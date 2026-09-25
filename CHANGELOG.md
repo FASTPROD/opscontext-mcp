@@ -6,6 +6,8 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 ## [Unreleased]
 
+## [2.9.0] 2026-09-25: credentials and prompt words stay out of the audit log
+
 ### Security
 
 - **The public repo is now a release copy** (`scripts/release-public.sh`, LOCK
@@ -57,6 +59,12 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
   default; `--apply` re-verifies, removes its own segment unless the chain improved by exactly
   that gap, and records an `audit.restore` event. The 51,174 records above were restored from a
   Time Machine snapshot with it, and the chain verifies again.
+
+### Docs
+
+- **The npm page matches the new behaviour**: Browser Capture and the Claude Code step no longer
+  say prompts are stored as text, the privacy table says what the package version is used for
+  now, and every link points to the public repo `FASTPROD/opscontext-mcp`.
 
 ## [2.8.4] 2026-09-17: a gate on complexity, a watch on doubled hooks
 

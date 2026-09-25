@@ -40,7 +40,7 @@ If your purchase team asks "is OpsContext part of a public-cloud platform play?"
 
 - ✅ Built and maintained by a single team (PROD LLC under CSS LLC)
 - ✅ Local-first: no telemetry, no cloud account, no signup; license activation is the only outbound call
-- ✅ Source-available under [BSL-1.1](https://github.com/FASTPROD/ContextEngine/blob/main/LICENSE) — NOT OSI-approved open source. You may use it in production; you may not offer it as a hosted service competing with the OpsContext PRO/Team/Enterprise plans. Converts to AGPL-3.0 on 2030-02-22.
+- ✅ Source-available under [BSL-1.1](https://github.com/FASTPROD/opscontext-mcp/blob/main/LICENSE) — NOT OSI-approved open source. You may use it in production; you may not offer it as a hosted service competing with the OpsContext PRO/Team/Enterprise plans. Converts to AGPL-3.0 on 2030-02-22.
 - ❌ **NOT** SOC 2– or ISO 27001–certified itself. The audit log helps *your* org's auditor satisfy [SOC 2 CC7.2](compliance/cc7.2.md) and [ISO 27001 A.12.4.1](compliance/a.12.4.1.md), but OpsContext-the-tool carries no attestation. (See those docs for the exact evidence-vs-certification distinction.)
 - ❌ **NOT** part of any larger public cloud, AI training pipeline, or data brokerage. The sibling brands listed above are independent products; none of them ingest your OpsContext audit log.
 
@@ -48,7 +48,7 @@ If your purchase team asks "is OpsContext part of a public-cloud platform play?"
 
 | Purpose | Channel |
 |---|---|
-| Engineering / bug reports | [github.com/FASTPROD/ContextEngine/issues](https://github.com/FASTPROD/ContextEngine/issues) |
+| Engineering / bug reports | [github.com/FASTPROD/opscontext-mcp/issues](https://github.com/FASTPROD/opscontext-mcp/issues) |
 | Commercial licensing / enterprise | [yannick@compr.ch](mailto:yannick@compr.ch) |
 | Security / responsible disclosure | [yannick@compr.ch](mailto:yannick@compr.ch) — please use subject line `[OpsContext security]` |
 | General | [compr.fr](https://compr.fr) |

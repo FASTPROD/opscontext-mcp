@@ -7,11 +7,11 @@
   "author": {
     "name": "PROD LLC (operating brand of CSS LLC, Swiss, est. 2005)",
     "email": "yannick@compr.ch",
-    "url": "https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md"
+    "url": "https://github.com/FASTPROD/opscontext-mcp/blob/main/docs/about.md"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/FASTPROD/ContextEngine.git",
+    "url": "https://github.com/FASTPROD/opscontext-mcp.git",
     "directory": "chrome-extension"
   },
   "scripts": {

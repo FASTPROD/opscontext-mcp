@@ -109,4 +109,4 @@ This separation means:
 
 Source-available under **BSL-1.1** (Business Source License) — see [LICENSE](https://www.npmjs.com/package/@compr/opscontext-mcp). Not OSI-approved open source; converts to AGPL-3.0 on 2030-02-22.
 
-© 2026 **PROD LLC** (operating brand of **CSS LLC**, Swiss company, incorporated 2005). Marketplace publisher ID `css-llc` = the legal-parent name (not a typo). [Full publisher disclosure](https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md) · [yannick@compr.ch](mailto:yannick@compr.ch)
+© 2026 **PROD LLC** (operating brand of **CSS LLC**, Swiss company, incorporated 2005). Marketplace publisher ID `css-llc` = the legal-parent name (not a typo). [Full publisher disclosure](https://github.com/FASTPROD/opscontext-mcp/blob/main/docs/about.md) · [yannick@compr.ch](mailto:yannick@compr.ch)

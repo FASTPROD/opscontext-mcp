@@ -1,6 +1,6 @@
 {
   "name": "@compr/opscontext-mcp",
-  "version": "2.8.4",
+  "version": "2.9.0",
   "description": "OpsContext for AI Agents — read-only fleet visibility (PM2/nginx/Docker/git/cron) + tamper-evident audit log + policy-as-code hooks. The ops + compliance layer Claude Code can't grow natively.",
   "type": "module",
   "main": "dist/index.js",
@@ -47,12 +47,12 @@
   "author": {
     "name": "PROD LLC (operating brand of CSS LLC, Swiss, est. 2005)",
     "email": "yannick@compr.ch",
-    "url": "https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md"
+    "url": "https://github.com/FASTPROD/opscontext-mcp/blob/main/docs/about.md"
   },
   "license": "BSL-1.1",
   "repository": {
     "type": "git",
-    "url": "https://github.com/FASTPROD/ContextEngine.git"
+    "url": "https://github.com/FASTPROD/opscontext-mcp.git"
   },
   "homepage": "https://compr.fr",
   "bugs": {

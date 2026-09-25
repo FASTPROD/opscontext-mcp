@@ -82,5 +82,5 @@ Everything in `src/background/`, `src/popup/`, `src/options/`, `src/lib/`,
 `scripts/copy-static.mjs`, and the test fixtures is original work by
 **PROD LLC** (operating brand of **CSS LLC**, Swiss company incorporated 2005),
 licensed under BSL-1.1 at the root of this package. See
-[docs/about.md](https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md)
+[docs/about.md](https://github.com/FASTPROD/opscontext-mcp/blob/main/docs/about.md)
 for full publisher disclosure.

@@ -124,7 +124,7 @@ a two-tier strategy (data-testid first, structural fallback second) and emits a
 that the capture stopped working. If you see capture_miss events, file an issue
 or PR with the new selector at:
 
-https://github.com/FASTPROD/ContextEngine/issues
+https://github.com/FASTPROD/opscontext-mcp/issues
 
 ## Attribution
 

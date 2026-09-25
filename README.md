@@ -12,7 +12,7 @@ Claude Code, Cursor, and Copilot write code without seeing your servers — so t
 
 OpsContext is an [MCP](https://modelcontextprotocol.io) server. It runs locally, snapshots your live infra (PM2 processes, nginx config, Docker containers, git status, cron jobs, redacted env), and exposes it via tools your AI coding agents (Claude Code, Cursor, Copilot, Windsurf, OpenClaw) can call in real time. Everything stays on your machine — no telemetry, no code uploads.
 
-> **🌐 Browser Capture (Phase 1, shipped 2026-06):** OpsContext now captures prompts + assistant responses + tool calls from **Claude.ai**, **ChatGPT.com**, *and* your **Claude Code** terminal sessions into the same hash-chained audit log. Cross-surface drift detection becomes possible (e.g. catch when a model says one thing in the browser and another in the terminal). See [Step 3](#3-capture-browser--claude-code-events-optional) below.
+> **🌐 Browser Capture (Phase 1, shipped 2026-06):** OpsContext now records prompts, assistant responses and tool calls from **Claude.ai**, **ChatGPT.com**, *and* your **Claude Code** terminal sessions in the same hash-chained audit log. Since 2.9.0 a prompt or a response is kept as its length and a keyed fingerprint, never its words; commands are kept with credentials redacted. Cross-surface drift detection becomes possible (e.g. catch when a model says one thing in the browser and another in the terminal). See [Step 3](#3-capture-browser--claude-code-events-optional) below.
 
 ## Why
 
@@ -167,7 +167,7 @@ npm i -g @compr/opscontext-mcp && opscontext install-claude-hook
 
 (Prefer the global install here: the hook scripts keep absolute paths to the CLI, and an `npx` cache copy can be pruned.)
 
-Adds `UserPromptSubmit`, `PostToolUse`, and `SessionStart` hook entries to `~/.claude/settings.json` so every Claude Code prompt + tool call lands in the same audit log as the browser events, plus a `Stop` entry: the **session gate** (2.7.0). A Claude Code turn cannot end while the repo's OpsContext session is older than the last commit; the agent is told which session to save, which session doc to update, and how far the agent docs are behind. No more "did you save the session?" at the end of a day. Details: `npx @compr/opscontext-mcp session-gate --help`.
+Adds `UserPromptSubmit`, `PostToolUse`, and `SessionStart` hook entries to `~/.claude/settings.json` so every Claude Code prompt (kept as a length and a keyed fingerprint, not its words) and tool call (credentials redacted) lands in the same audit log as the browser events, plus a `Stop` entry: the **session gate** (2.7.0). A Claude Code turn cannot end while the repo's OpsContext session is older than the last commit; the agent is told which session to save, which session doc to update, and how far the agent docs are behind. No more "did you save the session?" at the end of a day. Details: `npx @compr/opscontext-mcp session-gate --help`.
 
 Verify:
 ```bash
@@ -539,7 +539,7 @@ Everything happens locally — search, scoring, learnings, sessions, embeddings.
 | License key (`CE-XXXX-...`) | Activation + daily heartbeat | Validate subscription |
 | Machine ID (SHA-256 hash) | Activation + daily heartbeat | Enforce machine limit |
 | Email | Activation only | Tie the licence to an account |
-| Package version | Activation only | Serve a compatible module bundle |
+| Package version | Activation only | Recorded with your activation, so support knows which version a machine runs |
 | Platform/arch (e.g., `darwin/arm64`) | Activation only | Compatibility check |
 | Licence bundle version | Daily heartbeat | Compatibility marker carried in the signed licence |
 
@@ -553,7 +553,7 @@ That is the complete list. The activation request sends exactly six fields and t
 
 One file in the published package is deliberately unreadable: `dist/rubric.js`, which holds the scoring thresholds (what earns which points). Those values are commercial IP under [BSL-1.1](LICENSE), and knowing them exactly makes an AI-readiness score easy to game by padding files to hit a number rather than doing the work.
 
-**What that hides: values. What it does not hide: behaviour.** No code path, network call, file access, or data flow is concealed anywhere in this package. The scoring logic itself, every collector, the search ranker, and both network calls above ship as readable JavaScript — and the full source is public at [FASTPROD/ContextEngine](https://github.com/FASTPROD/ContextEngine). If a privacy claim on this page were false, the code that broke it would be right there to find.
+**What that hides: values. What it does not hide: behaviour.** No code path, network call, file access, or data flow is concealed anywhere in this package. The scoring logic itself, every collector, the search ranker, and both network calls above ship as readable JavaScript — and the full source is public at [FASTPROD/ContextEngine](https://github.com/FASTPROD/opscontext-mcp). If a privacy claim on this page were false, the code that broke it would be right there to find.
 
 ### Why this matters
 
@@ -588,4 +588,4 @@ PROD LLC also operates these products. The full, current list is on **[compr.fr]
 | **PLANK** | Hyperlocal social app for iOS and Android | [plank.io](https://plank.io) |
 | **compR** | Company site, and candidate credibility scoring | [compr.fr](https://compr.fr) · [compr.app](https://compr.app) |
 
-Contact: [yannick@compr.ch](mailto:yannick@compr.ch). Full corporate disclosure at [docs/about.md](https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md).
+Contact: [yannick@compr.ch](mailto:yannick@compr.ch). Full corporate disclosure at [docs/about.md](https://github.com/FASTPROD/opscontext-mcp/blob/main/docs/about.md).
