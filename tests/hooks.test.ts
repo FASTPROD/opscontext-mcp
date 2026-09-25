@@ -367,6 +367,42 @@ describe("getStagedFiles integration", () => {
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  // [STAGED-PATH-IS-AN-ARGUMENT-NEVER-A-SHELL-STRING]: until 2.9.0 a staged name was pasted
+  // into a shell string. `note$(touch PROOF).md` ran touch, and `café.md` (C-quoted by git's
+  // --name-only) was skipped unscanned, and `a*.md` also matched `ab.md`. Every name below is
+  // staged with its own line and must come back as itself, with exactly its own line, and
+  // with nothing executed.
+  it("treats a staged file name as data: nothing runs, every name is scanned as itself", async () => {
+    const { getStagedFiles } = await import("../src/hooks.js");
+    const repo = mkdtempSync(join(tmpdir(), "ce-hooks-hostile-"));
+    try {
+      execSync("git init -q", { cwd: repo });
+      execSync('git config user.email "test@test.local"', { cwd: repo });
+      execSync('git config user.name "test"', { cwd: repo });
+      const names = [
+        "note$(touch PROOF_SUBSHELL).md",
+        "tick`touch PROOF_BACKTICK`.md",
+        "café.md",
+        "a*.md",
+        "ab.md",
+        'we"ird name.md',
+        "-leading-dash.md",
+      ];
+      for (const n of names) writeFileSync(join(repo, n), `line of ${n}\n`);
+      execSync("git add -A", { cwd: repo });
+
+      const files = getStagedFiles(repo);
+      expect(existsSync(join(repo, "PROOF_SUBSHELL"))).toBe(false);
+      expect(existsSync(join(repo, "PROOF_BACKTICK"))).toBe(false);
+      expect(files.map((f) => f.path).sort()).toEqual([...names].sort());
+      for (const f of files) {
+        expect(f.addedLines.map((l) => l.content)).toEqual([`line of ${f.path}`]);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

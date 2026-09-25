@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { runRuleParity, type RuleParityViolation } from "../src/hooks.js";
@@ -138,6 +138,23 @@ describe("runRuleParity", () => {
     const v = runRuleParity(policy(), staged([]), repo, { all: true });
     expect(v).toHaveLength(1);
     expect(v[0].missingFrom).toEqual(["SKILLS.md"]);
+  });
+
+  // [STAGED-PATH-IS-AN-ARGUMENT-NEVER-A-SHELL-STRING]: policy.json names the files and a cloned
+  // repo controls policy.json. Until 2.9.0 the index read ran `git show :"<name>"` through a
+  // shell. The worktree copy lacks the marker on purpose: only a real index read of the hostile
+  // name passes, and the old code would both run `touch` and report a violation.
+  it("reads the index blob of a file whose policy name is shell syntax, and runs nothing", () => {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    execSync("git init -q .", { cwd: repo });
+    const hostile = "doc$(touch PROOF_PARITY).md";
+    put("CLAUDE.md", "# doc\nMULTI-AGENT COST\n");
+    put(hostile, "# doc\nMULTI-AGENT COST\n");
+    execSync("git add -A", { cwd: repo });
+    put(hostile, "# doc\nnothing\n");
+    const v = runRuleParity(policy({ required_in: ["CLAUDE.md", hostile] }), staged(["CLAUDE.md", hostile]), repo);
+    expect(v).toEqual([]);
+    expect(existsSync(join(repo, "PROOF_PARITY"))).toBe(false);
   });
 
   it("rejects a rule listing fewer than two files — parity needs two sides", () => {

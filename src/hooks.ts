@@ -44,7 +44,7 @@
 //      applies to the repo it lives in. Cross-repo enforcement is a
 //      separate concern (org-policy distribution via `extends:`).
 
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { createHash } from "crypto";
 import { join } from "path";
@@ -118,25 +118,44 @@ export interface StagedFile {
  * Errors from git (not a repo, no staged changes, etc.) are RE-THROWN, not
  * swallowed. The caller decides whether "no staged changes" is fatal.
  */
+// [LOCKED] [STAGED-PATH-IS-AN-ARGUMENT-NEVER-A-SHELL-STRING] - 2026-09-25
+// [NEVER] build a shell command string from a staged path, a policy path, or any other value a
+//         repository controls. Pass it as one argv element to execFileSync, list names with -z,
+//         and address the file with a `:(literal)` pathspec (here) or a `:path` blob spec
+//         (contentAfterCommit below).
+// WHY: until 2.9.0 this ran `git diff --cached -- "<name>"` through a shell, escaping only the
+//      double quote. Proven in a scratch repo on 2026-09-25: a staged file named
+//      `note$(touch PROOF).md` ran `touch` while the pre-commit scanner parsed the staged list,
+//      so a cloned repo or a pull request could run a command on the committer's machine. The
+//      same line also lost every non-ASCII name: `--name-only` prints `caf\303\251.md` C-quoted,
+//      the shell lookup found no such file, the catch skipped it, and a planted key in `café.md`
+//      was never scanned. A plain pathspec is a glob too: `a*.md` also matched `ab.md`.
+// FIX: execFileSync("git", [...]) with the name as its own argument (no shell exists to expand
+//      it), `-z` so git prints raw names, `:(literal)` so a name matches only itself, and a
+//      32 MB buffer so a large file is not skipped silently. tests/hooks.test.ts and
+//      tests/rule-parity.test.ts stage those exact names.
 export function getStagedFiles(repoRoot: string): StagedFile[] {
-  const nameOutput = execSync("git diff --cached --name-only --diff-filter=ACMR", {
-    cwd: repoRoot,
-    encoding: "utf-8",
-  }).trim();
-  if (!nameOutput) return [];
+  const nameOutput = execFileSync(
+    "git",
+    ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
+    { cwd: repoRoot, encoding: "utf-8" },
+  );
+  const fileNames = nameOutput.split("\0").filter((f) => f.length > 0);
+  if (fileNames.length === 0) return [];
 
-  const fileNames = nameOutput.split("\n");
   const result: StagedFile[] = [];
 
   for (const file of fileNames) {
     let diff: string;
     try {
-      diff = execSync(`git diff --cached --unified=0 -- "${file.replace(/"/g, '\\"')}"`, {
-        cwd: repoRoot,
-        encoding: "utf-8",
-      });
+      diff = execFileSync(
+        "git",
+        ["diff", "--cached", "--unified=0", "--", `:(literal)${file}`],
+        { cwd: repoRoot, encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
+      );
     } catch {
-      // Binary file, deleted, or path that doesn't roundtrip — skip safely.
+      // git could not diff this path (index and worktree disagree in a way git refuses to
+      // print, or the diff exceeds the buffer): nothing to parse, skip it.
       continue;
     }
 
@@ -695,7 +714,9 @@ function contentAfterCommit(
 ): string | null {
   if (!useWorktree && stagedSet.has(rel)) {
     try {
-      return execSync(`git show :"${rel}"`, {
+      // [LOCK] [STAGED-PATH-IS-AN-ARGUMENT-NEVER-A-SHELL-STRING]: `rel` comes from policy.json,
+      // which a cloned repo controls; it is an argv element, never part of a shell string.
+      return execFileSync("git", ["show", `:${rel}`], {
         cwd: repoRoot,
         encoding: "utf-8",
         maxBuffer: 32 * 1024 * 1024,

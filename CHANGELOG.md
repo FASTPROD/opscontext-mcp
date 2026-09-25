@@ -6,6 +6,24 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 ## [Unreleased]
 
+## [2.9.1] 2026-09-25: a staged file name is data, never shell
+
+### Security
+
+- **A staged file name is data, never shell** (`src/hooks.ts`, LOCK
+  `[STAGED-PATH-IS-AN-ARGUMENT-NEVER-A-SHELL-STRING]`). The pre-commit checkers ran
+  `git diff --cached -- "<name>"` and `git show :"<name>"` through a shell, escaping only the
+  double quote. Proven on 2026-09-25: a staged file named `note$(touch PROOF).md` ran `touch`
+  while `contextengine hook secret-scan` listed the staged files, so a cloned repo or a pull
+  request could run a command on the committer's machine. Names now reach git as arguments,
+  listed with `-z` and matched with a `:(literal)` pathspec; the rule-parity index read, whose
+  names come from `policy.json`, takes the same path.
+- **Every staged file is scanned, whatever its name.** The same line dropped every non-ASCII
+  name (git prints `caf\303\251.md` quoted, the lookup failed, the file was skipped unscanned)
+  and a name containing `*` matched other files too. A planted key in `café.md` passed the
+  scanner before; it is caught now. A diff above 1 MB was skipped silently as well; the buffer
+  is 32 MB.
+
 ## [2.9.0] 2026-09-25: credentials and prompt words stay out of the audit log
 
 ### Security
