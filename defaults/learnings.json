@@ -1,0 +1,146 @@
+[
+  {
+    "category": "security",
+    "rule": "Auth on write endpoints is non-negotiable",
+    "context": "Write endpoints launched without auth = IDOR vulnerability. Client-supplied user_id in request body can be spoofed. Always extract identity from JWT/session.",
+    "tags": [
+      "auth",
+      "IDOR",
+      "JWT",
+      "API"
+    ]
+  },
+  {
+    "category": "security",
+    "rule": "Rate-limit auth endpoints on day one",
+    "context": "Login/register without rate limiting = free brute-force. Apply rate limiting immediately: login 5-10/min, register 3-5/hr per IP.",
+    "tags": [
+      "rate-limiting",
+      "auth",
+      "brute-force"
+    ]
+  },
+  {
+    "category": "architecture",
+    "rule": "Single source of truth for constants",
+    "context": "Duplicated values (API URLs, color codes, config) always drift. Create one canonical file and import everywhere. Time saved on future changes: massive.",
+    "tags": [
+      "constants",
+      "DRY",
+      "refactoring"
+    ]
+  },
+  {
+    "category": "architecture",
+    "rule": "Shared database requires schema isolation",
+    "context": "When multiple apps share one PostgreSQL/MySQL instance, always use dedicated schemas or databases. Prevents accidental cross-contamination and simplifies migrations.",
+    "tags": [
+      "PostgreSQL",
+      "multi-app",
+      "schema",
+      "database"
+    ]
+  },
+  {
+    "category": "architecture",
+    "rule": "Extension modules prevent circular imports",
+    "context": "Shared instances (rate limiter, logger, DB) in a separate extensions/utils module break circular dependency between app entry point and route files. Applies to Flask, FastAPI, Express, etc.",
+    "tags": [
+      "circular-imports",
+      "extensions",
+      "modules"
+    ]
+  },
+  {
+    "category": "deployment",
+    "rule": "PM2 restart counter masks real crashes",
+    "context": "Hundreds of restarts can be a single missing module repeating. Use pm2 reset after fixing to clear noise. Check pm2 logs for the actual error before assuming instability.",
+    "tags": [
+      "PM2",
+      "debugging",
+      "restart-counter"
+    ]
+  },
+  {
+    "category": "deployment",
+    "rule": "Version strings drift across files",
+    "context": "Backend health endpoint, frontend UI, package.json all showing different versions. Use a single source constant and update all locations together.",
+    "tags": [
+      "versioning",
+      "consistency",
+      "drift"
+    ]
+  },
+  {
+    "category": "bug-patterns",
+    "rule": "Use == not >= for one-time reward thresholds",
+    "context": "if count >= 3: award() fires on 3, 4, 5, 6... Use == for exact threshold. This class of bug is invisible until data grows past the threshold.",
+    "tags": [
+      "threshold",
+      "comparison",
+      "logic-error"
+    ]
+  },
+  {
+    "category": "bug-patterns",
+    "rule": "GPS drift between independent getCurrentPosition calls",
+    "context": "Each call returns different coords within accuracy radius (~35m). Use watchPosition for consistent tracking in location-aware apps.",
+    "tags": [
+      "GPS",
+      "geolocation",
+      "drift",
+      "mobile"
+    ]
+  },
+  {
+    "category": "frontend",
+    "rule": "Run tsc --noEmit before every commit",
+    "context": "TypeScript errors silently accumulate when type-checking is not enforced. Zero-tolerance policy prevents drift. Add to CI or pre-commit hook.",
+    "tags": [
+      "TypeScript",
+      "CI",
+      "type-checking"
+    ]
+  },
+  {
+    "category": "testing",
+    "rule": "SQLite in-memory for backend tests",
+    "context": "Override DATABASE_URL with sqlite:// in test config. No schema migration needed, instant teardown. Disable rate-limiters in test mode.",
+    "tags": [
+      "SQLite",
+      "pytest",
+      "in-memory",
+      "testing"
+    ]
+  },
+  {
+    "category": "testing",
+    "rule": "Test the contract not the implementation",
+    "context": "Assert on status codes, response shapes, and output values. Don't mock internal functions \u2014 test through the API boundary. Tests survive refactoring this way.",
+    "tags": [
+      "contract-testing",
+      "assertions",
+      "API"
+    ]
+  },
+  {
+    "category": "tooling",
+    "rule": "Score your project early and often",
+    "context": "A structured rubric (tests, CI, docs, security, AI-readiness) reveals blind spots immediately. First audit often shows 30-50% \u2014 knowing the gaps drives prioritization.",
+    "tags": [
+      "scoring",
+      "audit",
+      "prioritization"
+    ]
+  },
+  {
+    "category": "git",
+    "rule": "Push every 5-10 commits, never accumulate 20+",
+    "context": "Large push backlogs risk merge conflicts, lost work, and difficult rollbacks. Push frequently, especially after critical fixes. Auto-push hooks help enforce this.",
+    "tags": [
+      "git",
+      "push-frequency",
+      "workflow"
+    ]
+  }
+]

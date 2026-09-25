@@ -1,0 +1,12 @@
+src/
+tsconfig.json
+*.ts
+.git/
+.github/
+hooks/
+contextengine.json
+*.code-workspace
+README.old.md
+dist/test.*
+dist/test-*
+dist/**/*.map

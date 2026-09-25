@@ -1,0 +1,90 @@
+{
+  "name": "@compr/opscontext-mcp",
+  "version": "2.8.4",
+  "description": "OpsContext for AI Agents — read-only fleet visibility (PM2/nginx/Docker/git/cron) + tamper-evident audit log + policy-as-code hooks. The ops + compliance layer Claude Code can't grow natively.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "opscontext": "dist/cli.js",
+    "opscontext-mcp": "dist/cli.js",
+    "contextengine": "dist/cli.js",
+    "contextengine-mcp": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/",
+    "prepublishOnly": "node scripts/check-npm-token-expiry.mjs && npm run build && node scripts/obfuscate-rubric.mjs",
+    "check-token": "node scripts/check-npm-token-expiry.mjs",
+    "verify-release": "bash scripts/verify-release.sh"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "claude",
+    "cursor",
+    "copilot",
+    "ai-agents",
+    "ops",
+    "observability",
+    "audit-log",
+    "compliance",
+    "soc2",
+    "iso27001",
+    "policy-as-code",
+    "git-hooks",
+    "pre-commit",
+    "secret-scanning",
+    "fleet",
+    "context",
+    "knowledge-base",
+    "developer-tools"
+  ],
+  "author": {
+    "name": "PROD LLC (operating brand of CSS LLC, Swiss, est. 2005)",
+    "email": "yannick@compr.ch",
+    "url": "https://github.com/FASTPROD/ContextEngine/blob/main/docs/about.md"
+  },
+  "license": "BSL-1.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FASTPROD/ContextEngine.git"
+  },
+  "homepage": "https://compr.fr",
+  "bugs": {
+    "email": "yannick@compr.ch"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "files": [
+    "dist/",
+    "!dist/test*",
+    "!dist/**/*.map",
+    "defaults/",
+    "!defaults/__pycache__",
+    "skills/",
+    "examples/",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.3.6"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "eslint": "^10.0.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.0",
+    "vitest": "^4.0.18"
+  }
+}

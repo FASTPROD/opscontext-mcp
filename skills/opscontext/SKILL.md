@@ -1,0 +1,263 @@
+---
+name: opscontext
+description: "OpsContext for AI Agents — the ops + compliance layer Claude Code can't grow natively. Read-only fleet visibility (PM2/nginx/Docker/git/cron) + tamper-evident hash-chained audit log producing evidence aligned with SOC 2 CC7.2 and ISO 27001 A.12.4.1 (evidence artifacts only — OpsContext itself is not certified; see docs/compliance/) + declarative policy-as-code git hooks (.contextengine/policy.json with secret_patterns, doc_coverage, deploy_verify_hosts, bypass_tokens) + persistent learnings + hybrid BM25/semantic search. Use when: (1) searching project documentation or context files, (2) collecting operational insights from workspaces, (3) storing and retrieving persistent learnings across sessions, (4) auditing project compliance or AI-readiness, (5) managing session data, (6) verifying the audit log chain, (7) authoring/validating policy.json. Zero API keys — runs 100% locally with CPU embeddings."
+homepage: https://www.npmjs.com/package/@compr/opscontext-mcp
+metadata: { "openclaw": { "emoji": "🧭", "requires": { "bins": ["npx"] }, "homepage": "https://www.npmjs.com/package/@compr/opscontext-mcp" } }
+---
+
+# OpsContext for AI Agents — Knowledge Base + Ops + Compliance
+
+ContextEngine turns your project documentation into a **queryable knowledge base** with hybrid BM25 keyword + semantic vector search. Zero API keys required — embeddings run locally on CPU.
+
+## Quick Start
+
+### 1. Initialize (one-time per project)
+
+```bash
+npx @compr/opscontext-mcp init
+```
+
+Creates `contextengine.json` config + `.github/copilot-instructions.md` template in the current directory.
+
+### 2. Search your knowledge base
+
+```bash
+# Ask the agent to search for context
+search_context "deployment docker nginx setup"
+```
+
+ContextEngine auto-discovers documentation files from 7 common patterns:
+- `.github/copilot-instructions.md`
+- `.github/SKILLS.md`
+- `CLAUDE.md`
+- `.cursorrules`
+- `.cursor/rules`
+- `AGENTS.md`
+
+## CLI Usage (no MCP required)
+
+ContextEngine also works as a standalone CLI tool — no MCP client needed:
+
+```bash
+npx @compr/opscontext-mcp search "docker nginx"      # Search knowledge base
+npx @compr/opscontext-mcp list-sources               # Show indexed sources
+npx @compr/opscontext-mcp list-projects              # Discover all projects
+npx @compr/opscontext-mcp score                      # Score the CURRENT project (writes its SCORE.md)
+npx @compr/opscontext-mcp score ~/Projects/PLANK.io  # Score one project by name or path
+npx @compr/opscontext-mcp score --all --no-save      # Score every project, write nothing
+npx @compr/opscontext-mcp score --html               # Visual HTML report
+npx @compr/opscontext-mcp list-learnings security    # List learnings by category
+npx @compr/opscontext-mcp audit                      # Compliance audit
+npx @compr/opscontext-mcp help                       # Show all commands
+```
+
+## MCP Server Setup
+
+ContextEngine runs as an **MCP server** via stdio transport. Configure it in your MCP client:
+
+### VS Code (Per-Workspace)
+
+Add to `.vscode/mcp.json` in your project root:
+
+```json
+{
+  "servers": {
+    "contextengine": {
+      "command": "npx",
+      "args": ["-y", "@compr/opscontext-mcp"],
+      "env": {
+        "CONTEXTENGINE_WORKSPACES": "/path/to/your/projects"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to Claude Desktop MCP config:
+
+```json
+{
+  "mcpServers": {
+    "contextengine": {
+      "command": "npx",
+      "args": ["-y", "@compr/opscontext-mcp"],
+      "env": {
+        "CONTEXTENGINE_WORKSPACES": "/path/to/your/projects"
+      }
+    }
+  }
+}
+```
+
+### OpenClaw MCP Config
+
+Add to your OpenClaw `openclaw.json` MCP servers section:
+
+```json
+{
+  "mcpServers": {
+    "contextengine": {
+      "command": "npx",
+      "args": ["-y", "@compr/opscontext-mcp"],
+      "env": {
+        "CONTEXTENGINE_WORKSPACES": "/path/to/your/projects"
+      }
+    }
+  }
+}
+```
+
+## Available Tools (17)
+
+| Tool | Description |
+|------|-------------|
+| `search_context` | Hybrid BM25+semantic search with temporal decay. Modes: hybrid, keyword, semantic |
+| `list_sources` | Show all indexed sources with chunk counts and embedding status |
+| `read_source` | Read full content of a knowledge source by name |
+| `reindex` | Force full re-index of all sources |
+| `list_projects` | Discover and analyze all projects (tech stack, git, docker, pm2) |
+| `check_ports` | Scan all projects for port conflicts |
+| `run_audit` | Compliance agent — git remotes, hooks, .env, Docker, PM2, versions |
+| CLI `session-gate` | Claude Code Stop hook (installed by `install-claude-hook`): a turn cannot end while the repo's CE session is older than the last commit |
+| `score_project` | AI-readiness scoring 0-100% with anti-gaming v2 (symlink/ghost config detection) |
+| `save_session` | Save key-value entry to a named session for cross-session persistence |
+| `load_session` | Load all entries from a named session |
+| `list_sessions` | List all saved sessions with entry counts and timestamps |
+| `end_session` | Pre-flight checklist — checks uncommitted git changes + doc freshness |
+| `save_learning` | Save a permanent operational rule — auto-surfaces in search results |
+| `list_learnings` | List all permanent learnings, optionally filtered by category |
+| `import_learnings` | Bulk-import learnings from Markdown or JSON files |
+| `activate` | Activate a Pro license on this machine |
+| `activation_status` | Check current license activation status |
+
+## Core Capabilities
+
+### Hybrid Search
+
+Combines three signals for optimal relevance:
+- **40% BM25 keyword search** — IDF-weighted, rare terms rank higher
+- **60% semantic similarity** — cosine distance via MiniLM-L6-v2 (22MB, local CPU)
+- **Temporal decay** — 90-day half-life boosts recent content
+
+```bash
+# Search with mode selection
+search_context "docker nginx proxy" --mode hybrid
+search_context "deployment steps" --mode keyword
+search_context "how to configure SSL" --mode semantic
+```
+
+### Operational Data Collection
+
+Auto-collects from your projects (no setup needed):
+- **Git**: branches, remotes, recent commits, hooks
+- **package.json / composer.json**: dependencies, scripts
+- **Docker**: Dockerfile, docker-compose services
+- **PM2**: process list, ecosystem config
+- **Nginx**: server blocks, proxy configs
+- **.env**: variable names (never values)
+- **Cron**: scheduled tasks
+
+### Persistent Learnings
+
+Save reusable patterns, bug fixes, and operational rules that auto-surface in search results:
+
+```bash
+# Save a learning
+save_learning --category "deployment" --rule "Always use --platform linux/amd64 for cross-arch Docker builds" --context "Apple Silicon to AMD64 server"
+
+# List by category
+list_learnings --category "security"
+```
+
+16 categories: architecture, security, bug-patterns, deployment, testing, api, frontend, backend, infrastructure, tooling, devops, git, data, dependencies, performance, accessibility.
+
+### Session Persistence
+
+Save and restore key-value data across sessions via MCP tools (NOT files in the project):
+
+```bash
+# Sessions are stored centrally in ~/.contextengine/sessions/ — NOT in the project directory
+# Use the MCP tool or CLI command — do NOT create session files manually
+
+save_session --name "project-x" --key "current_task" --value "Implementing auth flow"
+load_session --name "project-x"
+```
+
+**Important**: "Save session" means calling the `save_session` MCP tool or CLI command. It does NOT mean creating a markdown file. Sessions are stored in `~/.contextengine/sessions/` and auto-loaded on MCP startup.
+
+## Configuration
+
+Create `contextengine.json` in your project root (or run `npx @compr/opscontext-mcp init`):
+
+```json
+{
+  "sources": ["docs/architecture.md", "RUNBOOK.md"],
+  "workspaces": ["/home/user/projects"],
+  "patterns": [".github/copilot-instructions.md", "CLAUDE.md"],
+  "codeDirs": ["src", "lib"]
+}
+```
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `CONTEXTENGINE_CONFIG` | Path to contextengine.json config file |
+| `CONTEXTENGINE_WORKSPACES` | Colon-separated list of workspace directories |
+
+## Architecture
+
+- **Embeddings**: all-MiniLM-L6-v2 via @huggingface/transformers (22MB, local CPU, no API key)
+- **Transport**: MCP SDK v1.26 via stdio
+- **Chunking**: Markdown heading-based with 4-line overlap + code chunker (TS/JS/Python)
+- **Dedup**: SHA-256 content hashing prevents duplicate chunks
+- **Caching**: Embedding cache to disk (~/.contextengine/embedding-cache.json)
+- **File watching**: fs.watch with 500ms debounce → auto re-index on changes
+- **Non-blocking**: Keyword search available instantly, embeddings load in background
+
+## Notes
+
+- Requires **Node.js 18+**
+- First run downloads the embedding model (~22MB) — subsequent runs use cache
+- Keyword search is available instantly at startup; semantic search becomes available once the model loads
+- License: BSL-1.1 (Business Source License)
+- npm: `@compr/opscontext-mcp`
+
+### Post-Commit Verification
+
+After every `git push`, call `end_session` to verify nothing was missed:
+
+- **MCP tool**: `end_session` — use when ContextEngine MCP server is connected
+- **CLI fallback**: `npx @compr/opscontext-mcp end-session` — use when MCP is not connected (Cursor, Copilot, terminal sessions)
+
+Resolve any FAIL items before finishing. Workflow: `commit → push → end_session → verify → fix anything it catches → re-commit if needed`.
+
+## Lock Markers — Do Not Touch Verified Code
+
+ContextEngine detects **lock markers** in source files and documentation. When a chunk contains a lock marker, search results display a `🔒 LOCKED` prefix — this means the code has been verified and **must not be modified, deleted, or re-implemented**.
+
+### Recognized patterns
+
+```
+// LOCKED                          // in JS/TS/C/Go
+/* LOCKED */                       // block comment variant
+# LOCKED                           // Python/Shell/YAML
+<!-- LOCKED -->                    // HTML/Markdown
+LOCKED — verified <date>           // prose
+DO NOT RE-AUDIT                    // audit skip signal
+ALREADY IMPLEMENTED                // status marker
+VERIFIED — DO NOT                  // verified block
+```
+
+### Rules for agents
+
+1. **Never delete or rewrite** code that contains a lock marker or sits within a locked section
+2. **Never re-implement** functionality described in an `ALREADY IMPLEMENTED` block
+3. **When you finish implementing a feature**, add a lock marker to signal future sessions:
+   ```ts
+   // LOCKED — verified March 3 2026 — GA4 tag injection
+   ```
+4. **When you see `🔒 LOCKED` in search results**, treat it as read-only context — do not open the file to "fix" or "improve" it
+5. **If you must modify locked code** (user explicitly requests it), remove the lock marker first and add a new one after verification

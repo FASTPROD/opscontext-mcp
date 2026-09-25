@@ -1,0 +1,1761 @@
+#!/usr/bin/env node
+
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource } from "./config.js";
+import { ingestSources, Chunk } from "./ingest.js";
+import { redactSecrets } from "./secret-shapes.js";
+import { summarizeSource } from "./source-summary.js";
+import { searchChunks, SearchResult } from "./search.js";
+import {
+  initEmbeddings,
+  embedChunks,
+  embedKeyOf,
+  vectorSearch,
+  isEmbeddingsReady,
+  EmbeddedChunk,
+  VectorSearchResult,
+} from "./embeddings.js";
+import { collectProjectOps, collectSystemOps } from "./collectors.js";
+import { loadEmbeddingStore, compactEmbeddingStore } from "./embedding-store.js";
+import {
+  sharedIndexEnabled,
+  corpusId,
+  electIndexer,
+  writeSharedIndex,
+  readSharedIndex,
+  sharedIndexMtime,
+  type ServerRole,
+} from "./shared-index.js";
+import {
+  listProjects,
+  checkPorts,
+  runComplianceAudit,
+  formatProjectList,
+  formatPortMap,
+  formatPlan,
+  scoreProject,
+  formatScoreReport,
+  runScoreCanary,
+} from "./agents.js";
+import {
+  saveSession,
+  loadSession,
+  listSessions,
+  deleteSession,
+  formatSession,
+  formatSessionList,
+} from "./sessions.js";
+import { verifyChain, readAuditLog, filterByRange, autoRotateAuditLog, safeAppend } from "./audit.js";
+import { registerServer, listServers, formatServers } from "./server-registry.js";
+import { computeFleetHealth, writeFleetHealth } from "./fleet-health.js";
+import { startEventIngestServer } from "./http-server.js";
+import { detect } from "./detector.js";
+import { buildCostReport } from "./cost-report.js";
+import {
+  saveLearning,
+  searchLearnings,
+  listLearnings,
+  deleteLearning,
+  learningsToChunks,
+  learningsStats,
+  formatLearnings,
+  importLearningsFromFile,
+  autoImportFromSources,
+  LEARNING_CATEGORIES, parseSince } from "./learnings.js";
+import {
+  communityRulesToChunks,
+  mergeWithDedup,
+  loadCommunityStore,
+} from "./community-sync.js";
+import { readFileSync, existsSync, watch, statSync, writeFileSync, mkdirSync } from "fs";
+import { basename, join, dirname } from "path";
+import { homedir } from "os";
+import { execSync } from "child_process";
+import { scanCodeDir } from "./code-chunker.js";
+import { fileURLToPath } from "url";
+import { TOOL_COUNT, FREE_TOOL_COUNT, PREMIUM_TOOL_NAMES } from "./tools-manifest.js";
+
+// Read version from package.json at startup
+let PKG_VERSION = "1.21.3";
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
+  PKG_VERSION = pkg.version || PKG_VERSION;
+} catch { /* fallback */ }
+import {
+  loadAdapters,
+  collectFromAdapters,
+  destroyAdapters,
+  listRegisteredAdapters,
+  type AdapterEntry,
+} from "./adapters.js";
+import {
+  gateCheck,
+  activate,
+  deactivate,
+  getActivationStatus,
+  heartbeat,
+  loadLicense,
+} from "./activation.js";
+import { ProtocolFirewall } from "./firewall.js";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let sources: KnowledgeSource[] = [];
+let chunks: Chunk[] = [];
+let embeddedChunks: EmbeddedChunk[] = [];
+let activeProjectNames: string[] = [];
+const firewall = new ProtocolFirewall();
+
+// One indexer, many readers. [LOCK] [ONE-INDEXER-MANY-READERS]
+// With the shared index off (default until the trial), every server is its own indexer, exactly
+// as before, and only the content-addressed vector store below is new.
+let role: ServerRole = "indexer";
+let corpus: string | undefined;
+let indexerPid: number | null = null;
+let setRegistryRole: ((r: ServerRole) => void) | null = null;
+/** key -> vector, loaded from ~/.contextengine/embeddings.bin and grown by what we embed. */
+let vectorStore: Map<string, Float32Array> = new Map();
+let indexSeq = 0;
+let lastIndexMtime: number | null = null;
+let modelInit: Promise<boolean> | null = null;
+
+// Wire up learning search for auto-injection (avoids circular import)
+firewall.setLearningSearchFn((query, projects) => {
+  return searchLearnings(query)
+    .filter((l) => {
+      // Project-scoped: include if no project set OR project matches
+      if (!projects || projects.length === 0) return true;
+      if (!l.project) return true; // universal learning
+      return projects.some(
+        (p) => p.toLowerCase() === l.project!.toLowerCase()
+      );
+    })
+    .slice(0, 10) // return generous set, firewall trims to INJECT_MAX
+    .map((l) => ({ rule: l.rule, project: l.project, category: l.category }));
+});
+
+/**
+ * Parse every source, collect ops and code, import learnings (indexer only), inject learnings,
+ * community rules and adapters. Sets `sources`, `chunks`, `activeProjectNames`. No embedding
+ * here. One body for startup and for every reindex; the two used to be separate copies.
+ */
+async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boolean }): Promise<void> {
+  sources = loadSources();
+  chunks = ingestSources(sources);
+
+  // Collect operational data from project directories
+  const config = loadConfig();
+  const projectDirs = loadProjectDirs();
+  activeProjectNames = projectDirs.map((d) => d.name);
+  firewall.setProjectDirs(projectDirs);
+  if (config.collectOps !== false) {
+    let opsChunks = 0;
+    for (const dir of projectDirs) {
+      const ops = collectProjectOps(dir.path, dir.name);
+      chunks.push(...ops);
+      opsChunks += ops.length;
+    }
+    if (opsChunks > 0) {
+      console.error(
+        `[ContextEngine] ⚙ Collected ${opsChunks} operational chunks from ${projectDirs.length} projects`
+      );
+    }
+  }
+
+  // Collect system-wide operational data
+  if (config.collectSystemOps !== false) {
+    const sysOps = collectSystemOps();
+    if (sysOps.length > 0) {
+      chunks.push(...sysOps);
+      console.error(
+        `[ContextEngine] 🖥 Collected ${sysOps.length} system operational chunks`
+      );
+    }
+  }
+
+  // Scan code files if configured
+  if (config.codeDirs && config.codeDirs.length > 0) {
+    let codeChunks = 0;
+    for (const dir of projectDirs) {
+      for (const codeDir of config.codeDirs) {
+        const codePath = join(dir.path, codeDir);
+        if (existsSync(codePath)) {
+          const codeResults = scanCodeDir(codePath, dir.name);
+          chunks.push(...codeResults);
+          codeChunks += codeResults.length;
+        }
+      }
+    }
+    if (codeChunks > 0) {
+      console.error(
+        `[ContextEngine] 💻 Parsed ${codeChunks} code chunks from source files`
+      );
+    }
+  }
+
+  // Auto-import learnings from discovered doc sources. Dedup is built-in. Only the indexer of a
+  // corpus writes the store from a sweep; a reader leaves that to it (one writer, not N).
+  if (opts.importLearnings) {
+    const autoImport = autoImportFromSources(
+      sources.map((s) => ({ path: s.path, name: s.name }))
+    );
+    if (autoImport.imported > 0) {
+      console.error(
+        `[ContextEngine] 📥 Auto-imported ${autoImport.imported} new learnings from ${autoImport.total} doc sources (${autoImport.updated} updated)`
+      );
+    }
+    if (autoImport.refused) {
+      console.error(`[ContextEngine] ⛔ Auto-import write refused: ${autoImport.refused}`);
+    }
+  }
+
+  // Inject learnings as searchable chunks (project-scoped to prevent IP leakage)
+  const learningChunks = learningsToChunks(activeProjectNames);
+  if (learningChunks.length > 0) {
+    chunks.push(...learningChunks);
+    console.error(
+      `[ContextEngine] 💡 Injected ${learningChunks.length} learning chunks into search index (scoped to ${activeProjectNames.length} projects)`
+    );
+  }
+
+  // Inject community rules from the cached store (best-effort — no network
+  // touched here; the daily `sync-community-rules` CLI keeps the cache fresh).
+  // Deduped against the local learnings so identical content never double-emits.
+  const communityChunks = communityRulesToChunks();
+  if (communityChunks.length > 0) {
+    const before = chunks.length;
+    chunks = mergeWithDedup(chunks, communityChunks);
+    const added = chunks.length - before;
+    const skipped = communityChunks.length - added;
+    const store = loadCommunityStore();
+    console.error(
+      `[ContextEngine] 🌐 Injected ${added} community rule chunks ` +
+      `(${skipped} dedup'd vs local; ${store.rules.length} total in cache)`
+    );
+  }
+
+  // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: before the adapters, whose block can return early.
+  chunks = chunks.map(redactChunk);
+
+  // Collect from plugin adapters
+  if (config.adapters && config.adapters.length > 0) {
+    if (opts.loadAdapters) {
+      const adapterCount = await loadAdapters(config.adapters as AdapterEntry[]);
+      if (adapterCount === 0) return;
+    }
+    const adapterChunks = await collectFromAdapters(config.adapters as AdapterEntry[]);
+    if (adapterChunks.length > 0) {
+      chunks.push(...adapterChunks.map(redactChunk));
+      console.error(
+        `[ContextEngine] 🔌 Adapters contributed ${adapterChunks.length} chunks`
+      );
+    }
+  }
+}
+
+/**
+ * [LOCKED] [INDEX-NEVER-SERVES-A-CREDENTIAL] - 2026-09-25
+ * [NEVER] let a chunk into the index, the shared index file or a search result without passing
+ *         its text through redactSecrets().
+ * WHY: on 2026-09-25 the shared index held database URLs with their passwords (read from dotenv
+ *      files, whose masking skipped the password inside a URL), sshpass and mysql passwords from
+ *      runbooks and memory notes, and Google API keys: 55 sources in all. search_context hands
+ *      chunks to every AI agent that asks, and the index file rides the weekly backup.
+ * FIX: every chunk, whatever collected it (docs, code, ops collectors, learnings, community rules,
+ *      adapters), is redacted with the capture shapes (src/secret-shapes.ts) as the index is built.
+ *      The source files are not touched: cleaning those is the owner's call, file by file.
+ */
+function redactChunk<T extends { content: string }>(c: T): T {
+  const r = redactSecrets(c.content);
+  return Object.keys(r.counts).length > 0 ? { ...c, content: r.text } : c;
+}
+
+/** Load the model once; every caller shares the same promise. */
+function ensureModel(): Promise<boolean> {
+  if (!modelInit) modelInit = initEmbeddings();
+  return modelInit;
+}
+
+/**
+ * Vectors for the current chunks: from the store for every text it holds, embedded now for
+ * the rest. [LOCK] [EMBEDDINGS-ARE-CONTENT-ADDRESSED]
+ */
+async function embedAll(): Promise<void> {
+  if (!isEmbeddingsReady()) return;
+  const snapshot = chunks;
+  const r = await embedChunks(snapshot, vectorStore);
+  if (snapshot !== chunks) return; // a newer build replaced these chunks meanwhile; its own embed follows
+  embeddedChunks = r.embedded;
+  console.error(`[ContextEngine] ✅ Semantic search ready: ${r.reused} vectors from the store, ${r.fresh} embedded now`);
+  if (role === "indexer") {
+    try {
+      const c = compactEmbeddingStore(new Set(snapshot.map(embedKeyOf)));
+      if (c.compacted) console.error(`[ContextEngine] 🧹 Embedding store compacted: ${c.before} -> ${c.after} records`);
+    } catch (err) {
+      console.error(`[ContextEngine] ⚠ embedding store compaction failed: ${(err as Error).message}`);
+    }
+  }
+}
+
+/** Indexer only: write the shared index for readers of this corpus. No-op otherwise. */
+function publishIndex(): void {
+  if (!corpus || role !== "indexer") return;
+  try {
+    indexSeq++;
+    const r = writeSharedIndex({
+      corpus,
+      seq: indexSeq,
+      writer: process.pid,
+      sources,
+      activeProjectNames,
+      chunks,
+      keys: chunks.map(embedKeyOf),
+    });
+    lastIndexMtime = sharedIndexMtime(corpus);
+    safeAppend("index.write", { pid: process.pid, corpus, seq: indexSeq, chunks: chunks.length, vectors: embeddedChunks.length, bytes: r.bytes, ms: r.ms });
+    console.error(`[ContextEngine] 📤 Shared index written: seq ${indexSeq}, ${chunks.length} chunks, ${Math.round(r.bytes / 1024)} KB, ${r.ms} ms`);
+  } catch (err) {
+    console.error(`[ContextEngine] ⚠ shared index write failed: ${(err as Error).message}`);
+  }
+}
+
+/** Reader: take the indexer's chunks and resolve their vectors from the store. */
+function adoptSharedIndex(): boolean {
+  if (!corpus) return false;
+  const f = readSharedIndex(corpus);
+  if (!f) return false;
+  sources = f.sources;
+  chunks = f.chunks;
+  activeProjectNames = f.activeProjectNames;
+  try { firewall.setProjectDirs(loadProjectDirs()); } catch { /* scoping keeps its last value */ }
+  vectorStore = loadEmbeddingStore().vectors;
+  const vecs: EmbeddedChunk[] = [];
+  let missing = 0;
+  f.chunks.forEach((c, i) => {
+    const v = vectorStore.get(f.keys[i]);
+    if (v) vecs.push({ chunk: c, vector: v });
+    else missing++;
+  });
+  embeddedChunks = vecs;
+  indexSeq = f.seq;
+  lastIndexMtime = sharedIndexMtime(corpus);
+  console.error(
+    `[ContextEngine] 📥 Shared index loaded: seq ${f.seq} from pid ${f.writer}, ${chunks.length} chunks, ${vecs.length} vectors${missing ? `, ${missing} not embedded yet` : ""}`
+  );
+  return true;
+}
+
+/**
+ * (Re-)ingest all sources. Called at startup and on file changes by the indexer; a reader
+ * never calls it on its own except as the fallback when no shared index exists yet.
+ */
+async function reindex(): Promise<void> {
+  await buildIndex({ importLearnings: role === "indexer" });
+  await embedAll();
+  publishIndex();
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid Search: combine keyword + vector scores with temporal decay
+// ---------------------------------------------------------------------------
+
+/**
+ * Temporal decay half-life in days.
+ * Chunks older than this get a ~50% penalty; very recent chunks get a boost.
+ * Set to 0 to disable temporal decay.
+ */
+const DECAY_HALF_LIFE_DAYS = 90;
+
+/**
+ * Compute a temporal decay multiplier for a chunk based on its indexedAt time.
+ * Returns a value between 0.5 and 1.0 (exponential decay).
+ * Formula: 0.5 + 0.5 * exp(-age_days * ln(2) / half_life)
+ *
+ * Age 0 days → 1.0 (no decay)
+ * Age = half_life → 0.75
+ * Age = 2 * half_life → 0.625
+ * Very old → approaches 0.5
+ */
+function temporalDecay(chunk: Chunk): number {
+  if (DECAY_HALF_LIFE_DAYS <= 0) return 1.0;
+  if (!chunk.indexedAt) return 0.85; // Default for chunks without timestamp
+
+  const now = Date.now();
+  const indexedMs = new Date(chunk.indexedAt).getTime();
+  if (isNaN(indexedMs)) return 0.85;
+
+  const ageDays = (now - indexedMs) / (1000 * 60 * 60 * 24);
+  const lambda = Math.LN2 / DECAY_HALF_LIFE_DAYS;
+  return 0.5 + 0.5 * Math.exp(-ageDays * lambda);
+}
+
+interface HybridResult {
+  chunk: Chunk;
+  keywordScore: number;
+  vectorScore: number;
+  temporalMultiplier: number;
+  combinedScore: number;
+}
+
+function hybridSearch(
+  query: string,
+  keywordResults: SearchResult[],
+  vectorResults: VectorSearchResult[],
+  topK: number
+): HybridResult[] {
+  const map = new Map<Chunk, HybridResult>();
+
+  // Normalize keyword scores (max = 1.0)
+  const maxKw = keywordResults.length > 0 ? keywordResults[0].score : 1;
+  for (const r of keywordResults) {
+    map.set(r.chunk, {
+      chunk: r.chunk,
+      keywordScore: r.score / maxKw,
+      vectorScore: 0,
+      temporalMultiplier: temporalDecay(r.chunk),
+      combinedScore: 0,
+    });
+  }
+
+  // Merge vector scores
+  for (const r of vectorResults) {
+    const existing = map.get(r.chunk);
+    if (existing) {
+      existing.vectorScore = r.score;
+    } else {
+      map.set(r.chunk, {
+        chunk: r.chunk,
+        keywordScore: 0,
+        vectorScore: r.score,
+        temporalMultiplier: temporalDecay(r.chunk),
+        combinedScore: 0,
+      });
+    }
+  }
+
+  // Combined: 40% keyword + 60% semantic, multiplied by temporal decay
+  for (const r of map.values()) {
+    const rawScore = r.keywordScore * 0.4 + r.vectorScore * 0.6;
+    r.combinedScore = rawScore * r.temporalMultiplier;
+  }
+
+  const results = Array.from(map.values());
+  results.sort((a, b) => b.combinedScore - a.combinedScore);
+  return results.slice(0, topK);
+}
+
+// ---------------------------------------------------------------------------
+// File Watching
+// ---------------------------------------------------------------------------
+const watchers: ReturnType<typeof watch>[] = [];
+let indexPoll: ReturnType<typeof setInterval> | null = null;
+let rolePoll: ReturnType<typeof setInterval> | null = null;
+const INDEX_POLL_MS = 3_000;
+const ROLE_POLL_MS = 15_000;
+
+function stopWatching(): void {
+  for (const w of watchers) {
+    try {
+      w.close();
+    } catch {
+      /* ignore */
+    }
+  }
+  watchers.length = 0;
+}
+
+/** Indexer only: one fs.watch per source; a change rebuilds, embeds the new chunks, publishes. */
+function startWatching(): void {
+  stopWatching();
+
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  for (const source of sources) {
+    if (!existsSync(source.path)) continue;
+
+    try {
+      const w = watch(source.path, () => {
+        // Debounce: wait 500ms after last change before re-indexing
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(async () => {
+          if (role !== "indexer") return; // demoted while the timer ran
+          console.error(
+            `[ContextEngine] 📝 File changed: ${basename(source.path)} — re-indexing...`
+          );
+          await reindex();
+          console.error(
+            `[ContextEngine] ✅ Re-indexed: ${chunks.length} chunks from ${sources.length} sources`
+          );
+        }, 500);
+      });
+      watchers.push(w);
+    } catch {
+      // Can't watch this file (permission, network drive, etc.)
+    }
+  }
+
+  console.error(
+    `[ContextEngine] 👁 Watching ${watchers.length} source files for changes`
+  );
+}
+
+/** Reader only: reload the shared index when its stamp moves. A stat every 3 s, nothing else. */
+function startIndexPolling(): void {
+  if (indexPoll || !corpus) return;
+  indexPoll = setInterval(() => {
+    if (role !== "reader" || !corpus) return;
+    const m = sharedIndexMtime(corpus);
+    if (m !== null && m !== lastIndexMtime) adoptSharedIndex();
+  }, INDEX_POLL_MS);
+  indexPoll.unref();
+}
+
+function stopIndexPolling(): void {
+  if (indexPoll) clearInterval(indexPoll);
+  indexPoll = null;
+}
+
+/** Re-run the election; on a change of role, switch what this server does. */
+function evaluateRole(reason: string): void {
+  if (!corpus) return;
+  let e: ReturnType<typeof electIndexer>;
+  try {
+    e = electIndexer(corpus, listServers().servers, process.pid);
+  } catch (err) {
+    console.error(`[ContextEngine] ⚠ election failed, staying ${role}: ${(err as Error).message}`);
+    return;
+  }
+  indexerPid = e.indexer;
+  if (e.role === role) return;
+  const was = role;
+  role = e.role;
+  setRegistryRole?.(role);
+  safeAppend("server.role", { pid: process.pid, corpus, role, indexer: indexerPid, reason });
+  console.error(`[ContextEngine] 🧭 Role ${was} -> ${role} (${reason}; indexer pid ${indexerPid ?? process.pid})`);
+  if (role === "indexer") {
+    stopIndexPolling();
+    ensureModel().then(() => reindex()).then(() => startWatching()).catch((err) => {
+      console.error(`[ContextEngine] ⚠ taking over as indexer failed: ${(err as Error).message}`);
+    });
+  } else {
+    stopWatching();
+    startIndexPolling();
+  }
+}
+
+let healthTick = 0;
+let lastStaleCount = -1;
+
+/**
+ * The indexer writes ~/.contextengine/fleet-health.json once a minute: version drift, reindex
+ * rate, today's blocks and refusals, the last verified release. Every surface reads that file.
+ * [LOCK] [HEALTH-IS-MEASURED-NEVER-ESTIMATED]
+ */
+function publishHealth(): void {
+  try {
+    const h = computeFleetHealth({ version: PKG_VERSION });
+    if (h.servers.stale.length !== lastStaleCount) {
+      lastStaleCount = h.servers.stale.length;
+      if (lastStaleCount > 0) console.error(`[ContextEngine] 🧭 ${lastStaleCount} server(s) on an old build: pid ${h.servers.stale.map((s) => s.pid).join(", ")}`);
+    }
+    if (role === "indexer") writeFleetHealth(h);
+  } catch (err) {
+    console.error(`[ContextEngine] ⚠ fleet health failed: ${(err as Error).message}`);
+  }
+}
+
+function startRolePolling(): void {
+  if (rolePoll) return;
+  rolePoll = setInterval(() => {
+    if (corpus) evaluateRole("periodic");
+    if (++healthTick % 4 === 0) publishHealth(); // every 60 s
+  }, ROLE_POLL_MS);
+  rolePoll.unref();
+  setTimeout(publishHealth, 5_000).unref();
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+const server = new McpServer({
+  name: "ContextEngine",
+  version: PKG_VERSION,
+});
+
+// ---------------------------------------------------------------------------
+// Enforcement: Protocol Firewall — progressive response degradation
+// ---------------------------------------------------------------------------
+// The firewall instance is created above (in State section).
+// It wraps EVERY tool response and escalates: silent → footer → header → degraded.
+// At "degraded" level, tool output is truncated until the agent complies.
+// See src/firewall.ts for the full design.
+
+/** Helper: wrap a single-text tool response through the firewall */
+function respond(toolName: string, text: string, contextHint?: string) {
+  return {
+    content: [{ type: "text" as const, text: firewall.wrap(toolName, text, contextHint) }],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: search_context (hybrid: keyword + vector)
+// ---------------------------------------------------------------------------
+server.tool(
+  "search_context",
+  "Search across all indexed project knowledge (copilot-instructions, skills docs, runbooks, session docs). Uses hybrid BM25 keyword + semantic search with temporal decay. Returns the most relevant chunks with source file, section, and line numbers.",
+  {
+    query: z.string().describe("Natural language search query"),
+    top_k: z
+      .number()
+      .int()
+      .min(1)
+      .max(30)
+      .default(5)
+      .describe("Number of results to return (default 5)"),
+    mode: z
+      .enum(["hybrid", "keyword", "semantic"])
+      .default("hybrid")
+      .describe("Search mode: hybrid (default), keyword-only, or semantic-only"),
+  },
+  async ({ query, top_k, mode }) => {
+    let results: Array<{
+      chunk: Chunk;
+      score: number;
+      label: string;
+    }> = [];
+
+    // A reader keeps its 300 MB model unloaded until someone asks for semantics; the first such
+    // query is answered by keyword while the model loads. [LOCK] [EMBEDDINGS-ARE-CONTENT-ADDRESSED]
+    if (mode !== "keyword" && !isEmbeddingsReady()) void ensureModel();
+
+    if (mode === "keyword" || mode === "hybrid") {
+      const kwResults = searchChunks(chunks, query, top_k * 2);
+
+      if (mode === "keyword" || !isEmbeddingsReady()) {
+        results = kwResults.map((r) => ({
+          chunk: r.chunk,
+          score: r.score,
+          label: "keyword",
+        }));
+      } else {
+        // Hybrid
+        const vecResults = await vectorSearch(query, embeddedChunks, top_k * 2);
+        const hybrid = hybridSearch(query, kwResults, vecResults, top_k);
+        results = hybrid.map((r) => ({
+          chunk: r.chunk,
+          score: r.combinedScore,
+          label: `kw:${r.keywordScore.toFixed(2)} sem:${r.vectorScore.toFixed(2)} age:${r.temporalMultiplier.toFixed(2)}`,
+        }));
+      }
+    } else if (mode === "semantic") {
+      if (!isEmbeddingsReady()) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Semantic search unavailable — embeddings model not loaded. Use mode='keyword' or 'hybrid'.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const vecResults = await vectorSearch(query, embeddedChunks, top_k);
+      results = vecResults.map((r) => ({
+        chunk: r.chunk,
+        score: r.score,
+        label: "semantic",
+      }));
+    }
+
+    results = results.slice(0, top_k);
+
+    if (results.length === 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No results found for: "${query}"`,
+          },
+        ],
+      };
+    }
+
+    // Track how many results came from learnings (for value meter)
+    const learningRecalls = results.filter(
+      (r) => r.chunk.source.includes("Learnings") || r.chunk.source.includes("learning")
+    ).length;
+    if (learningRecalls > 0) {
+      firewall.recordSearchRecalls(learningRecalls);
+    }
+
+    const searchMode = isEmbeddingsReady() ? mode : "keyword (embeddings loading)";
+    const text = [
+      `Search: "${query}" | Mode: ${searchMode} | ${results.length} results`,
+      "",
+      ...results.map((r, i) =>
+        [
+          `--- Result ${i + 1} (${r.label}: ${r.score.toFixed(3)}) ---`,
+          ...(r.chunk.locked
+            ? ["🔒 LOCKED — This content has been verified. DO NOT re-audit or re-implement."]
+            : []),
+          `Source: ${r.chunk.source}`,
+          `Section: ${r.chunk.section}`,
+          `Lines: ${r.chunk.lineStart}-${r.chunk.lineEnd}`,
+          "",
+          r.chunk.content,
+        ].join("\n")
+      ),
+    ].join("\n\n");
+
+    return respond("search_context", text, query);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_sources
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_sources",
+  "List all knowledge sources indexed by ContextEngine, each with a one-line summary (from the file's own head: frontmatter description, title plus first sentence, or module docstring), status (found/missing) and chunk counts. Read the summary to pick the right source before calling read_source.",
+  {},
+  async () => {
+    const lines = sources.map((s) => {
+      const exists = existsSync(s.path);
+      const count = chunks.filter((c) => c.source === s.name).length;
+      const embeddedCount = embeddedChunks.filter(
+        (ec) => ec.chunk.source === s.name
+      ).length;
+      const status = exists
+        ? `✅ ${count} chunks${embeddedCount > 0 ? ` (${embeddedCount} embedded)` : ""}`
+        : "⚠ file not found";
+      const summary = exists ? summarizeSource(s) : "";
+      return `${s.name}: ${status}${summary ? `\n  ${summary}` : ""}\n  ${s.path}`;
+    });
+
+    const embStatus = isEmbeddingsReady()
+      ? `✅ ${embeddedChunks.length} vectors`
+      : "⏳ loading...";
+
+    const text = [
+      `ContextEngine v${PKG_VERSION}`,
+      `Sources: ${sources.length} | Chunks: ${chunks.length} | Embeddings: ${embStatus}`,
+      "",
+      ...lines,
+    ].join("\n");
+
+    return respond("list_sources", text);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: read_source
+// ---------------------------------------------------------------------------
+server.tool(
+  "read_source",
+  "Read the full content of a specific knowledge source by name.",
+  {
+    source_name: z
+      .string()
+      .describe("Name of the source (from list_sources output)"),
+  },
+  async ({ source_name }) => {
+    const source = sources.find(
+      (s) => s.name.toLowerCase() === source_name.toLowerCase()
+    );
+    if (!source) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Unknown source: "${source_name}". Use list_sources to see available sources.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (!existsSync(source.path)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Source file not found: ${source.path}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const content = readFileSync(source.path, "utf-8");
+    return respond("read_source", `# ${source.name}\n\n${content}`, source_name);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: reindex
+// ---------------------------------------------------------------------------
+server.tool(
+  "reindex",
+  "Force a full re-index of all knowledge sources. Use after adding new files or changing contextengine.json.",
+  {},
+  async () => {
+    if (role === "reader" && corpus) {
+      adoptSharedIndex();
+      return respond(
+        "reindex",
+        `This server reads the shared index of corpus ${corpus}, written by pid ${indexerPid ?? "?"}: reloaded seq ${indexSeq}, ${chunks.length} chunks, ${embeddedChunks.length} vectors. Saving a doc makes the indexer rebuild; every reader picks it up within ${INDEX_POLL_MS / 1000} s.`
+      );
+    }
+    await reindex();
+    return respond("reindex", `Re-indexed: ${chunks.length} chunks from ${sources.length} sources. Embeddings: ${embeddedChunks.length} vectors.`);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_projects (Multi-Agent Phase 1)
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_projects",
+  "Discover and analyze all projects in the workspace. Shows tech stack (framework, runtime, key dependencies), infrastructure (git, docker, pm2), and git remote status for each project. Requires Pro license.",
+  {},
+  async () => {
+    const gate = gateCheck("list_projects");
+    if (gate) return { content: [{ type: "text" as const, text: gate }] };
+    const projectDirs = loadProjectDirs();
+    const projects = listProjects(projectDirs);
+    const text = formatProjectList(projects);
+    return respond("list_projects", text, "projects infrastructure stack");
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: check_ports (Multi-Agent Phase 1)
+// ---------------------------------------------------------------------------
+server.tool(
+  "check_ports",
+  "Scan all projects for port declarations (ecosystem.config.js, docker-compose.yml, .env, package.json) and detect port conflicts. Returns a port allocation map with conflict warnings. Requires Pro license.",
+  {},
+  async () => {
+    const gate = gateCheck("check_ports");
+    if (gate) return { content: [{ type: "text" as const, text: gate }] };
+    const projectDirs = loadProjectDirs();
+    const { ports, conflicts } = checkPorts(projectDirs);
+    const text = formatPortMap(ports, conflicts);
+    return respond("check_ports", text, "port conflicts allocation");
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: run_audit (Multi-Agent Phase 1 — Compliance Agent)
+// ---------------------------------------------------------------------------
+server.tool(
+  "run_audit",
+  "Run the Compliance Agent audit across all projects. Checks: port conflicts, git remotes (origin + gdrive), git hooks (post-commit auto-push), .env files (existence + gitignore), Docker config (restart policy, workdir), PM2 config (treekill, kill_timeout, no bash wrappers), version issues (EOL runtimes, outdated deps, MUI v4/v5 coexistence). Returns a structured plan with findings and remediation steps.",
+  {
+    scope: z
+      .enum(["all", "compliance", "versions", "ports"])
+      .default("all")
+      .describe("Audit scope: all checks, compliance only, version checks only, or port conflicts only"),
+  },
+  async ({ scope }) => {
+    const gate = gateCheck("run_audit");
+    if (gate) return { content: [{ type: "text" as const, text: gate }] };
+    const projectDirs = loadProjectDirs();
+    const plan = runComplianceAudit(projectDirs);
+    const text = formatPlan(plan);
+    return respond("run_audit", text, `audit ${scope}`);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: score_project (AI-Readiness Scoring)
+// ---------------------------------------------------------------------------
+server.tool(
+  "score_project",
+  "Score one or all projects on AI-readiness (0-100%). Checks documentation (copilot-instructions, README, CLAUDE.md, .cursorrules, SKILLS.md, .env.example), infrastructure (git, hooks, Docker, CI, deploy scripts, PM2), code quality (tests, TypeScript, linting, npm scripts), and security (.env gitignored, secrets exposure, lockfiles). Returns letter grade (A+ to F) with detailed breakdown.",
+  {
+    project: z
+      .string()
+      .optional()
+      .describe("Project name OR absolute directory path to score. Omit to score all projects."),
+  },
+  async ({ project }) => {
+    const gate = gateCheck("score_project");
+    if (gate) return { content: [{ type: "text" as const, text: gate }] };
+
+    // 🔒 LOCKED [SCORE-CANARY-COVERS-EVERY-SCORER] — 2026-08-19
+    // ⛔ NEVER let a scoring entry point run without the canary.
+    // WHY: [SCORE-CANARY] was wired on the CLI only. This MCP tool — the path
+    //    Claude Code actually scores through — had zero call sites, so a
+    //    drifting scorer would have been caught when a human typed the
+    //    command and missed entirely when an agent called the tool. Session
+    //    21 §H2 found the same shape in the fleet-write guard: a guard that
+    //    covers one caller reads, from the outside, exactly like one that works.
+    // FIX: canary here too. This tool never writes SCORE.md, so a deviation
+    //    is reported rather than fatal — but it is never silent.
+    const canary = runScoreCanary();
+    if (!canary.ok) {
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            "🚨 Scoring canary FAILED — these scores are NOT trustworthy.\n\n" +
+            canary.deviations.map((d) => `   • ${d}`).join("\n") +
+            (canary.inconclusive
+              ? "\n\nThe canary fixture could not be built, so the scorer is unverified. This is an unknown, not a pass."
+              : "\n\nThe scorer no longer behaves as pinned. Fix the deviation or update the pin deliberately."),
+        }],
+      };
+    }
+
+    const projectDirs = loadProjectDirs();
+
+    let scores;
+    if (project) {
+      // [SCORE-ACCEPTS-PATH] — resolve names and paths alike. This tool never writes
+      // SCORE.md, so unlike the CLI its fleet-wide default is harmless and is kept.
+      const dir = resolveProjectDir(project, projectDirs);
+      if (!dir) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Project "${project}" not found — not a known project name, and not an existing directory. Available: ${projectDirs.map((d) => d.name).join(", ")}`,
+            },
+          ],
+        };
+      }
+      scores = [scoreProject(dir)];
+    } else {
+      scores = projectDirs.map(scoreProject);
+    }
+
+    const text = formatScoreReport(scores);
+    return respond("score_project", text, project || "all projects scoring");
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: save_session (Session Persistence)
+// ---------------------------------------------------------------------------
+server.tool(
+  "save_session",
+  "Save a key-value entry to a named session. Use to persist decisions, context, plans, and findings between coding sessions. Each session can hold multiple keys (e.g., 'summary', 'active_tasks', 'decisions'). Keys are updated in place if they already exist.",
+  {
+    session: z
+      .string()
+      .describe("Session name (e.g., 'admin-crowlr-upgrade', 'compr-app-v2'). Will be created if it doesn't exist."),
+    key: z
+      .string()
+      .describe("Entry key within the session (e.g., 'summary', 'active_tasks', 'decisions', 'blockers')"),
+    value: z
+      .string()
+      .describe("Content to save — can be a summary, list of tasks, decisions, notes, code snippets, etc."),
+  },
+  async ({ session, key, value }) => {
+    const result = saveSession(session, key, value);
+    return respond("save_session", `✅ Saved key "${key}" to session "${session}" (${result.entries.length} entries total)`);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: load_session (Session Persistence)
+// ---------------------------------------------------------------------------
+server.tool(
+  "load_session",
+  "Load a previously saved session by name. Returns all stored key-value entries with timestamps. Use at the start of a session to restore context from a previous conversation.",
+  {
+    session: z
+      .string()
+      .describe("Session name to load"),
+  },
+  async ({ session }) => {
+    const result = loadSession(session);
+    if (!result) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No session found with name "${session}". Use \`list_sessions\` to see available sessions.`,
+          },
+        ],
+      };
+    }
+    const text = formatSession(result);
+    return respond("load_session", text);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_sessions (Session Persistence)
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_sessions",
+  "List all saved sessions. Shows session names, entry counts, and timestamps. Use to discover what context is available from previous conversations.",
+  {},
+  async () => {
+    const sessions = listSessions();
+    const text = formatSessionList(sessions);
+    return respond("list_sessions", text);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: delete_session (Session Persistence)
+// ---------------------------------------------------------------------------
+server.tool(
+  "delete_session",
+  "Delete a saved session by name. Returns success/not-found. Use for cleanup of stale or obsolete session context.",
+  {
+    name: z.string().describe("Session name to delete"),
+  },
+  async ({ name }) => {
+    const ok = deleteSession(name);
+    if (ok) {
+      return respond("delete_session", `✅ Deleted session "${name}".`);
+    }
+    const available = listSessions().map((s) => s.name);
+    const hint = available.length
+      ? `\n\nAvailable sessions: ${available.join(", ")}`
+      : "";
+    return respond("delete_session", `Session "${name}" not found.${hint}`);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: audit_verify (Compliance — tamper-evident audit log)
+// ---------------------------------------------------------------------------
+server.tool(
+  "audit_verify",
+  "Verify the integrity of the local audit log chain. Returns OK + record count, or BROKEN + break index when a record has been edited or the chain otherwise diverges. Produces evidence aligned with SOC 2 CC7.2 (change monitoring) and ISO 27001 A.12.4.1 (event logging) — evidence artifacts, not a certification (OpsContext is not itself SOC 2– or ISO 27001–certified; see docs/compliance/). The audit log lives at ~/.contextengine/audit.log and records every state-changing operation (learning save/delete/import, session save/delete, activation activate/deactivate) as a hash-chained JSONL line.",
+  {
+    since: z.string().optional().describe("ISO date — restrict integrity report counters to records on/after this timestamp (chain still verified end-to-end)"),
+    until: z.string().optional().describe("ISO date — restrict counters to records on/before this timestamp"),
+  },
+  async ({ since, until }) => {
+    const report = verifyChain();
+    const records = (() => {
+      try { return readAuditLog(); } catch { return []; }
+    })();
+    const filtered = filterByRange(records, since, until);
+    const summary: string[] = [];
+    summary.push(`Audit chain: ${report.ok ? "✅ INTACT" : "❌ BROKEN"}`);
+    summary.push(`Total records: ${report.total}`);
+    if ((report.redactedIndices ?? []).length > 0) {
+      summary.push(`Redacted and acknowledged on the chain: ${report.redactedIndices!.length} record(s), not counted as altered`);
+    }
+    if (since || until) {
+      summary.push(`Range filter: ${since ?? "start"} → ${until ?? "now"}  (${filtered.length} record(s) in range)`);
+    }
+    if (!report.ok) {
+      summary.push(`Break at index: ${report.breakAtIndex}`);
+      summary.push(`Reason: ${report.breakReason}`);
+      summary.push("");
+      summary.push("A broken chain means the log was either edited after the fact or partially");
+      summary.push("written during a crash. For compliance evidence, treat all records from the");
+      summary.push("break onward as unverified.");
+    }
+    return respond("audit_verify", summary.join("\n"));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: agent_cost (multi-agent token / cost / capacity report)
+// ---------------------------------------------------------------------------
+// Same renderer as `contextengine cost`. [LOCK] [COST-REPORT-ONE-RENDERER]
+// Free tool: it reads the caller's own Claude Code transcripts on this machine,
+// nothing leaves it. Added 2026-08-21, one day after the CLI (707fcc8).
+server.tool(
+  "agent_cost",
+  "Multi-agent cost report from Claude Code's own transcripts on this machine: tokens moved (cache read/write, fresh input, output), valued cost at API list prices (marked NOTIONAL on a subscription, UNPRICED when no rate matches), capacity intensity (subagents, failed, died at window, tool calls per agent, cache reuse), top runs, and context_burn / fanout_without_canary signals. Call it after a fan-out to read what it consumed, or before one to compare with the last. Thresholds come from .contextengine/policy.json agent_cost, else built-in defaults.",
+  {
+    days: z.number().int().positive().optional().describe("Only runs started within the last N days"),
+    project: z.string().optional().describe("Filter by project slug as it appears in ~/.claude/projects (e.g. -Users-yan-Projects-ContextEngine)"),
+    session: z.string().optional().describe("Filter by parent session id"),
+    run: z.string().optional().describe("Filter by run id (wf_... or task group id)"),
+    top: z.number().int().positive().max(50).optional().describe("How many runs to list (default 10)"),
+    json: z.boolean().optional().describe("Return the structured JSON report instead of the text one"),
+    policy_dir: z.string().optional().describe("Absolute path of the repo whose .contextengine/policy.json supplies agent_cost thresholds and rates. Default: the MCP server's working directory, which under launchd is the home dir, not a repo; the report names which source it used on its 'thresholds:' line"),
+  },
+  async ({ days, project, session, run, top, json, policy_dir }) => {
+    // [COST-POLICY-DIR-IS-EXPLICIT] — the daemon's cwd is not a project. Without this the MCP
+    // surface silently priced with built-in defaults while the CLI in the repo read policy.json.
+    const report = buildCostReport({ days, project, session, run, top }, policy_dir || process.cwd());
+    if (json && report.json) return respond("agent_cost", JSON.stringify(report.json, null, 2));
+    return respond("agent_cost", report.text);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: drift_status (Detector — read current drift signals)
+// ---------------------------------------------------------------------------
+// Agents should call this between major task phases. If any 'critical' signal
+// is active, they should pause and surface to the human. The signals are also
+// appended to the audit log as drift.detected events so post-hoc review can
+// reconstruct what fired and when.
+server.tool(
+  "drift_status",
+  "Returns active drift / loop / stuck-tool / fabrication / silent-failure signals detected over the recent audit-log window. Use to self-check before starting a major task phase. If any 'critical' signal is active (fabrication_suspect or silent_failure), pause and surface to the human.",
+  {
+    windowSeconds: z.number().optional().describe("Look-back window in seconds. Default 300 (5 min)."),
+    minSeverity: z.enum(["info", "warn", "critical"]).optional().describe("Floor filter for severity. Default 'info' (everything)."),
+  },
+  async ({ windowSeconds, minSeverity }) => {
+    const signals = detect({ windowSeconds: windowSeconds ?? 300 });
+    const order = { info: 0, warn: 1, critical: 2 } as const;
+    const floor = order[minSeverity ?? "info"];
+    const filtered = signals.filter((s) => order[s.severity] >= floor);
+    const lines: string[] = [];
+    lines.push(`Drift signals: ${filtered.length} active (window=${windowSeconds ?? 300}s, minSeverity=${minSeverity ?? "info"}).`);
+    if (filtered.length === 0) {
+      lines.push("All clear.");
+    } else {
+      for (const s of filtered) {
+        const sev = s.severity.toUpperCase();
+        lines.push(`  [${sev}] ${s.kind}: ${s.reason}`);
+      }
+      const critical = filtered.filter((s) => s.severity === "critical");
+      if (critical.length > 0) {
+        lines.push("");
+        lines.push(`⛔ ${critical.length} CRITICAL signal(s) — pause the task and surface to the human.`);
+      }
+    }
+    return respond("drift_status", lines.join("\n"));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: end_session (End-of-Session Protocol Enforcer)
+// ---------------------------------------------------------------------------
+server.tool(
+  "end_session",
+  "MUST be called before ending any coding session. Checks all project repos for uncommitted changes, verifies documentation freshness (copilot-instructions.md, SKILLS.md, session docs), and returns a checklist of required actions. Will report PASS/FAIL for each check. The AI agent should resolve all FAIL items before ending.",
+  {},
+  async () => {
+    const projectDirs = loadProjectDirs();
+    const checks: string[] = [];
+    let passCount = 0;
+    let failCount = 0;
+
+    checks.push("# End-of-Session Protocol\n");
+
+    // --- Check 1: Uncommitted changes across all repos ---
+    checks.push("## 1. Uncommitted Changes\n");
+    const reposChecked = new Set<string>();
+
+    for (const dir of projectDirs) {
+      try {
+        // Find the git root for this project
+        const gitRoot = execSync("git rev-parse --show-toplevel", {
+          cwd: dir.path,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+
+        if (reposChecked.has(gitRoot)) continue;
+        reposChecked.add(gitRoot);
+
+        const status = execSync("git status --porcelain", {
+          cwd: gitRoot,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+
+        const repoName = basename(gitRoot);
+        if (status) {
+          const fileCount = status.split("\n").length;
+          checks.push(`- ❌ **FAIL** — \`${repoName}\` has ${fileCount} uncommitted file(s)`);
+          // Show first 5 files
+          const files = status.split("\n").slice(0, 5);
+          for (const f of files) {
+            checks.push(`  - \`${f.trim()}\``);
+          }
+          if (fileCount > 5) checks.push(`  - ... and ${fileCount - 5} more`);
+          failCount++;
+        } else {
+          checks.push(`- ✅ **PASS** — \`${repoName}\` is clean`);
+          passCount++;
+        }
+      } catch {
+        // Not a git repo or git not available
+      }
+    }
+
+    // Also check common doc repos that might not be in projectDirs
+    const extraRepoPaths = [
+      join(process.env.HOME || "", "FASTPROD"),
+    ];
+    for (const repoPath of extraRepoPaths) {
+      if (!existsSync(repoPath) || reposChecked.has(repoPath)) continue;
+      try {
+        const gitRoot = execSync("git rev-parse --show-toplevel", {
+          cwd: repoPath,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+
+        if (reposChecked.has(gitRoot)) continue;
+        reposChecked.add(gitRoot);
+
+        const status = execSync("git status --porcelain", {
+          cwd: gitRoot,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+
+        const repoName = basename(gitRoot);
+        if (status) {
+          const fileCount = status.split("\n").length;
+          checks.push(`- ❌ **FAIL** — \`${repoName}\` has ${fileCount} uncommitted file(s)`);
+          failCount++;
+        } else {
+          checks.push(`- ✅ **PASS** — \`${repoName}\` is clean`);
+          passCount++;
+        }
+      } catch {
+        // Not a git repo
+      }
+    }
+
+    checks.push("");
+
+    // --- Check 2: Documentation freshness ---
+    checks.push("## 2. Documentation Freshness\n");
+    const now = Date.now();
+    const SESSION_THRESHOLD_MS = 4 * 60 * 60 * 1000; // 4 hours — if not modified in current session, flag it
+
+    // Find copilot-instructions.md files across projects
+    let copilotFound = false;
+    for (const dir of projectDirs) {
+      const copilotPath = join(dir.path, ".github", "copilot-instructions.md");
+      if (existsSync(copilotPath)) {
+        copilotFound = true;
+        try {
+          const stat = statSync(copilotPath);
+          const ageMs = now - stat.mtimeMs;
+          if (ageMs < SESSION_THRESHOLD_MS) {
+            const mins = Math.round(ageMs / 60000);
+            checks.push(`- ✅ **PASS** — \`${dir.name}/copilot-instructions.md\` updated ${mins}m ago`);
+            passCount++;
+          } else {
+            const hours = Math.round(ageMs / 3600000);
+            checks.push(`- ⚠️ **CHECK** — \`${dir.name}/copilot-instructions.md\` last modified ${hours}h ago — update if anything changed`);
+            failCount++;
+          }
+        } catch {
+          checks.push(`- ⚠️ **CHECK** — \`${dir.name}/copilot-instructions.md\` could not be read`);
+        }
+      }
+    }
+    if (!copilotFound) {
+      checks.push("- ⚠️ **CHECK** — No copilot-instructions.md found in any project");
+    }
+
+    // Check SKILLS.md
+    const skillsPaths = [
+      join(process.env.HOME || "", "Projects", "EXO", "SKILLS.md"),
+    ];
+    for (const sp of skillsPaths) {
+      if (existsSync(sp)) {
+        try {
+          const stat = statSync(sp);
+          const ageMs = now - stat.mtimeMs;
+          if (ageMs < SESSION_THRESHOLD_MS) {
+            const mins = Math.round(ageMs / 60000);
+            checks.push(`- ✅ **PASS** — \`SKILLS.md\` updated ${mins}m ago`);
+            passCount++;
+          } else {
+            const hours = Math.round(ageMs / 3600000);
+            checks.push(`- ⚠️ **CHECK** — \`SKILLS.md\` last modified ${hours}h ago — update if new capabilities were learned`);
+            failCount++;
+          }
+        } catch {
+          // Can't stat
+        }
+      }
+    }
+
+    // Check session doc
+    const sessionDocPath = join(process.env.HOME || "", "FASTPROD", "docs", "CROWLR_COMPR_APPS_SESSION.md");
+    if (existsSync(sessionDocPath)) {
+      try {
+        const stat = statSync(sessionDocPath);
+        const ageMs = now - stat.mtimeMs;
+        if (ageMs < SESSION_THRESHOLD_MS) {
+          const mins = Math.round(ageMs / 60000);
+          checks.push(`- ✅ **PASS** — \`SESSION.md\` updated ${mins}m ago`);
+          passCount++;
+        } else {
+          const hours = Math.round(ageMs / 3600000);
+          checks.push(`- ⚠️ **CHECK** — \`SESSION.md\` last modified ${hours}h ago — append session summary`);
+          failCount++;
+        }
+      } catch {
+        // Can't stat
+      }
+    }
+
+    checks.push("");
+
+    // --- Summary ---
+    checks.push("## Summary\n");
+    const total = passCount + failCount;
+    if (failCount === 0) {
+      checks.push(`✅ **ALL CLEAR** — ${passCount}/${total} checks passed. Safe to end session.`);
+    } else {
+      checks.push(`⚠️ **${failCount} item(s) need attention** — ${passCount}/${total} passed.`);
+      checks.push("");
+      checks.push("**Before ending this session, please:**");
+      checks.push("1. Commit and push all uncommitted changes");
+      checks.push("2. Update copilot-instructions.md with version/feature changes");
+      checks.push("3. Update SKILLS.md if new capabilities were used");
+      checks.push("4. Append a session summary to SESSION.md");
+      checks.push("5. Run `end_session` again to verify all clear");
+    }
+
+    return respond("end_session", checks.join("\n"));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: save_learning (Permanent Learning Store)
+// ---------------------------------------------------------------------------
+server.tool(
+  "save_learning",
+  "Save a permanent operational rule learned during a coding session. Unlike sessions (ephemeral), learnings persist forever and auto-surface in search_context results so AI agents don't repeat mistakes. Duplicate rules (same category + rule text) are updated in place.",
+  {
+    category: z
+      .enum(LEARNING_CATEGORIES)
+      .describe("Category: deployment, api, database, frontend, backend, devops, security, performance, testing, debugging, tooling, git, dependencies, architecture, data, infrastructure, mobile, other"),
+    rule: z
+      .string()
+      .describe("The operational rule — concise, actionable (e.g., 'Always restart Flask after model changes')"),
+    context: z
+      .string()
+      .describe("Full context of how this was discovered — the bug, the fix, the symptoms (e.g., 'Avatar save returned 200 but field missing from API response — stale to_dict() cache')"),
+    project: z
+      .string()
+      .optional()
+      .describe("Project this learning applies to (e.g., 'CROWLR.io'). Omit if it's a general rule."),
+  },
+  async ({ category, rule, context, project }) => {
+    try {
+      const learning = saveLearning(category, rule, context, project);
+      const stats = learningsStats();
+
+      // Re-inject learnings into search index (project-scoped)
+      const newChunks = learningsToChunks(activeProjectNames);
+      // Remove old learning chunks and add new ones
+      const nonLearningChunks = chunks.filter((c) => c.source !== "💡 Learnings Store");
+      chunks.length = 0;
+      chunks.push(...nonLearningChunks, ...newChunks);
+
+      return respond("save_learning", [
+              `✅ Learning saved: **${rule}**`,
+              ``,
+              `- **ID:** \`${learning.id}\``,
+              `- **Category:** ${category}`,
+              project ? `- **Project:** ${project}` : "",
+              `- **Tags:** ${(learning.tags ?? []).join(", ")}`, // [LOCK] [LEARNING-FIELDS-ARE-OPTIONAL-ON-READ]
+              ``,
+              `📊 Store: ${stats.total} learnings across ${Object.keys(stats.categories).length} categories`,
+              ``,
+              `This learning will now auto-surface in \`search_context\` results when relevant.`,
+            ]
+              .filter(Boolean)
+              .join("\n"));
+    } catch (e: any) {
+      return respond("save_learning", `❌ Learning rejected: ${e.message}`);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_learnings (Permanent Learning Store)
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_learnings",
+  "List all permanent learnings, optionally filtered by category. Shows operational rules that have been discovered across sessions. Use search_context to find learnings by keyword — they're automatically included in search results.",
+  {
+    category: z
+      .string()
+      .optional()
+      .describe("Filter by category (deployment, api, database, etc.). Omit to show all."),
+    since: z
+      .string()
+      .optional()
+      .describe("Only learnings created at or after this boundary: 'today', 'yesterday' (Europe/Zurich calendar days) or an ISO date/instant. Every entry shows its created instant, UTC plus Europe/Zurich."),
+  },
+  async ({ category, since }) => {
+    // Project-scoped: only show learnings for active workspace projects + universal (no project)
+    let sinceDate: Date | undefined;
+    if (since) {
+      const parsed = parseSince(since);
+      if (!parsed) return respond("list_learnings", `❌ since="${since}" is not today, yesterday, or an ISO date. No list rendered, so this is not a zero.`);
+      sinceDate = parsed;
+    }
+    const learnings = listLearnings(category, activeProjectNames);
+    const text = formatLearnings(learnings, { since: sinceDate, sinceSpec: since });
+    return respond("list_learnings", text);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: delete_learning (Permanent Learning Store)
+// ---------------------------------------------------------------------------
+server.tool(
+  "delete_learning",
+  "Delete a learning by its ID. Use list_learnings first to find the ID of the learning you want to remove.",
+  {
+    id: z.string().describe("The unique ID of the learning to delete"),
+  },
+  async ({ id }) => {
+    const deleted = deleteLearning(id);
+    if (!deleted) {
+      return respond("delete_learning", `❌ No learning found with ID "${id}". Use \`list_learnings\` to see available IDs.`);
+    }
+    // Re-inject learnings into search index
+    const newChunks = learningsToChunks(activeProjectNames);
+    const nonLearningChunks = chunks.filter((c) => c.source !== "💡 Learnings Store");
+    chunks.length = 0;
+    chunks.push(...nonLearningChunks, ...newChunks);
+    return respond("delete_learning", `✅ Learning "${id}" deleted successfully.`);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: import_learnings (Bulk Import from Files)
+// ---------------------------------------------------------------------------
+server.tool(
+  "import_learnings",
+  "Bulk-import learnings from a Markdown or JSON file. By default only MARKED learnings are imported: inline bullets with a [category] prefix, anything inside a *LEARNINGS.md file, anything under a heading that says learnings / lessons / gotchas / rules, and JSON arrays of {category, rule, context}. Set permissive=true to also import every H3 heading, bold bullet and table row (H2=category, H3=rule, bullets=context). Deduplicates against existing learnings.",
+  {
+    file_path: z
+      .string()
+      .describe("Absolute path to the Markdown (.md) or JSON (.json) file to import from"),
+    default_category: z
+      .string()
+      .optional()
+      .describe("Default category for rules where category cannot be inferred. Defaults to 'other'."),
+    project: z
+      .string()
+      .optional()
+      .describe("Project name to tag all imported learnings with (e.g., 'FC_project')"),
+    permissive: z
+      .boolean()
+      .optional()
+      .describe("Import every heading, bold bullet and table row as a rule (the pre-2.5.7 behaviour). Default false: only marked learnings."),
+  },
+  async ({ file_path, default_category, project, permissive }) => {
+    let result;
+    try {
+      result = importLearningsFromFile(
+        file_path,
+        default_category || "other",
+        project,
+        { permissive: permissive === true },
+      );
+    } catch (e: any) {
+      return respond("import_learnings", `⛔ Import refused: ${e?.message || e}`);
+    }
+
+    // Re-inject learnings into search index (project-scoped)
+    const newChunks = learningsToChunks(activeProjectNames);
+    const nonLearningChunks = chunks.filter((c) => c.source !== "💡 Learnings Store");
+    chunks.length = 0;
+    chunks.push(...nonLearningChunks, ...newChunks);
+
+    const stats = learningsStats();
+    const lines = [
+      `# Import Results\n`,
+      `- **Imported:** ${result.imported} new learnings`,
+      `- **Updated:** ${result.updated} existing learnings (dedup match)`,
+      `- **Skipped:** ${result.skipped} entries (missing data)`,
+      `- **Ignored:** ${result.ignored} headings / bold bullets / table rows outside a learnings scope (pass permissive=true to import them)`,
+      ``,
+      `📊 Store total: ${stats.total} learnings across ${Object.keys(stats.categories).length} categories`,
+      ``,
+    ];
+
+    if (result.errors.length > 0) {
+      lines.push(`## ⚠️ Errors (${result.errors.length})\n`);
+      for (const err of result.errors.slice(0, 10)) {
+        lines.push(`- ${err}`);
+      }
+      if (result.errors.length > 10) {
+        lines.push(`- ... and ${result.errors.length - 10} more`);
+      }
+    }
+
+    lines.push(`\nAll imported learnings now auto-surface in \`search_context\` results.`);
+
+    return respond("import_learnings", lines.join("\n"));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: activate (License Activation)
+// ---------------------------------------------------------------------------
+server.tool(
+  "activate",
+  "Activate a ContextEngine Pro license to unlock premium tools (score_project, run_audit, check_ports, list_projects, HTML reports). Get a license at https://api.compr.ch/contextengine/pricing",
+  {
+    license_key: z.string().describe("Your ContextEngine license key"),
+    email: z.string().describe("Email associated with the license"),
+  },
+  async ({ license_key, email }) => {
+    const result = await activate(license_key, email);
+    return respond("activate", result.message);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: activation_status (Check License)
+// ---------------------------------------------------------------------------
+server.tool(
+  "activation_status",
+  "Check current ContextEngine license status, plan, and available premium tools.",
+  {},
+  async () => {
+    const status = getActivationStatus();
+    const lines = [
+      `## ContextEngine License Status\n`,
+      `- **Activated**: ${status.activated ? "✅ Yes" : "❌ No"}`,
+      `- **Plan**: ${status.plan}`,
+      `- **Expires**: ${status.expiresAt}`,
+      `- **Delta version**: ${status.deltaVersion}`,
+      `- **Machine ID**: ${status.machineId}`,
+      ``,
+    ];
+    if (status.premiumTools.length > 0) {
+      lines.push(`### 🔓 Premium Tools Available`);
+      for (const t of status.premiumTools) {
+        lines.push(`- ${t}`);
+      }
+    } else {
+      lines.push(`### 🔒 Premium Tools (requires activation)`);
+      lines.push(`- score_project, run_audit, check_ports, list_projects`);
+      lines.push(``);
+      lines.push(`Get a license: https://api.compr.ch/contextengine/pricing`);
+      lines.push(`Activate: \`npx contextengine activate <key> <email>\``);
+    }
+    return respond("activation_status", lines.join("\n"));
+  }
+);
+
+// ---------------------------------------------------------------------------
+// MCP Resources: expose each source as a browsable resource
+// ---------------------------------------------------------------------------
+function registerResources(): void {
+  // Static resources for each discovered source — deduplicate by URI
+  const registered = new Set<string>();
+  for (const source of sources) {
+    if (!existsSync(source.path)) continue;
+
+    const uri = `context://${encodeURIComponent(source.name)}`;
+    if (registered.has(uri)) continue;
+    registered.add(uri);
+
+    server.resource(
+      source.name,
+      uri,
+      {
+        description: `Knowledge source: ${source.name}`,
+        mimeType: "text/markdown",
+      },
+      async () => {
+        const content = existsSync(source.path)
+          ? readFileSync(source.path, "utf-8")
+          : `Source file not found: ${source.path}`;
+
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: "text/markdown",
+              text: content,
+            },
+          ],
+        };
+      }
+    );
+  }
+
+  console.error(
+    `[ContextEngine] 📚 Registered ${registered.size} MCP resources (${sources.length - registered.size} duplicates skipped)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+async function main() {
+  // 0. Inventory this server FIRST, before indexing takes minutes: a server exists the moment it
+  //    starts. [LOCK] [SERVERS-ARE-INVENTORIED]. With the shared index on, the registry is also
+  //    the electorate: the record carries the corpus and the role. [LOCK] [ONE-INDEXER-MANY-READERS]
+  if (sharedIndexEnabled()) {
+    try {
+      corpus = corpusId();
+    } catch (err) {
+      console.error("[ContextEngine] ⚠ corpus id failed, shared index off for this server:", err);
+    }
+  }
+  try {
+    const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined });
+    setRegistryRole = reg.setRole;
+    const fleet = listServers();
+    if (corpus) {
+      const e = electIndexer(corpus, fleet.servers, process.pid);
+      role = e.role;
+      indexerPid = e.indexer;
+      reg.setRole(role);
+      safeAppend("server.role", { pid: process.pid, corpus, role, indexer: indexerPid, reason: "start" });
+    }
+    console.error(`[ContextEngine] 🧭 ${formatServers(fleet)}`);
+    if (corpus) console.error(`[ContextEngine] 🧭 This server: ${role} of corpus ${corpus}${role === "reader" ? ` (indexer pid ${indexerPid})` : ""}`);
+    safeAppend("server.start", { pid: reg.record.pid, parent: reg.record.parent, version: reg.record.version, build: reg.record.build, cwd: reg.record.cwd, servers_running: fleet.servers.length, stale_builds: fleet.servers.filter((x) => x.staleBuild).length });
+  } catch (err) {
+    console.error("[ContextEngine] ⚠ Server registry failed:", err);
+  }
+
+  // 1. The index: a reader takes the indexer's; everyone else, or a reader with nothing to
+  //    take yet, builds it (fast, keyword search available immediately).
+  let adopted = false;
+  if (role === "reader") adopted = adoptSharedIndex();
+  if (!adopted) {
+    if (role === "reader") console.error("[ContextEngine] 📥 No shared index yet; building locally once, without importing learnings");
+    await buildIndex({ importLearnings: role === "indexer", loadAdapters: true });
+  }
+
+  // 2. Register MCP resources
+  registerResources();
+
+  // 2b. Auto-inject recent session context into search index
+  const recentSessions = listSessions();
+  if (recentSessions.length > 0) {
+    // Sort by updated desc, take the most recent
+    recentSessions.sort((a, b) => new Date(b.updated).getTime() - new Date(a.updated).getTime());
+    const recent = recentSessions[0];
+    const recentSession = loadSession(recent.name);
+    if (recentSession) {
+      const ageHours = (Date.now() - new Date(recentSession.updated).getTime()) / 3600000;
+      if (ageHours < 72) { // Only inject if session is less than 3 days old
+        const sessionContent = recentSession.entries
+          .map((e) => `### ${e.key}\n${e.value}`)
+          .join("\n\n");
+
+        chunks.push({
+          source: `Session: ${recentSession.name}`,
+          section: "Last Session Context",
+          content: `# Previous Session: ${recentSession.name}\n_Updated: ${recentSession.updated}_\n\n${sessionContent}`,
+          lineStart: 0,
+          lineEnd: 0,
+        });
+        console.error(
+          `[ContextEngine] 📋 Auto-injected session "${recentSession.name}" (${recentSession.entries.length} entries, ${Math.round(ageHours)}h ago)`
+        );
+      }
+    }
+  }
+
+  // 3. Connect MCP transport (server is usable with keyword search now)
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("[ContextEngine] 🚀 MCP server running on stdio (keyword search ready)");
+
+  // 3a. Audit log auto-rotation. Deferred so the first requests are answered before the
+  // synchronous verify + rewrite (a few seconds on a 500k-record chain) blocks the loop.
+  // [LOCK] [AUTO-ROTATE-HYSTERESIS-AND-ONE-RUNNER]
+  // Measured 2026-08-21: ~13k records/hour on this machine, so the 100k trigger is hours
+  // away, not a day; a server that is never restarted must still rotate. Hourly recheck.
+  const runAutoRotate = () => {
+    try {
+      const o = autoRotateAuditLog();
+      if (o.action === "rotated" || o.action === "refused" || o.action === "error" || o.action === "in_progress") {
+        console.error(`[ContextEngine] 📦 audit auto-rotate (${o.action}): ${o.detail}`);
+      }
+    } catch (err) {
+      console.error(`[ContextEngine] ⚠ audit auto-rotate failed: ${(err as Error).message}`);
+    }
+  };
+  setTimeout(runAutoRotate, 3_000).unref();
+  setInterval(runAutoRotate, 60 * 60_000).unref();
+
+  // 3b. Write server-meta.json so the VS Code extension can read tool count
+  // without needing an active MCP session. Single source of truth =
+  // src/tools-manifest.ts (asserted by tests/tools-manifest.test.ts).
+  try {
+    const metaDir = join(homedir(), ".contextengine");
+    mkdirSync(metaDir, { recursive: true });
+    writeFileSync(
+      join(metaDir, "server-meta.json"),
+      JSON.stringify(
+        {
+          toolCount: TOOL_COUNT,
+          freeCount: FREE_TOOL_COUNT,
+          premiumCount: PREMIUM_TOOL_NAMES.length,
+          version: PKG_VERSION,
+          generatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ),
+    );
+  } catch (err) {
+    console.error("[ContextEngine] ⚠ Failed to write server-meta.json:", err);
+  }
+
+  // 4. Vectors. The store holds one vector per text ever embedded on this machine; the model
+  //    always loads for whoever embeds or answers queries. [LOCK] [EMBEDDINGS-ARE-CONTENT-ADDRESSED]
+  //    A reader that adopted the index already has its vectors and loads the model on its first
+  //    semantic query, not before: 300 MB per process is worth waiting for.
+  if (!adopted && role === "indexer") {
+    vectorStore = loadEmbeddingStore().vectors;
+    if (vectorStore.size > 0) console.error(`[ContextEngine] 💾 Embedding store: ${vectorStore.size} vectors`);
+    publishIndex(); // keyword-searchable index for readers now; vectors follow
+    ensureModel().then(async (ready) => {
+      if (!ready) return;
+      await embedAll();
+      publishIndex();
+    });
+  } else if (!adopted) {
+    // A reader that started before its indexer published (every window restarted at once):
+    // keyword search from its own build, no embedding of its own, the index adopted the moment
+    // it appears. Only indexers embed; that is the whole point. [LOCK] [ONE-INDEXER-MANY-READERS]
+    console.error(`[ContextEngine] ⏳ Reader without an index: keyword search only until pid ${indexerPid ?? "?"} publishes`);
+  }
+
+  // 5. Watch (indexer) or poll (reader), and keep the election running
+  if (role === "indexer") startWatching();
+  else startIndexPolling();
+  startRolePolling();
+
+  // 5b. A daemon (launchd, OPSCONTEXT_DAEMON=1) has stdin on /dev/null, so the stdio transport
+  // closes at once; as a reader it holds no watchers and every poller is unref'd, and the loop
+  // would drain and exit 0, which KeepAlive turns into a restart every 10 s. Hold the loop open.
+  // [LOCK] [AUTOSTART-IS-THE-STANDING-INDEXER]
+  if (process.env.OPSCONTEXT_DAEMON === "1") {
+    setInterval(() => { /* keep the event loop alive: this process serves the index, not a client */ }, 60_000);
+    console.error("[ContextEngine] 🛡 Daemon mode: staying alive without an MCP client");
+  }
+
+  // 6. Boot the local HTTP event-ingest endpoint for the browser extension.
+  // Local 127.0.0.1:7842 only; auth via shared secret at
+  // ~/.contextengine/extension-secret (see init-extension-secret CLI).
+  // No-op if secret is missing; the endpoint will refuse with 401 until
+  // a secret is configured. Failure to bind (port collision) logs and
+  // continues — the MCP server stays usable without browser capture.
+  startEventIngestServer().catch((err) => {
+    console.error("[ContextEngine] event-ingest start failed:", err);
+  });
+}
+
+main().catch((err) => {
+  console.error("[ContextEngine] Fatal:", err);
+  process.exit(1);
+});

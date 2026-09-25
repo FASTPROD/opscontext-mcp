@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.js.map
+.env
+.npmrc
+.DS_Store
+*.vsix
+.copilot-credentials.md
+
+# Ed25519 license signing — private key NEVER committed
+server/.secrets/
+
+# install-skill artifacts — generated copies of skills/opscontext/, source of truth lives in skills/
+.claude/skills/
+
+# python bytecode from running defaults/simplicity-gate.py or its tests
+__pycache__/
