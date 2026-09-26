@@ -18,7 +18,7 @@
 import { existsSync, writeFileSync, mkdirSync, readlinkSync } from "fs";
 import { join, dirname } from "path";
 import { homedir, platform } from "os";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 
@@ -57,7 +57,7 @@ function detectNodePath(): string {
 function detectOpscontextEntry(): { kind: "global" | "devtree" | "npx"; path: string } | null {
   // (1) Try global install via `npm root -g`
   try {
-    const globalRoot = execSync("npm root -g 2>/dev/null", { encoding: "utf-8" }).trim();
+    const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     const candidate = join(globalRoot, "@compr", "opscontext-mcp", "dist", "index.js");
     if (existsSync(candidate)) return { kind: "global", path: candidate };
   } catch {
@@ -99,6 +99,18 @@ function detectOpscontextEntry(): { kind: "global" | "devtree" | "npx"; path: st
 // FIX: Standard priority; the shared-index flag; CONTEXTENGINE_CONFIG passed through from the
 //      installing shell so its corpus id equals the chats'; the memory skip only if the installer
 //      was itself run with it (an explicit choice, not a default).
+// [LOCKED] [AUTOSTART-ARGV-AND-XML-ESCAPED] - 2026-09-25
+// [NEVER] paste a path into a launchctl/lsof/curl command string, or into the plist unescaped.
+// WHY: with a home folder named "John Smith", `launchctl bootstrap gui/501 ${PLIST_FILE}` handed
+//      launchctl the path in two pieces and failed, after `bootout` had already stopped the running
+//      agent; a home named "R&D home" produced a plist launchd refuses ("unknown ampersand-escape
+//      sequence"); only the passthrough env values were escaped (E2E_REVIEW_2026-09 A3-2, A3-3).
+// FIX: execFileSync with an argument list for every command; xml() on every value in the plist;
+//      `plutil -lint` on the written file before anything running is stopped.
+function xml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+}
+
 export function buildPlist(nodePath: string, entryPath: string, nodeBinDir: string, env: NodeJS.ProcessEnv = process.env): string {
   // OPSCONTEXT_DAEMON tells the server it has no MCP client on stdin and must stay alive on its
   // own: as a reader it holds no file watchers, and every poller is unref'd, so without this the
@@ -107,7 +119,8 @@ export function buildPlist(nodePath: string, entryPath: string, nodeBinDir: stri
   if (env.CONTEXTENGINE_CONFIG) passthrough.push(["CONTEXTENGINE_CONFIG", env.CONTEXTENGINE_CONFIG]);
   if (env.CONTEXTENGINE_WORKSPACES) passthrough.push(["CONTEXTENGINE_WORKSPACES", env.CONTEXTENGINE_WORKSPACES]);
   if (env.OPSCONTEXT_SKIP_CLAUDE_MEMORY === "1") passthrough.push(["OPSCONTEXT_SKIP_CLAUDE_MEMORY", "1"]);
-  const extraEnv = passthrough.map(([k, v]) => `        <key>${k}</key>\n        <string>${v.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</string>`).join("\n");
+  // [LOCK] [AUTOSTART-ARGV-AND-XML-ESCAPED]: every value, not only the passthrough ones.
+  const extraEnv = passthrough.map(([k, v]) => `        <key>${k}</key>\n        <string>${xml(v)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -117,21 +130,21 @@ export function buildPlist(nodePath: string, entryPath: string, nodeBinDir: stri
 
     <key>ProgramArguments</key>
     <array>
-        <string>${nodePath}</string>
-        <string>${entryPath}</string>
+        <string>${xml(nodePath)}</string>
+        <string>${xml(entryPath)}</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${nodeBinDir}:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${xml(nodeBinDir)}:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>${homedir()}</string>
+        <string>${xml(homedir())}</string>
 ${extraEnv}
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>${homedir()}</string>
+    <string>${xml(homedir())}</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -143,10 +156,10 @@ ${extraEnv}
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>${join(LOG_DIR, "mcp-stdout.log")}</string>
+    <string>${xml(join(LOG_DIR, "mcp-stdout.log"))}</string>
 
     <key>StandardErrorPath</key>
-    <string>${join(LOG_DIR, "mcp-stderr.log")}</string>
+    <string>${xml(join(LOG_DIR, "mcp-stderr.log"))}</string>
 
     <key>ProcessType</key>
     <string>Standard</string>
@@ -165,7 +178,7 @@ function userId(): number {
 
 function portIsOurs(): boolean {
   try {
-    execSync(`lsof -nP -iTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1`, { stdio: "ignore" });
+    execFileSync("lsof", ["-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -176,7 +189,7 @@ function waitForPort(timeoutSec: number = 30): boolean {
   const start = Date.now();
   while (Date.now() - start < timeoutSec * 1000) {
     if (portIsOurs()) return true;
-    execSync("sleep 1");
+    execFileSync("sleep", ["1"]);
   }
   return false;
 }
@@ -270,15 +283,24 @@ To view server logs:        tail -f ~/.contextengine/logs/mcp-stderr.log
     console.log(`   detected existing process on :${PORT} — relying on launchctl bootout to clean it.`);
   }
 
+  // [LOCK] [AUTOSTART-ARGV-AND-XML-ESCAPED]: a file launchd would refuse must never cost the user
+  // the agent that is running now, so check it before the bootout.
+  try {
+    execFileSync("plutil", ["-lint", PLIST_FILE], { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (err) {
+    console.error(`❌ The new plist is not valid, nothing was stopped or loaded: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
   // Idempotent bootstrap: bootout (ignore failure) → bootstrap
   const uid = userId();
   try {
-    execSync(`launchctl bootout gui/${uid}/${LABEL}`, { stdio: "ignore" });
+    execFileSync("launchctl", ["bootout", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
   } catch {
     /* not loaded — fine */
   }
   try {
-    execSync(`launchctl bootstrap gui/${uid} ${PLIST_FILE}`, { stdio: "inherit" });
+    execFileSync("launchctl", ["bootstrap", `gui/${uid}`, PLIST_FILE], { stdio: "inherit" });
   } catch (err) {
     console.error(`❌ launchctl bootstrap failed: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
@@ -317,7 +339,7 @@ You can re-install with: opscontext install-autostart`);
   const uid = userId();
   let removed = false;
   try {
-    execSync(`launchctl bootout gui/${uid}/${LABEL}`, { stdio: "ignore" });
+    execFileSync("launchctl", ["bootout", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
     removed = true;
   } catch {
     /* not loaded */
@@ -361,7 +383,7 @@ running entrypoint.`);
 
   let launchctlState = "not loaded";
   try {
-    const out = execSync(`launchctl print gui/${uid}/${LABEL} 2>/dev/null || true`, { encoding: "utf-8" });
+    const out = execFileSync("launchctl", ["print", `gui/${uid}/${LABEL}`], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
     const match = out.match(/state\s*=\s*(\S+)/);
     if (match) launchctlState = match[1];
   } catch {
@@ -376,7 +398,7 @@ running entrypoint.`);
 
   if (portUp) {
     try {
-      const health = execSync(`curl -sf http://127.0.0.1:${PORT}/health`, { encoding: "utf-8", timeout: 2000 });
+      const health = execFileSync("curl", ["-sf", `http://127.0.0.1:${PORT}/health`], { encoding: "utf-8", timeout: 2000 });
       console.log(`  health:      ${health.trim()}`);
     } catch {
       console.log(`  health:      ⚠ port open but /health didn't respond`);

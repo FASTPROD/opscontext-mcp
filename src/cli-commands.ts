@@ -45,6 +45,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "import-learnings",
   "init",
   "init-extension-secret",
+  "trust",
   "install-autostart",
   "install-claude-hook",
   "install-skill",

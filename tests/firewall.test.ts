@@ -241,7 +241,7 @@ describe("ProtocolFirewall — learning auto-injection", () => {
     ]);
 
     const output = fw.wrap("search_context", "test results", "port configuration");
-    expect(output).toContain("Relevant learnings");
+    expect(output).toContain("Saved notes that match");
     expect(output).toContain("Always use port 8002");
     expect(output).toContain("[MyProject/infrastructure]");
     expect(output).toContain("[deployment]");
@@ -255,7 +255,7 @@ describe("ProtocolFirewall — learning auto-injection", () => {
     ]);
 
     const output = fw.wrap("search_context", "test results");
-    expect(output).not.toContain("Relevant learnings");
+    expect(output).not.toContain("Saved notes that match");
   });
 
   it("does not inject when search returns empty", () => {
@@ -263,7 +263,7 @@ describe("ProtocolFirewall — learning auto-injection", () => {
     fw.setLearningSearchFn(() => []);
 
     const output = fw.wrap("search_context", "test results", "nothing matches");
-    expect(output).not.toContain("Relevant learnings");
+    expect(output).not.toContain("Saved notes that match");
   });
 
   it("caches injection results within same round", () => {
@@ -318,7 +318,7 @@ describe("ProtocolFirewall — learning auto-injection", () => {
 
     const output = fw.wrap("save_learning", "ok", "some hint");
     expect(output).toBe("ok");
-    expect(output).not.toContain("Relevant learnings");
+    expect(output).not.toContain("Saved notes that match");
   });
 });
 

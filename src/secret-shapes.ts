@@ -52,7 +52,9 @@ export const SECRET_SHAPES: SecretShape[] = [
   { id: "telegram_bot_token", re: /\b\d{8,10}:AA[0-9A-Za-z_-]{33}\b/g },
   { id: "jwt", re: /\beyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{10,}\.[0-9A-Za-z_-]{10,}/g },
   // scheme://user:SECRET@host, the shape of every database URL found on 2026-09-24.
-  { id: "url_password", re: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'"`]+:)[^\s@/'"`]+(?=@)/gi, keepPrefix: true },
+  // The user part may be empty: redis://:secret@host is how Redis spells a password-only URL
+  // (E2E_REVIEW_2026-09 A6-3: it came back raw from search and from the receiver).
+  { id: "url_password", re: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'"`]*:)[^\s@/'"`]+(?=@)/gi, keepPrefix: true },
   { id: "sshpass_password", re: new RegExp(String.raw`(\bsshpass\s+-p\s*)${QUOTED_OR_BARE}`, "g"), keepPrefix: true },
   { id: "sshpass_env", re: new RegExp(String.raw`(\bSSHPASS=)${QUOTED_OR_BARE}`, "g"), keepPrefix: true },
   // mysql -pSECRET (the value is glued to the flag; a bare -p prompts and is left alone).
@@ -64,10 +66,16 @@ export const SECRET_SHAPES: SecretShape[] = [
   { id: "api_key_header", re: /(\bx-api-key:\s*)[^\s'"]{8,}/gi, keepPrefix: true },
   // name = value, the long tail. Skips variables, env lookups, paths, placeholders already
   // redacted, type names and function calls.
+  // A name that ends in a separator plus PASS (SMTP_PASS, DB_PASS, db.pass) counts too: a real mail
+  // password sat in the shared index under SMTP_PASS (E2E_REVIEW_2026-09 A6-3). The separator keeps
+  // bypass and compass out. A bare `pass` counts only before an equals sign, or before a quoted value
+  // after a colon (nodemailer's auth block): as first shipped in 2.10.0 it also took prose (a README's
+  // "PII pass" list) and code (a count of passing checks in agents.ts), which the public-release scan
+  // refused.
   {
     id: "credential_assignment",
     // A backtick opens a value too: "password: `...`" in Markdown, found in the real log.
-    re: /(\b[\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret)["'`]?\s*[:=]\s*["'`]?)(?![$<{*/~.[]|process\.env|os\.environ|getenv)[^\s'"`,;)}\]]{6,}/gi,
+    re: /(\b(?:[\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret)|[\w.-]*[_.-]pass|pass(?=["'`]?\s*=|["'`]?\s*:\s*["'`]))["'`]?\s*[:=]\s*["'`]?)(?![$<{*/~.[]|process\.env|os\.environ|getenv)[^\s'"`,;)}\]]{6,}/gi,
     keepPrefix: true,
     skip: (value, after) =>
       after.startsWith("(") ||
@@ -126,6 +134,27 @@ export function redactSecrets(input: string): RedactionResult {
     });
   }
   return { text, counts };
+}
+
+/**
+ * [LOCKED] [INDEX-NEVER-SERVES-A-CREDENTIAL] - 2026-09-25 (moved here from src/index.ts the same day)
+ * [NEVER] let a chunk into the index, the shared index file or a search result without passing
+ *         its text through redactSecrets(), in the MCP server AND in the CLI.
+ * WHY: on 2026-09-25 the shared index held database URLs with their passwords (read from dotenv
+ *      files, whose masking skipped the password inside a URL), sshpass and mysql passwords from
+ *      runbooks and memory notes, and Google API keys: 55 sources in all. search_context hands
+ *      chunks to every AI agent that asks, and the index file rides the weekly backup.
+ *      The same day the fix was found to cover one builder of two: the CLI's initEngine() never
+ *      called it, and `contextengine search` returned 7 of 7 planted fake credentials in clear
+ *      (E2E_REVIEW_2026-09 A6-2). The VS Code extension shells out to that CLI.
+ * FIX: every chunk, whatever collected it (docs, code, ops collectors, learnings, community rules,
+ *      adapters), is redacted with the capture shapes as the index is built, by this one function,
+ *      called by both builders (src/index.ts buildIndex, src/cli.ts initEngine).
+ *      The source files are not touched: cleaning those is the owner's call, file by file.
+ */
+export function redactChunk<T extends { content: string }>(c: T): T {
+  const r = redactSecrets(c.content);
+  return Object.keys(r.counts).length > 0 ? { ...c, content: r.text } : c;
 }
 
 /** Redact every string inside a JSON-like value, returning a copy and the merged counts. */

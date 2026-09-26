@@ -87,20 +87,26 @@ const DEFAULT_PATTERNS = [
  * Priority: env var > CWD > home dir
  */
 export function findConfigFile(): string | null {
-  const candidates: string[] = [];
+  return findConfigFileWithOrigin()?.path ?? null;
+}
+
+/** Where the config came from: the env var, the current folder, or the home folder. A config in
+ *  the current folder may belong to a downloaded repository. [LOCK] [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG] */
+export function findConfigFileWithOrigin(): { path: string; origin: "env" | "cwd" | "home" } | null {
+  const candidates: Array<{ path: string; origin: "env" | "cwd" | "home" }> = [];
 
   const envPath = process.env.CONTEXTENGINE_CONFIG;
   if (envPath) {
-    candidates.push(resolve(envPath));
+    candidates.push({ path: resolve(envPath), origin: "env" });
   }
 
   candidates.push(
-    resolve(process.cwd(), "contextengine.json"),
-    resolve(homedir(), ".contextengine.json")
+    { path: resolve(process.cwd(), "contextengine.json"), origin: "cwd" },
+    { path: resolve(homedir(), ".contextengine.json"), origin: "home" },
   );
 
   for (const c of candidates) {
-    if (existsSync(c)) return c;
+    if (existsSync(c.path)) return c;
   }
   return null;
 }

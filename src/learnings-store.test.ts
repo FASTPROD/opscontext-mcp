@@ -3,6 +3,7 @@
 // ~/.contextengine is never touched. HOME must be set BEFORE the module is imported:
 // LEARNINGS_PATH is computed at import time.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { trustProjects } from "./trusted-projects.js";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -135,6 +136,7 @@ describe("imports are one batch", () => {
       writeFileSync(p, `# Notes\n\n## Lessons learned\n\n### auto rule ${f} alpha long enough\nctx\n\n### auto rule ${f} beta long enough\nctx\n`);
       paths.push({ path: p, name: `Proj${f} — src${f}.md` });
     }
+    trustProjects(["Proj0", "Proj1", "Proj2"]); // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS]
     const r = L.autoImportFromSources(paths);
     expect(r.imported).toBe(6);
     expect(readStore().learnings.length).toBe(base + 6);
@@ -207,6 +209,7 @@ describe("[STORE-GROWTH-IS-A-TRIPWIRE-TOO]", () => {
     const lines = ["# Learnings", ""];
     for (let i = 0; i < L.MAX_GROWTH_PER_WRITE + 5; i++) lines.push(`### runaway rule ${i} that is long enough to count`, "");
     writeFileSync(p, lines.join("\n"));
+    trustProjects(["Proj"]); // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS]
     const r = L.autoImportFromSources([{ path: p, name: "Proj — AGENT-LEARNINGS.md" }]);
     expect(r.refused).toMatch(/runaway import/);
     expect(r.imported).toBe(0);

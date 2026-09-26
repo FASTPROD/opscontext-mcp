@@ -19,10 +19,10 @@
 //   independently mirrored — keep both in sync; if you patch one, patch the
 //   other in the same commit).
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { dirname } from "path";
 import { createHash } from "crypto";
-import { execSync, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { listLearnings, type Learning } from "./learnings.js";
@@ -460,30 +460,27 @@ export async function reviewLoop(rules: ExportedRule[]): Promise<ExportedRule[]>
   if (!process.stdin.isTTY) return rules;
 
   const editor = process.env.EDITOR || "vi";
-  const tmpPath = join(tmpdir(), `opscontext-export-review-${process.pid}.json`);
-  writeFileSync(tmpPath, JSON.stringify(rules, null, 2), "utf-8");
-
-  const result = spawnSync(editor, [tmpPath], { stdio: "inherit" });
-  if (result.status !== 0) {
-    // Editor exited non-zero — keep the original list rather than risk a
-    // half-edited file.
-    return rules;
-  }
-
+  // A private folder, the file readable by the user only (it holds the learnings being exported),
+  // removed on every path. E2E_REVIEW_2026-09 A1-1: the old cleanup pasted the path into
+  // `rm -f "..."`, where a TMPDIR holding `$(` would run, and a failed edit left the file behind.
+  const dir = mkdtempSync(join(tmpdir(), "opscontext-export-review-"));
+  const tmpPath = join(dir, "review.json");
   try {
-    const edited = readFileSync(tmpPath, "utf-8");
-    const parsed = JSON.parse(edited);
-    if (Array.isArray(parsed)) return parsed as ExportedRule[];
-    return rules;
+    writeFileSync(tmpPath, JSON.stringify(rules, null, 2), { encoding: "utf-8", mode: 0o600 });
+    // EDITOR is a shell command by convention ("code --wait"), as git treats it; the file path goes
+    // in as "$1", an argument, never as text in the command.
+    const result = spawnSync("/bin/sh", ["-c", `${editor} "$1"`, "opscontext-editor", tmpPath], { stdio: "inherit" });
+    if (result.status !== 0) {
+      // Editor exited non-zero — keep the original list rather than risk a
+      // half-edited file.
+      return rules;
+    }
+    const parsed = JSON.parse(readFileSync(tmpPath, "utf-8"));
+    return Array.isArray(parsed) ? (parsed as ExportedRule[]) : rules;
   } catch {
     return rules;
   } finally {
-    try {
-      // Best-effort cleanup; not a correctness issue if it lingers in $TMPDIR.
-      execSync(`rm -f ${JSON.stringify(tmpPath)}`);
-    } catch {
-      /* ignore */
-    }
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 

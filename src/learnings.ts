@@ -7,6 +7,7 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { Chunk } from "./ingest.js";
 import { safeAppend } from "./audit.js";
+import { trustedProjects, looksLikeMarkedLearnings } from "./trusted-projects.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1100,12 +1101,16 @@ export function learningsToChunks(projects?: string[]): Chunk[] {
  */
 export function autoImportFromSources(
   sources: Array<{ path: string; name: string }>,
-): { total: number; imported: number; updated: number; ignored: number; refused?: string } {
+): { total: number; imported: number; updated: number; ignored: number; refused?: string; untrusted: string[] } {
   let totalImported = 0;
   let totalUpdated = 0;
   let totalIgnored = 0;
   let processed = 0;
   let refused: string | undefined;
+  // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS] (src/trusted-projects.ts): seeded, the first
+  // time, with every project that already has learnings in the store.
+  const trusted = trustedProjects(() => [...new Set(loadStore().learnings.map((l) => l.project).filter((p): p is string => !!p))]);
+  const untrusted = new Set<string>();
 
   // One load and one save for the whole sweep (~880 files), instead of one full-file
   // rewrite per rule per file. [LOCK] [STORE-NEVER-STARTS-FRESH-OVER-DATA]
@@ -1118,6 +1123,17 @@ export function autoImportFromSources(
 
     // Extract project name from source name (e.g., "ContextEngine — copilot-instructions.md")
     const project = source.name.split(" — ")[0]?.trim() || undefined;
+
+    // A project the owner has not marked as theirs is searchable, never imported automatically.
+    // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS]
+    if (project && !trusted.has(project.toLowerCase())) {
+      try {
+        if (looksLikeMarkedLearnings(readFileSync(source.path, "utf-8"))) untrusted.add(project);
+      } catch {
+        /* unreadable: nothing to import anyway */
+      }
+      continue;
+    }
 
     // Strict by construction: only marked learnings. [LOCK] [AUTO-IMPORT-ONLY-MARKED-LEARNINGS]
     const result = importLearningsFromFile(source.path, "other", project);
@@ -1136,7 +1152,7 @@ export function autoImportFromSources(
     processed = 0;
   }
 
-  return { total: processed, imported: totalImported, updated: totalUpdated, ignored: totalIgnored, refused };
+  return { total: processed, imported: totalImported, updated: totalUpdated, ignored: totalIgnored, refused, untrusted: [...untrusted] };
 }
 
 /**

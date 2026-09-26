@@ -1,6 +1,6 @@
 {
   "name": "@compr/opscontext-mcp",
-  "version": "2.9.1",
+  "version": "2.10.0",
   "description": "OpsContext for AI Agents — read-only fleet visibility (PM2/nginx/Docker/git/cron) + tamper-evident audit log + policy-as-code hooks. The ops + compliance layer Claude Code can't grow natively.",
   "type": "module",
   "main": "dist/index.js",
@@ -52,7 +52,7 @@
   "license": "BSL-1.1",
   "repository": {
     "type": "git",
-    "url": "https://github.com/FASTPROD/opscontext-mcp.git"
+    "url": "git+https://github.com/FASTPROD/opscontext-mcp.git"
   },
   "homepage": "https://compr.fr",
   "bugs": {

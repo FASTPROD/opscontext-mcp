@@ -33,6 +33,10 @@ export interface ServerRecord {
    *  the one writing the shared index for it, or a reader of it. Absent on older builds. */
   corpus?: string;
   role?: "indexer" | "reader";
+  /** Since 2.10.0: started as the launchd agent (OPSCONTEXT_DAEMON=1). [LOCK] [EVENT-PORT-BELONGS-TO-THE-DAEMON] */
+  daemon?: boolean;
+  /** Since 2.10.0: the event-ingest port this server holds right now; absent when it holds none. */
+  eventPort?: number;
 }
 
 export interface ServerReport {
@@ -103,7 +107,12 @@ export function isAlive(pid: number): boolean {
 /**
  * Register the running server. Returns a stop() that removes the record; exit handlers call it too.
  */
-export function registerServer(opts: { version: string; script: string; corpus?: string; role?: "indexer" | "reader" }): { record: ServerRecord; stop: () => void; setRole: (role: "indexer" | "reader") => void } {
+export function registerServer(opts: { version: string; script: string; corpus?: string; role?: "indexer" | "reader"; daemon?: boolean }): {
+  record: ServerRecord;
+  stop: () => void;
+  setRole: (role: "indexer" | "reader") => void;
+  setEventPort: (port: number | null) => void;
+} {
   const dir = registryDir();
   mkdirSync(dir, { recursive: true });
   const now = new Date().toISOString();
@@ -120,6 +129,7 @@ export function registerServer(opts: { version: string; script: string; corpus?:
     node: process.version,
     ...(opts.corpus ? { corpus: opts.corpus } : {}),
     ...(opts.role ? { role: opts.role } : {}),
+    ...(opts.daemon ? { daemon: true } : {}),
   };
   const file = join(dir, `${process.pid}.json`);
   const write = () => { try { writeFileSync(file, JSON.stringify(record, null, 2)); } catch { /* registry is diagnostics, never fatal */ } };
@@ -138,7 +148,28 @@ export function registerServer(opts: { version: string; script: string; corpus?:
     process.on(sig, () => { stop(); process.exit(0); });
   }
   const setRole = (role: "indexer" | "reader") => { record.role = role; write(); };
-  return { record, stop, setRole };
+  const setEventPort = (port: number | null) => {
+    if (port === null) delete record.eventPort;
+    else record.eventPort = port;
+    write();
+  };
+  return { record, stop, setRole, setEventPort };
+}
+
+/** The pid of a live launchd agent other than `exceptPid`, or null. Cheap: no build hashing. */
+export function liveDaemonPid(exceptPid: number = process.pid): number | null {
+  const dir = registryDir();
+  if (!existsSync(dir)) return null;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const rec = JSON.parse(readFileSync(join(dir, f), "utf8")) as ServerRecord;
+      if (rec.daemon && rec.pid !== exceptPid && isAlive(rec.pid)) return rec.pid;
+    } catch {
+      /* a record being rewritten: the next tick reads it */
+    }
+  }
+  return null;
 }
 
 /** Read every record, drop the dead ones, compare builds with the files on disk now. */
@@ -163,6 +194,15 @@ export function listServers(): ServerReport {
   }
   // Only servers that index on their own cost a re-index per doc change; readers of a shared
   // index do not. [LOCK] [ONE-INDEXER-MANY-READERS]
+  // [LOCK] [EVENT-PORT-BELONGS-TO-THE-DAEMON]: say who receives Claude Code and browser events.
+  const holder = report.servers.find((s) => typeof s.eventPort === "number");
+  const daemon = report.servers.find((s) => s.daemon);
+  if (holder?.staleBuild) {
+    report.warnings.push(`pid ${holder.pid} holds the event port :${holder.eventPort} on an old build: the redaction that guards the audit log runs that build (restart it, or let the launchd agent take the port)`);
+  }
+  if (holder && daemon && holder.pid !== daemon.pid) {
+    report.warnings.push(`the event port :${holder.eventPort} is held by pid ${holder.pid}, not by the launchd agent pid ${daemon.pid}; it hands over within seconds on 2.10.0 and later`);
+  }
   const indexing = report.servers.filter((s) => s.role !== "reader");
   if (indexing.length > SERVER_COUNT_WARN) {
     report.warnings.push(`${indexing.length} of ${report.servers.length} servers index on their own; every doc change makes each of them re-index the corpus (${SERVER_COUNT_WARN} is the comfortable ceiling; CONTEXTENGINE_SHARED_INDEX=1 makes all but one per corpus readers)`);
@@ -203,7 +243,7 @@ export function formatServers(report: ServerReport, home: string = homedir(), op
   for (const s of report.servers) {
     const t = s.started.slice(11, 19) + "Z";
     const flag = s.staleBuild ? `STALE BUILD (disk ${s.currentBuild})` : s.currentBuild === null ? "script missing on disk" : "current";
-    const role = s.role ? `  ${s.role.padEnd(7)} corpus ${s.corpus ?? "?"}` : "";
+    const role = (s.role ? `  ${s.role.padEnd(7)} corpus ${s.corpus ?? "?"}` : "") + (s.daemon ? "  launchd agent" : "") + (s.eventPort ? `  holds :${s.eventPort}` : "");
     let cost = "";
     if (opts.cost) {
       const c = processCost(s.pid);

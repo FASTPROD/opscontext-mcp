@@ -32,6 +32,7 @@ import { safeAppend } from "./audit.js";
 import { Chunk } from "./ingest.js";
 import {
   verifyLicenseSignature,
+  verifyDetachedSignature,
   type SignableLicensePayload,
 } from "./license-sig.js";
 
@@ -41,6 +42,15 @@ import {
 
 export const TIER_A_URL =
   "https://raw.githubusercontent.com/FASTPROD/opscontext-community-rules/main/rules.json";
+/** Ed25519 signature of rules.json's exact bytes, base64, by the pinned licence key.
+ *  [LOCK] [COMMUNITY-TIER-A-IS-SIGNED] */
+export const TIER_A_SIG_URL = `${TIER_A_URL}.sig`;
+
+// Caps on what any tier can put into every user's search results. [LOCK] [COMMUNITY-TIER-A-IS-SIGNED]
+const MAX_RULES_PER_SOURCE = 500;
+const MAX_RULE_CHARS = 500;
+const MAX_CONTEXT_CHARS = 2000;
+const MAX_TAGS = 10;
 
 export const TIER_B_URL =
   "https://api.compr.ch/contextengine/community-rules/fetch";
@@ -243,15 +253,17 @@ function normalizeIncoming(
   const now = new Date().toISOString();
   const out: CommunityRule[] = [];
   for (const r of rawRules) {
+    if (out.length >= MAX_RULES_PER_SOURCE) break;
     if (!isValidRuleShape(r)) continue;
     const rec = r as Record<string, unknown>;
+    if ((rec.rule as string).length > MAX_RULE_CHARS) continue;
     out.push({
       id: rec.id as string,
       source,
       category: rec.category as string,
       rule: rec.rule as string,
-      context: rec.context as string,
-      tags: rec.tags as string[],
+      context: (rec.context as string).slice(0, MAX_CONTEXT_CHARS),
+      tags: (rec.tags as string[]).slice(0, MAX_TAGS).map((t) => t.slice(0, 40)),
       project_cluster:
         typeof rec.project_cluster === "string"
           ? (rec.project_cluster as string)
@@ -324,6 +336,32 @@ export async function syncTierA(
       tier: "A",
       status: res.statusCode,
     });
+    return { fetched: 0, cached: true };
+  }
+
+  // [LOCKED] [COMMUNITY-TIER-A-IS-SIGNED] - 2026-09-25
+  // [NEVER] accept tier A rules without a valid signature, or drop the caps in normalizeIncoming().
+  // WHY: tier A was plain JSON from a public GitHub repository, verified by nothing but TLS: whoever
+  //      could write to that repository wrote into every user's search results. In a sandbox 5,001
+  //      unsigned rules were accepted, one of 200 KB (E2E_REVIEW_2026-09 A6-4). Tier B was already
+  //      signed and bound to the request ([COMMUNITY-SYNC-REPLAY-GUARD]).
+  // FIX: rules.json must come with rules.json.sig, an Ed25519 signature of its exact bytes by the
+  //      pinned licence key (server/scripts/sign-community-rules.mjs, run where the private key
+  //      lives); unsigned or mismatched rules are discarded and the cache kept. Every tier is capped
+  //      (count, rule and context length, tags). The repository did not exist on 2026-09-25, so
+  //      nothing was cut off.
+  let sigRes: HttpResponse;
+  try {
+    sigRes = await http(TIER_A_SIG_URL, { method: "GET", headers: { "User-Agent": headers["User-Agent"], Accept: "text/plain" } });
+  } catch (e) {
+    process.stderr.write(`[community-sync] Tier A signature fetch failed (${e instanceof Error ? e.message : String(e)}); using cached store.\n`);
+    safeAppend("community.sync_error", { tier: "A", reason: "signature_fetch_failed" });
+    return { fetched: 0, cached: true };
+  }
+  if (sigRes.statusCode !== 200 || !verifyDetachedSignature(Buffer.from(res.body, "utf8"), sigRes.body)) {
+    const reason = sigRes.statusCode === 200 ? "signature_invalid" : "unsigned";
+    process.stderr.write(`[community-sync] Tier A rules discarded (${reason}): they must be signed with the pinned key; using cached store.\n`);
+    safeAppend("community.sync_error", { tier: "A", reason });
     return { fetched: 0, cached: true };
   }
 

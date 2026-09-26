@@ -17,11 +17,11 @@
  *   contextengine help                Show this message
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, mkdtempSync } from "fs";
 import { join, basename, resolve } from "path";
 import { createInterface } from "readline";
 import { tmpdir, homedir } from "os";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 // ---------------------------------------------------------------------------
 // Detect project characteristics
@@ -715,7 +715,7 @@ import {
   activate,
   deactivate,
   getActivationStatus,
-  gateCheck,
+  gateCheckFresh,
 } from "./activation.js";
 import {
   syncTierA,
@@ -738,7 +738,7 @@ import {
   restoreSegment,
   scrubAuditLog,
 } from "./audit.js";
-import { redactPayload } from "./secret-shapes.js";
+import { redactPayload, redactChunk } from "./secret-shapes.js";
 import {
   loadRepoPolicy,
   parsePolicy,
@@ -763,7 +763,11 @@ import {
   formatRuleParityViolationsJson,
   type RuleParityViolation,
 } from "./hooks.js";
-import { safeAppend } from "./audit.js";
+import { safeAppend, type AuditEvent } from "./audit.js";
+import { checkCaptureEvent, prepareCapturedPayload } from "./http-server.js";
+import { secureCeHome } from "./ce-home.js";
+import { QUOTED_TEXT_NOTE } from "./framing.js";
+import { trustProjects, untrustProjects, listTrusted } from "./trusted-projects.js";
 import { listServers, formatServers } from "./server-registry.js";
 import { computeFleetHealth, formatFleetHealth } from "./fleet-health.js";
 import { ciStatusForHead, formatCiStatus } from "./ci-status.js";
@@ -839,7 +843,9 @@ async function initEngine(): Promise<EngineState> {
     chunks = mergeWithDedup(localChunks, communityChunks);
   }
 
-  return { sources, chunks };
+  // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: the CLI builds its own index; every chunk it can
+  // print goes through the same redaction as the MCP server's.
+  return { sources, chunks: chunks.map(redactChunk) };
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +861,7 @@ async function cliSearch(query: string, topK: number): Promise<void> {
     return;
   }
 
-  console.log(`\n🔍 Search: "${query}" | ${results.length} results (keyword/BM25)\n`);
+  console.log(`\n🔍 Search: "${query}" | ${results.length} results (keyword/BM25)\n${QUOTED_TEXT_NOTE}\n`);
 
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
@@ -887,7 +893,7 @@ async function cliListSources(): Promise<void> {
 }
 
 async function cliListProjects(): Promise<void> {
-  const gate = gateCheck("list_projects");
+  const gate = await gateCheckFresh("list_projects");
   if (gate) { console.error(gate); process.exit(1); }
   const projectDirs = loadProjectDirs();
   const projects = listProjects(projectDirs);
@@ -1002,7 +1008,7 @@ async function cliScore(
   save = true,
   all = false
 ): Promise<void> {
-  const gate = gateCheck("score_project");
+  const gate = await gateCheckFresh("score_project");
   if (gate) { console.error(gate); process.exit(1); }
 
   if (project && all) {
@@ -1094,13 +1100,16 @@ async function cliScore(
 
   if (html) {
     const htmlContent = generateScoreHTML(scores);
-    const tmpPath = join(tmpdir(), "contextengine-score.html");
-    writeFileSync(tmpPath, htmlContent, "utf-8");
+    // A private folder of its own, not a fixed name in a shared /tmp, and the path handed to the
+    // opener as an argument, never pasted into a shell string (E2E_REVIEW_2026-09 A1-1).
+    const tmpPath = join(mkdtempSync(join(tmpdir(), "contextengine-score-")), "score.html");
+    writeFileSync(tmpPath, htmlContent, { encoding: "utf-8", mode: 0o600 });
     console.log(`\n📊 HTML report written to: ${tmpPath}`);
     // Open in default browser
-    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    const [openCmd, ...openArgs] =
+      process.platform === "darwin" ? ["open"] : process.platform === "win32" ? ["cmd", "/c", "start", '""'] : ["xdg-open"];
     try {
-      execSync(`${openCmd} "${tmpPath}"`);
+      execFileSync(openCmd, [...openArgs, tmpPath], { stdio: "ignore" });
       console.log("🌐 Opened in browser\n");
     } catch {
       console.log(`Open manually: file://${tmpPath}\n`);
@@ -1122,7 +1131,7 @@ async function cliScore(
 }
 
 async function cliAudit(): Promise<void> {
-  const gate = gateCheck("run_audit");
+  const gate = await gateCheckFresh("run_audit");
   if (gate) { console.error(gate); process.exit(1); }
   const projectDirs = loadProjectDirs();
   const plan = runComplianceAudit(projectDirs);
@@ -1850,12 +1859,22 @@ safeAppend), visible via 'contextengine audit-verify' and consumed by the
     process.exit(1);
   }
 
-  // Cast — the audit module accepts any string for the event field; the
-  // AuditEvent union is documentation, not enforcement. Validation of
-  // "what's a valid event kind" is the caller's responsibility (the HTTP
-  // server enforces a prefix allow-list; this CLI is trusted).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  safeAppend(eventKind as any, payload, actor);
+  // [LOCKED] [EMIT-EVENT-GOES-THROUGH-THE-DOOR] - 2026-09-25
+  // [NEVER] append a captured event here without the receiver's kind check and
+  //         prepareCapturedPayload().
+  // WHY: this command was "trusted" and wrote anything: in a sandbox it kept a mysql password and
+  //      a prompt's full text, and wrote an audit.redact acknowledgement, the record that turns
+  //      "altered" into "redacted" in the verifier. The VS Code extension emits through it, so
+  //      [CAPTURE-IS-REDACTED-AT-THE-DOOR] and [PROMPT-TEXT-IS-NOT-KEPT] had a side entrance
+  //      (E2E_REVIEW_2026-09 A2-6).
+  // FIX: the same checkCaptureEvent() and prepareCapturedPayload() as POST /events; "cli" stays a
+  //      valid actor here, "system" does not.
+  const refused = checkCaptureEvent(eventKind, actor, { allowCliActor: true });
+  if (refused) {
+    console.error(`❌ ${refused}`);
+    process.exit(1);
+  }
+  safeAppend(eventKind as AuditEvent, prepareCapturedPayload(payload, eventKind), actor);
   console.log(`✅ Appended ${eventKind} to audit log.`);
 }
 
@@ -1950,6 +1969,32 @@ this CLI is for terminal users, CI, and cron.`);
   // Keep alive — the watcher uses internal timers, but a stdin listener also
   // helps catch terminal closes.
   process.stdin.resume();
+}
+
+/** `contextengine trust`: which projects are auto-imported. [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS] */
+function cliTrust(args: string[]): void {
+  if (args.includes("-h") || args.includes("--help")) {
+    console.log(`Usage: contextengine trust <project>...        mark projects as yours
+       contextengine trust --list                  show them
+       contextengine trust --remove <project>...   unmark them
+
+Learnings are imported automatically only from projects marked as yours. A project seen for the
+first time (a repository you downloaded, for instance) stays searchable but its learnings are not
+saved until you mark it. The list starts with every project that already had learnings.`);
+    return;
+  }
+  const names = args.filter((a) => !a.startsWith("-"));
+  let list: string[];
+  if (args.includes("--remove")) {
+    list = untrustProjects(names);
+    console.log(`Removed ${names.length} project(s).`);
+  } else if (names.length > 0) {
+    list = trustProjects(names, () => [...new Set(listLearnings().map((l) => l.project).filter((p): p is string => !!p))]);
+    console.log(`Marked as yours: ${names.join(", ")}. Their learnings are imported at the next reindex.`);
+  } else {
+    list = listTrusted();
+  }
+  console.log(`${list.length} trusted project(s)${list.length ? ": " + list.join(", ") : " (none yet: the list is created at the first reindex)"}`);
 }
 
 async function cliInitExtensionSecret(args: string[]): Promise<void> {
@@ -2442,6 +2487,9 @@ async function cliEndSession(): Promise<void> {
     checks.push(`- ⛔ Auto-import write refused: ${autoImport.refused}`);
     failCount++;
   }
+  if (autoImport.untrusted.length > 0) {
+    checks.push(`- ⏸ Not imported, project not marked as yours: ${autoImport.untrusted.join(", ")} (contextengine trust <project>)\n`);
+  }
 
   // --- Check 3: Learnings Store ---
   checks.push("## 3. Learnings Store\n");
@@ -2738,6 +2786,9 @@ function readPackageVersion(): string {
 // ---------------------------------------------------------------------------
 const command = process.argv[2];
 
+// [LOCK] [CE-HOME-IS-PRIVATE]: before any command writes into it (not for a version or help line).
+if (command && !["--version", "-v", "--help", "-h", "help"].includes(command)) secureCeHome();
+
 if (command === "init") {
   runInit().catch((err) => {
     console.error("Error:", err);
@@ -2797,6 +2848,8 @@ Usage:
                                        Author + validate the declarative .contextengine/policy.json
   contextengine init-extension-secret [--force]
                                        Generate ~/.contextengine/extension-secret for the browser ext
+  contextengine trust [<project>...] [--list] [--remove <project>...]
+                                       Mark projects as yours: only those are auto-imported into learnings
   contextengine install-autostart [--force]
                                        Install macOS LaunchAgent so MCP server auto-starts at login
                                        (uninstall-autostart / autostart-status — companion commands)
@@ -3024,6 +3077,8 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
     console.error("Error:", err);
     process.exit(1);
   });
+} else if (command === "trust") {
+  cliTrust(process.argv.slice(3));
 } else if (command === "install-autostart") {
   import("./install-autostart.js").then((m) =>
     m.cliInstallAutostart(process.argv.slice(3)),

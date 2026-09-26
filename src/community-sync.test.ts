@@ -28,6 +28,7 @@ import {
 import { join } from "path";
 import { tmpdir } from "os";
 import { generateKeyPairSync, sign } from "crypto";
+import { __setLicensePublicKeyForTesting } from "./license-sig.js";
 
 import {
   loadCommunityStore,
@@ -113,22 +114,56 @@ function makeHttpMock(
   return (async () => response) as never;
 }
 
+// Tier A must come with a signature by the pinned key: tests sign with a key of their own and
+// install it in-process. [LOCK] [COMMUNITY-TIER-A-IS-SIGNED]
+const TIER_A_KEYS = generateKeyPairSync("ed25519");
+function tierAMock(body: string, opts: { headers?: Record<string, string>; sig?: "good" | "none" | "bad" } = {}) {
+  __setLicensePublicKeyForTesting(TIER_A_KEYS.publicKey.export({ type: "spki", format: "pem" }).toString());
+  const good = sign(null, Buffer.from(body, "utf8"), TIER_A_KEYS.privateKey).toString("base64");
+  return (async (url: string) => {
+    if (url.endsWith(".sig")) {
+      if (opts.sig === "none") return { statusCode: 404, headers: {}, body: "404: Not Found" };
+      return { statusCode: 200, headers: {}, body: opts.sig === "bad" ? Buffer.alloc(64, 1).toString("base64") : good };
+    }
+    return { statusCode: 200, headers: opts.headers ?? {}, body };
+  }) as never;
+}
+
 // ---------------------------------------------------------------------------
 // syncTierA
 // ---------------------------------------------------------------------------
 
 describe("syncTierA", () => {
+  afterEach(() => __setLicensePublicKeyForTesting(null));
+
+  it("[COMMUNITY-TIER-A-IS-SIGNED] discards unsigned or wrongly signed rules and keeps the cache", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const payload = JSON.stringify({ rules: [VALID_TIER_A_RULE, VALID_TIER_A_RULE_2] });
+    for (const sig of ["none", "bad"] as const) {
+      __setHttpForTesting(tierAMock(payload, { sig }));
+      const result = await syncTierA({ force: true });
+      expect(result, sig).toEqual({ fetched: 0, cached: true });
+      expect(loadCommunityStore().rules.length, sig).toBe(0);
+    }
+    stderrSpy.mockRestore();
+  });
+
+  it("[COMMUNITY-TIER-A-IS-SIGNED] caps the count and drops an oversized rule", async () => {
+    const many = Array.from({ length: 5001 }, (_, i) => ({ ...VALID_TIER_A_RULE, id: `r${i}`, context: "x".repeat(5000) }));
+    many.unshift({ ...VALID_TIER_A_RULE, id: "huge", rule: "Planted rule " + "y".repeat(200 * 1024) });
+    __setHttpForTesting(tierAMock(JSON.stringify({ rules: many })));
+    const result = await syncTierA({ force: true });
+    expect(result.fetched).toBe(500);
+    const rules = loadCommunityStore().rules;
+    expect(rules.some((r) => r.id === "huge")).toBe(false);
+    expect(Math.max(...rules.map((r) => r.context.length))).toBeLessThanOrEqual(2000);
+  });
+
   it("200 with rules: writes store, fetched > 0", async () => {
     const payload = JSON.stringify({
       rules: [VALID_TIER_A_RULE, VALID_TIER_A_RULE_2],
     });
-    __setHttpForTesting(
-      makeHttpMock({
-        statusCode: 200,
-        headers: { etag: '"abc123"' },
-        body: payload,
-      }),
-    );
+    __setHttpForTesting(tierAMock(payload, { headers: { etag: '"abc123"' } }));
 
     const result = await syncTierA();
     expect(result.cached).toBe(false);
@@ -189,13 +224,7 @@ describe("syncTierA", () => {
 
   it("malformed JSON response: returns cached, logs, doesn't throw", async () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    __setHttpForTesting(
-      makeHttpMock({
-        statusCode: 200,
-        headers: { etag: '"foo"' },
-        body: "this is not json {{",
-      }),
-    );
+    __setHttpForTesting(tierAMock("this is not json {{", { headers: { etag: '"foo"' } }));
 
     const result = await syncTierA();
     expect(result.fetched).toBe(0);
@@ -205,13 +234,7 @@ describe("syncTierA", () => {
   });
 
   it("accepts a bare JSON array (no rules wrapper)", async () => {
-    __setHttpForTesting(
-      makeHttpMock({
-        statusCode: 200,
-        headers: {},
-        body: JSON.stringify([VALID_TIER_A_RULE]),
-      }),
-    );
+    __setHttpForTesting(tierAMock(JSON.stringify([VALID_TIER_A_RULE])));
     const result = await syncTierA();
     expect(result.fetched).toBe(1);
   });
@@ -229,7 +252,7 @@ describe("syncTierA", () => {
 
     let receivedHeaders: Record<string, string> | undefined;
     __setHttpForTesting(async (_url, opts) => {
-      receivedHeaders = opts?.headers as Record<string, string>;
+      if (!_url.endsWith(".sig")) receivedHeaders = opts?.headers as Record<string, string>;
       return {
         statusCode: 200,
         headers: {},
@@ -249,7 +272,7 @@ describe("syncTierA", () => {
 
 /**
  * Build a Tier B response signed by a TEST keypair (NOT production).
- * Uses CE_LICENSE_PUBLIC_KEY env override so verifyLicenseSignature() picks
+ * Uses __setLicensePublicKeyForTesting() so verifyLicenseSignature() picks
  * up our test public key.
  */
 function buildSignedTierBPayload(
@@ -296,7 +319,7 @@ describe("syncTierB", () => {
       [VALID_TIER_A_RULE],
       { key: LICENSE },
     );
-    process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
+    __setLicensePublicKeyForTesting(publicKeyPem);
     try {
       __setHttpForTesting(
         makeHttpMock({
@@ -313,7 +336,7 @@ describe("syncTierB", () => {
       expect(store.rules.length).toBe(1);
       expect(store.rules[0].source).toBe("tier-B-pro");
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
     }
   });
 
@@ -326,7 +349,7 @@ describe("syncTierB", () => {
       [VALID_TIER_A_RULE],
       { key: "CE-ATTACKER-CAPTURED-LICENSE" },
     );
-    process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
+    __setLicensePublicKeyForTesting(publicKeyPem);
     try {
       __setHttpForTesting(
         makeHttpMock({ statusCode: 200, headers: {}, body: payload }),
@@ -341,7 +364,7 @@ describe("syncTierB", () => {
         ),
       ).toBe(true);
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
       stderrSpy.mockRestore();
     }
   });
@@ -353,7 +376,7 @@ describe("syncTierB", () => {
       [VALID_TIER_A_RULE],
       { key: LICENSE, machineId: "SOMEONE-ELSES-MACHINE-ID" },
     );
-    process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
+    __setLicensePublicKeyForTesting(publicKeyPem);
     try {
       __setHttpForTesting(
         makeHttpMock({ statusCode: 200, headers: {}, body: payload }),
@@ -367,7 +390,7 @@ describe("syncTierB", () => {
         ),
       ).toBe(true);
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
       stderrSpy.mockRestore();
     }
   });
@@ -379,7 +402,7 @@ describe("syncTierB", () => {
       [VALID_TIER_A_RULE],
       { key: LICENSE, expiresAt: new Date(Date.now() - 1000).toISOString() },
     );
-    process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
+    __setLicensePublicKeyForTesting(publicKeyPem);
     try {
       __setHttpForTesting(
         makeHttpMock({ statusCode: 200, headers: {}, body: payload }),
@@ -390,7 +413,7 @@ describe("syncTierB", () => {
         true,
       );
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
       stderrSpy.mockRestore();
     }
   });
@@ -405,7 +428,7 @@ describe("syncTierB", () => {
         expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString(),
       },
     );
-    process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
+    __setLicensePublicKeyForTesting(publicKeyPem);
     try {
       __setHttpForTesting(
         makeHttpMock({ statusCode: 200, headers: {}, body: payload }),
@@ -418,7 +441,7 @@ describe("syncTierB", () => {
         ),
       ).toBe(true);
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
       stderrSpy.mockRestore();
     }
   });
@@ -442,13 +465,13 @@ describe("syncTierB", () => {
   it("invalid signature: rejects (no rules written), logs", async () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     // Build a payload with a signature from a DIFFERENT keypair than the one
-    // we install as CE_LICENSE_PUBLIC_KEY.
+    // we install as the test key.
     const { payload } = buildSignedTierBPayload([VALID_TIER_A_RULE]);
     // Install a DIFFERENT public key so verification fails
     const decoy = generateKeyPairSync("ed25519").publicKey
       .export({ type: "spki", format: "pem" })
       .toString();
-    process.env.CE_LICENSE_PUBLIC_KEY = decoy;
+    __setLicensePublicKeyForTesting(decoy);
     try {
       __setHttpForTesting(
         makeHttpMock({
@@ -464,7 +487,7 @@ describe("syncTierB", () => {
       expect(store.rules.length).toBe(0);
       expect(stderrSpy).toHaveBeenCalled();
     } finally {
-      delete process.env.CE_LICENSE_PUBLIC_KEY;
+      __setLicensePublicKeyForTesting(null);
       stderrSpy.mockRestore();
     }
   });

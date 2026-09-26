@@ -89,17 +89,89 @@ function backupSettings(): string {
 // FIX: compare the script path after expanding $HOME, ${HOME} and a leading ~; installing also
 //      removes extra copies of our own commands under the same matcher, and nothing else.
 
+/** The first shell word of a command, quotes removed ('...', "...", backslash), and the rest. */
+function splitFirstWord(command: string): { word: string; rest: string } {
+  const s = command ?? "";
+  let i = 0;
+  while (i < s.length && /\s/.test(s[i])) i++;
+  let word = "";
+  while (i < s.length && !/\s/.test(s[i])) {
+    const ch = s[i];
+    if (ch === "'") {
+      const j = s.indexOf("'", i + 1);
+      word += j < 0 ? s.slice(i + 1) : s.slice(i + 1, j);
+      i = j < 0 ? s.length : j + 1;
+    } else if (ch === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== '"') {
+        if (s[j] === "\\" && j + 1 < s.length) { word += s[j + 1]; j += 2; } else { word += s[j]; j++; }
+      }
+      i = j + 1;
+    } else if (ch === "\\" && i + 1 < s.length) {
+      word += s[i + 1];
+      i += 2;
+    } else {
+      word += ch;
+      i++;
+    }
+  }
+  return { word, rest: s.slice(i).trim() };
+}
+
 /** The script path of a hook command, with $HOME, ${HOME} or a leading ~ expanded. */
 export function hookScriptPath(command: string, home: string = homedir()): string {
-  const m = /^\s*(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(command ?? "");
-  const path = m ? (m[1] ?? m[2] ?? m[3]) : "";
-  return path.replace(/^(?:\$HOME|\$\{HOME\}|~)(?=\/)/, home);
+  return splitFirstWord(command).word.replace(/^(?:\$HOME|\$\{HOME\}|~)(?=\/)/, home);
 }
 
 /** The command with its script path expanded, so two spellings of one call compare equal. */
 function normalizedCommand(command: string, home: string): string {
-  const args = (command ?? "").trim().replace(/^(?:"[^"]*"|'[^']*'|\S+)/, "").trim();
-  return `${hookScriptPath(command, home)} ${args}`.trim();
+  return `${hookScriptPath(command, home)} ${splitFirstWord(command).rest}`.trim();
+}
+
+// [LOCKED] [HOOK-PATHS-ARE-SHELL-QUOTED] - 2026-09-25
+// [NEVER] write a script path into a hook command, or into the generated gate script, without
+//         shellQuote(): Claude Code runs every hook command through a shell.
+// WHY: with a home folder named "John Smith" the installer wrote `/Users/John Smith/.claude/...`
+//      unquoted: every hook exited 127, the install's own count found 0 of ours and failed, and
+//      each re-run added four more broken entries (4, then 8). A double quote in the path made the
+//      shell exit 2, which for a Stop hook means "block the turn" (E2E_REVIEW_2026-09 A3-2, A3-4).
+// FIX: shellQuote() leaves a plain path as it is (existing installs compare equal and do not
+//      churn) and single-quotes anything else; splitFirstWord() reads commands the way the shell
+//      does, so a quoted path compares equal to its plain spelling; an unquoted copy of one of our
+//      paths that contains a space is recognised as ours and repaired.
+export function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./@%+=:,-]+$/.test(value) ? value : scriptQuote(value);
+}
+
+/** Always single-quoted: for the lines of a generated sh script. */
+function scriptQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** An old install's unquoted command for one of our scripts whose path contains whitespace. */
+function isBrokenUnquotedCopy(command: string, script: string): boolean {
+  if (!/\s/.test(script)) return false;
+  const c = (command ?? "").trim();
+  return c === script || c.startsWith(`${script} `);
+}
+
+/** True when a hook command runs one of `scripts`, however it is spelled. */
+function runsOneOf(command: string, scripts: string[], home: string = homedir()): boolean {
+  return scripts.includes(hookScriptPath(command, home)) || scripts.some((s) => isBrokenUnquotedCopy(command, s));
+}
+
+/** Rewrites unquoted, broken copies of our commands to their quoted form (then dedup sees them). */
+function repairUnquotedCommands(entries: HookEntry[], scripts: string[]): number {
+  let repaired = 0;
+  for (const e of entries) {
+    for (const h of e.hooks ?? []) {
+      const s = scripts.find((x) => isBrokenUnquotedCopy(h.command, x));
+      if (!s) continue;
+      h.command = `${shellQuote(s)} ${h.command.trim().slice(s.length).trim()}`.trim();
+      repaired++;
+    }
+  }
+  return repaired;
 }
 
 function hookAlreadyWired(entries: HookEntry[] | undefined, hookScript: string, home: string = homedir()): boolean {
@@ -244,6 +316,11 @@ Run: opscontext install-autostart
   }
   const simplicityAsked = args.includes("--simplicity");
 
+  // Parse settings.json before writing anything: a malformed file is refused with nothing changed
+  // (it used to be refused after the emit script had already been copied).
+  const original = existsSync(SETTINGS_FILE) ? readFileSync(SETTINGS_FILE, "utf-8") : null;
+  const settings = readSettings();
+
   // Step 1: Install / verify the hook script
   mkdirSync(HOOKS_DIR, { recursive: true });
   const src = bundledFile("claude-code-hook.sh");
@@ -257,19 +334,18 @@ Run: opscontext install-autostart
   chmodSync(HOOK_SCRIPT, 0o755);
   console.log(`✅ Installed hook script: ${HOOK_SCRIPT}`);
 
-  // Step 2: Splice into settings.json
-  const settings = readSettings();
-  const backup = backupSettings();
-  if (backup) console.log(`✅ Backed up settings.json → ${backup}`);
-
+  // Step 2: Splice into settings.json (written, after a backup, only if something changes)
   settings.hooks ??= {};
   const hookCmdPrefix = `${HOOK_SCRIPT}`; // compared by expanded path, [HOOKS-COMPARED-BY-EXPANDED-PATH]
 
   // [LOCK] [HOOKS-COMPARED-BY-EXPANDED-PATH]: remove extra copies before deciding what to add.
+  // [LOCK] [HOOK-PATHS-ARE-SHELL-QUOTED]: first repair unquoted copies an older install wrote for a
+  // path with a space, so the dedup below sees them as ours.
   let deduped = 0;
   for (const kind of [...EVENT_KINDS, "Stop"]) {
     const entries = settings.hooks[kind];
     if (!entries) continue;
+    repairUnquotedCommands(entries, OUR_SCRIPTS);
     const r = dropDuplicateHooks(entries, OUR_SCRIPTS);
     settings.hooks[kind] = r.entries;
     deduped += r.removed;
@@ -288,7 +364,7 @@ Run: opscontext install-autostart
       hooks: [
         {
           type: "command",
-          command: `${HOOK_SCRIPT} ${kind}`,
+          command: `${shellQuote(HOOK_SCRIPT)} ${kind}`,
           timeout: 5,
         },
       ],
@@ -305,14 +381,14 @@ Run: opscontext install-autostart
   const cliPath = globalCliPath() ?? join(__dirname_esm, "cli.js");
   writeFileSync(
     GATE_SCRIPT,
-    `#!/bin/sh\n# Generated by \`opscontext install-claude-hook\`: the CE session gate on Claude Code Stop.\n# Exit 2 = the turn may not end yet (reason on stderr). See: contextengine session-gate --help\nexec "${process.execPath}" "${cliPath}" session-gate\n`,
+    `#!/bin/sh\n# Generated by \`opscontext install-claude-hook\`: the CE session gate on Claude Code Stop.\n# Exit 2 = the turn may not end yet (reason on stderr). See: contextengine session-gate --help\nexec ${scriptQuote(process.execPath)} ${scriptQuote(cliPath)} session-gate\n`,
   );
   chmodSync(GATE_SCRIPT, 0o755);
   settings.hooks.Stop ??= [];
   if (hookAlreadyWired(settings.hooks.Stop, GATE_SCRIPT)) {
     skipped++;
   } else {
-    settings.hooks.Stop.push({ hooks: [{ type: "command", command: GATE_SCRIPT, timeout: 15 }] });
+    settings.hooks.Stop.push({ hooks: [{ type: "command", command: shellQuote(GATE_SCRIPT), timeout: 15 }] });
     added++;
   }
   console.log(`✅ Installed session gate: ${GATE_SCRIPT}`);
@@ -334,7 +410,7 @@ Run: opscontext install-autostart
     } else {
       settings.hooks.PostToolUse.push({
         matcher: SIMPLICITY_MATCHER,
-        hooks: [{ type: "command", command: SIMPLICITY_SCRIPT, timeout: 30 }],
+        hooks: [{ type: "command", command: shellQuote(SIMPLICITY_SCRIPT), timeout: 30 }],
       });
       added++;
     }
@@ -344,7 +420,15 @@ Run: opscontext install-autostart
     else console.log(`⚠️  ruff not found (PATH, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/.cargo/bin): the gate stays silent until it is installed (brew install ruff, or pipx install ruff).`);
   }
 
-  writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  // A re-run that changes nothing writes nothing and leaves no backup behind (a copy of
+  // settings.json per run piled up, env values and all).
+  let backup = "";
+  const unchanged = original !== null && JSON.stringify(JSON.parse(original)) === JSON.stringify(settings);
+  if (!unchanged) {
+    backup = backupSettings();
+    if (backup) console.log(`✅ Backed up settings.json → ${backup}`);
+    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  }
   const removedNote = deduped ? `, ${deduped} duplicate registrations removed` : "";
   console.log(`✅ ${added} hook entries added, ${skipped} already present${removedNote}.`);
 
@@ -387,9 +471,18 @@ The hook script files under ~/.claude/hooks/ are left in place — delete
 manually if you want them gone. The audit log is NOT touched.`);
     return;
   }
-  const ourNames = args.includes("--simplicity")
-    ? ["opscontext-simplicity-gate.py"]
-    : ["opscontext-emit.sh", "opscontext-session-gate.sh", "opscontext-simplicity-gate.py"];
+  // [LOCKED] [UNINSTALL-REMOVES-ONLY-OUR-COMMANDS] - 2026-09-25
+  // [NEVER] drop a whole hook entry because one of its commands is ours, or recognise ours by a
+  //         substring of the command text.
+  // WHY: the uninstaller removed every entry whose command text contained one of our file names.
+  //      In a sandbox it deleted a user's company-audit.sh that shared an entry with our emit hook,
+  //      and a user's notify-opscontext-emit.sh.done that merely contained our name
+  //      (E2E_REVIEW_2026-09 A3-1). [CLAUDE-HOOK-INSTALL] asks for the "preserve existing"
+  //      discipline in every code path; this one broke it.
+  // FIX: remove only the commands that run our scripts, compared by expanded path like the
+  //      installer ([HOOKS-COMPARED-BY-EXPANDED-PATH]); drop an entry only when that leaves it
+  //      empty; back up and write only when something was removed.
+  const ours = args.includes("--simplicity") ? [SIMPLICITY_SCRIPT] : OUR_SCRIPTS;
 
   const settings = readSettings();
   if (!settings.hooks) {
@@ -397,24 +490,30 @@ manually if you want them gone. The audit log is NOT touched.`);
     return;
   }
 
-  const backup = backupSettings();
-  if (backup) console.log(`✅ Backed up settings.json → ${backup}`);
-
   let removed = 0;
   for (const kind of [...EVENT_KINDS, "Stop"] as const) {
     const entries = settings.hooks[kind];
     if (!entries) continue;
-    const filtered = entries.filter((e) => !e.hooks?.some((h) => ourNames.some((n) => h.command?.includes(n))));
-    removed += entries.length - filtered.length;
-    if (filtered.length === 0) {
+    const kept: HookEntry[] = [];
+    for (const e of entries) {
+      const before = e.hooks ?? [];
+      const hooks = before.filter((h) => !runsOneOf(h.command, ours));
+      removed += before.length - hooks.length;
+      if (hooks.length > 0 || before.length === 0) kept.push({ ...e, hooks });
+    }
+    if (kept.length === 0) {
       delete settings.hooks[kind];
     } else {
-      settings.hooks[kind] = filtered;
+      settings.hooks[kind] = kept;
     }
   }
 
-  writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-  console.log(`✅ Removed ${removed} hook entries.`);
+  if (removed > 0) {
+    const backup = backupSettings();
+    if (backup) console.log(`✅ Backed up settings.json → ${backup}`);
+    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  }
+  console.log(`✅ Removed ${removed} OpsContext hook command(s); every other hook kept.`);
   console.log(`   Hook script kept at: ${HOOK_SCRIPT}`);
   console.log(`   Audit log untouched.`);
 }

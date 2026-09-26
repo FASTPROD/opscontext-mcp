@@ -130,15 +130,16 @@ describe("verifyLicenseSignature", () => {
     }
   });
 
-  it("the CE_LICENSE_PUBLIC_KEY env var overrides the bundled public key (self-hoster path)", () => {
+  // [LOCK] [LICENSE-SIG]: E2E_REVIEW_2026-09 A4-1. This test used to assert the opposite: that the
+  // variable replaced the pinned key. With it, a self-made key and a self-signed licence unlocked
+  // every Pro tool.
+  it("the CE_LICENSE_PUBLIC_KEY env var no longer replaces the pinned key", () => {
     const { signed, publicKeyPem } = signWithTestKey(REFERENCE_LICENSE);
     const original = process.env.CE_LICENSE_PUBLIC_KEY;
     process.env.CE_LICENSE_PUBLIC_KEY = publicKeyPem;
     try {
-      // Caller does not pass a publicKeyPem arg → falls back to env var
       const r = verifyLicenseSignature(signed);
-      expect(r.ok).toBe(true);
-      if (r.ok) expect(r.mode).toBe("ed25519");
+      expect(r.ok).toBe(false);
     } finally {
       if (original === undefined) delete process.env.CE_LICENSE_PUBLIC_KEY;
       else process.env.CE_LICENSE_PUBLIC_KEY = original;

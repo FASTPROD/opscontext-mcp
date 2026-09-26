@@ -122,7 +122,8 @@ function resolveEnvVars(config: Record<string, unknown>): Record<string, unknown
  */
 async function loadAdapterModule(
   modulePath: string,
-  config?: Record<string, unknown>
+  config?: Record<string, unknown>,
+  baseDir: string = process.cwd(),
 ): Promise<Adapter> {
   let moduleSpecifier = modulePath;
   let exportName: string | null = null;
@@ -134,9 +135,10 @@ async function loadAdapterModule(
     exportName = exp;
   }
 
-  // Resolve relative paths from CWD
+  // Resolve relative paths from the config file's folder, never from wherever the server started.
+  // [LOCK] [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG]
   if (moduleSpecifier.startsWith(".") || moduleSpecifier.startsWith("/")) {
-    moduleSpecifier = resolve(process.cwd(), moduleSpecifier);
+    moduleSpecifier = resolve(baseDir, moduleSpecifier);
   }
 
   const mod = await import(moduleSpecifier);
@@ -178,7 +180,7 @@ async function loadAdapterModule(
  * @param entries — Adapter entries from contextengine.json
  * @returns Number of successfully loaded adapters
  */
-export async function loadAdapters(entries: AdapterEntry[]): Promise<number> {
+export async function loadAdapters(entries: AdapterEntry[], baseDir: string = process.cwd()): Promise<number> {
   let loaded = 0;
 
   for (const entry of entries) {
@@ -190,7 +192,7 @@ export async function loadAdapters(entries: AdapterEntry[]): Promise<number> {
     try {
       const resolvedConfig = entry.config ? resolveEnvVars(entry.config) : undefined;
 
-      const adapter = await loadAdapterModule(entry.module, resolvedConfig);
+      const adapter = await loadAdapterModule(entry.module, resolvedConfig, baseDir);
 
       // Validate config if adapter supports it
       if (adapter.validate) {

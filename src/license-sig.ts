@@ -6,8 +6,13 @@
 //    the change.
 // ⛔ NEVER ship the public key as a mutable variable. It's a constant
 //    that pins the client to the production activation server.
-//    Self-hosters override via CE_LICENSE_PUBLIC_KEY env var, which
-//    is the documented escape hatch.
+//    [NEVER] bring back an environment variable that replaces it (2026-09-25).
+//    Self-hosters build from source with their own key in LICENSE_PUBLIC_KEY_PEM.
+//    WHY (2026-09-25, owner's decision after E2E_REVIEW_2026-09 A4-1): the old escape hatch,
+//    CE_LICENSE_PUBLIC_KEY, documented in the shipped CHANGELOG, let anyone generate a key pair,
+//    sign their own licence and unlock every Pro tool with one variable; proven in a sandbox
+//    (`score` ran on a self-signed licence). Tests swap the key in-process only, through
+//    __setLicensePublicKeyForTesting().
 // ⛔ Legacy SHA-256 signatures are NOW REJECTED (flag day reached
 //    2026-06-11 — earlier than the originally scheduled 2026-08-15
 //    because the customer base is effectively empty and no one would
@@ -26,10 +31,33 @@
 // Ed25519 license signature — verify side (client).
 //
 // Pairs with server/src/license-sig.ts (sign side). Public key below is
-// pinned to the production activation server (api.compr.ch). Self-hosters
-// override with CE_LICENSE_PUBLIC_KEY env var.
+// pinned to the production activation server (api.compr.ch). No runtime
+// override: see [LICENSE-SIG] above.
 
 import { createPublicKey, verify } from "crypto";
+
+let testPublicKeyPem: string | null = null;
+/** Tests only: verify against another key, in this process. Pass null to restore the pinned key. */
+export function __setLicensePublicKeyForTesting(pem: string | null): void {
+  testPublicKeyPem = pem;
+}
+function activePublicKeyPem(): string {
+  return testPublicKeyPem ?? LICENSE_PUBLIC_KEY_PEM;
+}
+
+/**
+ * True when `signatureB64` is an Ed25519 signature of `bytes` by the pinned key. Used for the
+ * community rules file, which is signed as a whole. [LOCK] [COMMUNITY-TIER-A-IS-SIGNED]
+ */
+export function verifyDetachedSignature(bytes: Buffer, signatureB64: string): boolean {
+  try {
+    const sig = Buffer.from(signatureB64.trim(), "base64");
+    if (sig.length !== 64) return false;
+    return verify(null, bytes, createPublicKey(activePublicKeyPem()), sig);
+  } catch {
+    return false;
+  }
+}
 
 // Production Ed25519 public key. Paired private key lives ONLY on the
 // activation server. Public key SHA-256 fingerprint (first 32 hex chars):
@@ -85,12 +113,12 @@ export type VerifyResult =
  *   - ok=false, reason=<string>           → signature missing / invalid /
  *                                            tampered / wrong keypair
  *
- * Override the public key via CE_LICENSE_PUBLIC_KEY env var (PEM contents)
- * for self-hosters running their own activation server.
+ * The key is the pinned one (tests: __setLicensePublicKeyForTesting). No environment variable
+ * replaces it any more. [LOCK] [LICENSE-SIG]
  */
 export function verifyLicenseSignature(
   license: SignableLicensePayload & { signature: string },
-  publicKeyPem: string = process.env.CE_LICENSE_PUBLIC_KEY || LICENSE_PUBLIC_KEY_PEM,
+  publicKeyPem: string = activePublicKeyPem(),
 ): VerifyResult {
   if (!license.signature || license.signature.length === 0) {
     return { ok: false, reason: "signature field missing" };

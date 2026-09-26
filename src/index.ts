@@ -3,9 +3,9 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource } from "./config.js";
+import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource, findConfigFileWithOrigin } from "./config.js";
 import { ingestSources, Chunk } from "./ingest.js";
-import { redactSecrets } from "./secret-shapes.js";
+import { redactChunk } from "./secret-shapes.js";
 import { summarizeSource } from "./source-summary.js";
 import { searchChunks, SearchResult } from "./search.js";
 import {
@@ -48,7 +48,9 @@ import {
   formatSessionList,
 } from "./sessions.js";
 import { verifyChain, readAuditLog, filterByRange, autoRotateAuditLog, safeAppend } from "./audit.js";
-import { registerServer, listServers, formatServers } from "./server-registry.js";
+import { registerServer, listServers, formatServers, liveDaemonPid } from "./server-registry.js";
+import { secureCeHome } from "./ce-home.js";
+import { QUOTED_TEXT_NOTE } from "./framing.js";
 import { computeFleetHealth, writeFleetHealth } from "./fleet-health.js";
 import { startEventIngestServer } from "./http-server.js";
 import { detect } from "./detector.js";
@@ -93,7 +95,8 @@ import {
   type AdapterEntry,
 } from "./adapters.js";
 import {
-  gateCheck,
+  gateCheckFresh,
+  licenceCheckState,
   activate,
   deactivate,
   getActivationStatus,
@@ -118,6 +121,8 @@ let role: ServerRole = "indexer";
 let corpus: string | undefined;
 let indexerPid: number | null = null;
 let setRegistryRole: ((r: ServerRole) => void) | null = null;
+let setRegistryEventPort: ((port: number | null) => void) | null = null;
+let warnedCwdAdapters = false;
 /** key -> vector, loaded from ~/.contextengine/embeddings.bin and grown by what we embed. */
 let vectorStore: Map<string, Float32Array> = new Map();
 let indexSeq = 0;
@@ -212,6 +217,13 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
     if (autoImport.refused) {
       console.error(`[ContextEngine] ⛔ Auto-import write refused: ${autoImport.refused}`);
     }
+    // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS]: say what was left out, and how to include it.
+    if (autoImport.untrusted.length > 0) {
+      console.error(
+        `[ContextEngine] ⏸ Marked learnings in ${autoImport.untrusted.length} project(s) you have not marked as yours were not imported: ` +
+          `${autoImport.untrusted.join(", ")}. If they are yours: contextengine trust ${autoImport.untrusted.map((p) => JSON.stringify(p)).join(" ")}`,
+      );
+    }
   }
 
   // Inject learnings as searchable chunks (project-scoped to prevent IP leakage)
@@ -243,9 +255,30 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
   chunks = chunks.map(redactChunk);
 
   // Collect from plugin adapters
-  if (config.adapters && config.adapters.length > 0) {
+  // [LOCKED] [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG] - 2026-09-25
+  // [NEVER] import an adapter module named by a contextengine.json found in the current folder, or
+  //         resolve a relative adapter path from the current folder.
+  // WHY: without CONTEXTENGINE_CONFIG (the README's setup), the server reads ./contextengine.json
+  //      from the folder it starts in, which for Claude Code is the project opened. An adapter entry
+  //      there is import()ed, so a downloaded repository carrying a config and a module ran its own
+  //      code in the user's session when the project was opened; proven in a sandbox on 2026-09-25
+  //      (E2E_REVIEW_2026-09 A6-5). A relative path in the user's own config also resolved from
+  //      that folder, not from the config's.
+  // FIX: adapters load only from the config named by CONTEXTENGINE_CONFIG or ~/.contextengine.json,
+  //      relative paths resolve from that file's folder; a config found in the current folder may
+  //      still list sources, never code.
+  const cfgFile = findConfigFileWithOrigin();
+  if (config.adapters && config.adapters.length > 0 && cfgFile?.origin === "cwd") {
+    if (!warnedCwdAdapters) {
+      warnedCwdAdapters = true;
+      console.error(
+        `[ContextEngine] ⛔ Adapters in ${cfgFile.path} were NOT loaded: a config found in the current folder may not run code. ` +
+          `Point CONTEXTENGINE_CONFIG at it, or move the adapters to ~/.contextengine.json.`,
+      );
+    }
+  } else if (config.adapters && config.adapters.length > 0) {
     if (opts.loadAdapters) {
-      const adapterCount = await loadAdapters(config.adapters as AdapterEntry[]);
+      const adapterCount = await loadAdapters(config.adapters as AdapterEntry[], cfgFile ? dirname(cfgFile.path) : process.cwd());
       if (adapterCount === 0) return;
     }
     const adapterChunks = await collectFromAdapters(config.adapters as AdapterEntry[]);
@@ -258,22 +291,8 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
   }
 }
 
-/**
- * [LOCKED] [INDEX-NEVER-SERVES-A-CREDENTIAL] - 2026-09-25
- * [NEVER] let a chunk into the index, the shared index file or a search result without passing
- *         its text through redactSecrets().
- * WHY: on 2026-09-25 the shared index held database URLs with their passwords (read from dotenv
- *      files, whose masking skipped the password inside a URL), sshpass and mysql passwords from
- *      runbooks and memory notes, and Google API keys: 55 sources in all. search_context hands
- *      chunks to every AI agent that asks, and the index file rides the weekly backup.
- * FIX: every chunk, whatever collected it (docs, code, ops collectors, learnings, community rules,
- *      adapters), is redacted with the capture shapes (src/secret-shapes.ts) as the index is built.
- *      The source files are not touched: cleaning those is the owner's call, file by file.
- */
-function redactChunk<T extends { content: string }>(c: T): T {
-  const r = redactSecrets(c.content);
-  return Object.keys(r.counts).length > 0 ? { ...c, content: r.text } : c;
-}
+// [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: redactChunk lives in src/secret-shapes.ts, shared with
+// the CLI's index builder.
 
 /** Load the model once; every caller shares the same promise. */
 function ensureModel(): Promise<boolean> {
@@ -696,6 +715,7 @@ server.tool(
     const searchMode = isEmbeddingsReady() ? mode : "keyword (embeddings loading)";
     const text = [
       `Search: "${query}" | Mode: ${searchMode} | ${results.length} results`,
+      QUOTED_TEXT_NOTE, // [LOCK] [QUOTED-TEXT-IS-FRAMED-AS-DATA]
       "",
       ...results.map((r, i) =>
         [
@@ -733,7 +753,8 @@ server.tool(
       const status = exists
         ? `✅ ${count} chunks${embeddedCount > 0 ? ` (${embeddedCount} embedded)` : ""}`
         : "⚠ file not found";
-      const summary = exists ? summarizeSource(s) : "";
+      // A preview quotes the file: redacted like any chunk. [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]
+      const summary = exists ? redactChunk({ content: summarizeSource(s) }).content : "";
       return `${s.name}: ${status}${summary ? `\n  ${summary}` : ""}\n  ${s.path}`;
     });
 
@@ -744,6 +765,7 @@ server.tool(
     const text = [
       `ContextEngine v${PKG_VERSION}`,
       `Sources: ${sources.length} | Chunks: ${chunks.length} | Embeddings: ${embStatus}`,
+      QUOTED_TEXT_NOTE, // [LOCK] [QUOTED-TEXT-IS-FRAMED-AS-DATA]
       "",
       ...lines,
     ].join("\n");
@@ -791,8 +813,10 @@ server.tool(
       };
     }
 
-    const content = readFileSync(source.path, "utf-8");
-    return respond("read_source", `# ${source.name}\n\n${content}`, source_name);
+    // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: the whole file goes through the same redaction as a
+    // search result; read_source used to return it raw (E2E_REVIEW_2026-09 A6-6).
+    const content = redactChunk({ content: readFileSync(source.path, "utf-8") }).content;
+    return respond("read_source", `# ${source.name}\n${QUOTED_TEXT_NOTE}\n\n${content}`, source_name);
   }
 );
 
@@ -824,7 +848,7 @@ server.tool(
   "Discover and analyze all projects in the workspace. Shows tech stack (framework, runtime, key dependencies), infrastructure (git, docker, pm2), and git remote status for each project. Requires Pro license.",
   {},
   async () => {
-    const gate = gateCheck("list_projects");
+    const gate = await gateCheckFresh("list_projects");
     if (gate) return { content: [{ type: "text" as const, text: gate }] };
     const projectDirs = loadProjectDirs();
     const projects = listProjects(projectDirs);
@@ -841,7 +865,7 @@ server.tool(
   "Scan all projects for port declarations (ecosystem.config.js, docker-compose.yml, .env, package.json) and detect port conflicts. Returns a port allocation map with conflict warnings. Requires Pro license.",
   {},
   async () => {
-    const gate = gateCheck("check_ports");
+    const gate = await gateCheckFresh("check_ports");
     if (gate) return { content: [{ type: "text" as const, text: gate }] };
     const projectDirs = loadProjectDirs();
     const { ports, conflicts } = checkPorts(projectDirs);
@@ -863,7 +887,7 @@ server.tool(
       .describe("Audit scope: all checks, compliance only, version checks only, or port conflicts only"),
   },
   async ({ scope }) => {
-    const gate = gateCheck("run_audit");
+    const gate = await gateCheckFresh("run_audit");
     if (gate) return { content: [{ type: "text" as const, text: gate }] };
     const projectDirs = loadProjectDirs();
     const plan = runComplianceAudit(projectDirs);
@@ -885,7 +909,7 @@ server.tool(
       .describe("Project name OR absolute directory path to score. Omit to score all projects."),
   },
   async ({ project }) => {
-    const gate = gateCheck("score_project");
+    const gate = await gateCheckFresh("score_project");
     if (gate) return { content: [{ type: "text" as const, text: gate }] };
 
     // 🔒 LOCKED [SCORE-CANARY-COVERS-EVERY-SCORER] — 2026-08-19
@@ -1401,7 +1425,8 @@ server.tool(
     }
     const learnings = listLearnings(category, activeProjectNames);
     const text = formatLearnings(learnings, { since: sinceDate, sinceSpec: since });
-    return respond("list_learnings", text);
+    // Redacted like every chunk: a learning can quote a command with its password. [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]
+    return respond("list_learnings", redactChunk({ content: text }).content);
   }
 );
 
@@ -1530,6 +1555,7 @@ server.tool(
       `- **Expires**: ${status.expiresAt}`,
       `- **Delta version**: ${status.deltaVersion}`,
       `- **Machine ID**: ${status.machineId}`,
+      `- **Licence check**: ${licenceCheckState()}`, // [LOCK] [LICENSE-IS-CHECKED-DAILY]
       ``,
     ];
     if (status.premiumTools.length > 0) {
@@ -1595,6 +1621,9 @@ function registerResources(): void {
 // Start
 // ---------------------------------------------------------------------------
 async function main() {
+  // [LOCK] [CE-HOME-IS-PRIVATE]: the folder is 0700 before the registry, the index or the log write
+  // into it.
+  secureCeHome();
   // 0. Inventory this server FIRST, before indexing takes minutes: a server exists the moment it
   //    starts. [LOCK] [SERVERS-ARE-INVENTORIED]. With the shared index on, the registry is also
   //    the electorate: the record carries the corpus and the role. [LOCK] [ONE-INDEXER-MANY-READERS]
@@ -1606,8 +1635,9 @@ async function main() {
     }
   }
   try {
-    const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined });
+    const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined, daemon: process.env.OPSCONTEXT_DAEMON === "1" });
     setRegistryRole = reg.setRole;
+    setRegistryEventPort = reg.setEventPort;
     const fleet = listServers();
     if (corpus) {
       const e = electIndexer(corpus, fleet.servers, process.pid);
@@ -1750,7 +1780,13 @@ async function main() {
   // No-op if secret is missing; the endpoint will refuse with 401 until
   // a secret is configured. Failure to bind (port collision) logs and
   // continues — the MCP server stays usable without browser capture.
-  startEventIngestServer().catch((err) => {
+  // [LOCK] [EVENT-PORT-BELONGS-TO-THE-DAEMON]: the launchd agent keeps trying until it holds the
+  // port; a chat server takes it only while no agent is alive, and hands it over when one is.
+  startEventIngestServer({
+    daemon: process.env.OPSCONTEXT_DAEMON === "1",
+    onPortChange: (port) => setRegistryEventPort?.(port),
+    liveDaemon: () => liveDaemonPid(),
+  }).catch((err) => {
     console.error("[ContextEngine] event-ingest start failed:", err);
   });
 }

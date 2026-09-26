@@ -85,6 +85,14 @@ export interface LicenseInfo {
   lastHeartbeat: string;
   deltaVersion: string;
   signature: string;
+  /** Since 2.10.0: the first failed licence check since the last good one. [LOCK] [LICENSE-IS-CHECKED-DAILY] */
+  offlineSince?: string;
+  /** Since 2.10.0: the first of consecutive refusals by the licence server (grace before revoked). */
+  refusedSince?: { at: string; reason: string };
+  /** Since 2.10.0: refused for longer than the grace (refund, expiry, revoked machine). */
+  revoked?: { at: string; reason: string };
+  /** Since 2.10.0: when the next licence check is due. */
+  nextCheck?: string;
 }
 
 interface ActivationResponse {
@@ -122,6 +130,12 @@ export function loadLicense(): LicenseInfo | null {
     // Check expiry
     if (new Date(data.expiresAt) < new Date()) {
       console.error("[ContextEngine] ⚠ License expired — premium features disabled");
+      return null;
+    }
+
+    // Refused by the licence server at the last check. [LOCK] [LICENSE-IS-CHECKED-DAILY]
+    if (data.revoked) {
+      console.error(`[ContextEngine] ⛔ License refused by the licence server on ${data.revoked.at} (${data.revoked.reason}) — premium features disabled. Run activate again after renewing.`);
       return null;
     }
 
@@ -256,18 +270,44 @@ export async function activate(licenseKey: string, email: string): Promise<{
 // Heartbeat — periodic license validation
 // ---------------------------------------------------------------------------
 
-export async function heartbeat(): Promise<boolean> {
+// [LOCKED] [LICENSE-IS-CHECKED-DAILY] - 2026-09-25
+// [NEVER] let a non-refusal (network error, 429, 5xx, 404, a proxy page) cancel a licence, cancel on
+//         a single refusal, or let the gate run without the scheduled check being attempted.
+// WHY: heartbeat() existed and was never called: 0 callers. A refunded or revoked licence kept
+//      every Pro tool until its expiry date, and a licence last checked in 2000 still scored in a
+//      sandbox (E2E_REVIEW_2026-09 A4-2). The owner chose to switch it on, with 7 days of grace.
+//      A first version cancelled on the first refusal; since no licence had ever been checked, a
+//      licence missing from the server's database by mistake (a restore, a hand-made test key)
+//      would have lost Pro at the first check after the upgrade, with no warning.
+// FIX: gateCheckFresh() runs the check before the gate when it is due: 24 h after a success, 1 h
+//      after a failure (so an offline user is not delayed 5 s on every call), at once when never
+//      checked or when the date is in the future (an edited file). Only the server's explicit
+//      refusal (403 with valid:false, server/src/server.ts) counts as one; the licence is revoked
+//      once refusals have lasted REFUSAL_GRACE_DAYS, and a success in between clears them.
+//      Anything else starts offlineSince, and the gate refuses once the server has been
+//      unreachable for more than OFFLINE_GRACE_DAYS since the first failed check. Both states show
+//      in activation_status. The payload is unchanged: [ACTIVATION-PAYLOAD-NO-USAGE-DATA].
+const OFFLINE_GRACE_DAYS = 7;
+const REFUSAL_GRACE_DAYS = 3;
+const RETRY_AFTER_FAILURE_MS = 60 * 60 * 1000;
+export type HeartbeatOutcome = "fresh" | "valid" | "refused" | "revoked" | "unreachable" | "no_license";
+
+function scheduleNext(license: LicenseInfo, afterMs: number): void {
+  license.nextCheck = new Date(Date.now() + afterMs).toISOString();
+}
+
+export async function heartbeat(opts: { force?: boolean; timeoutMs?: number } = {}): Promise<HeartbeatOutcome> {
   const license = loadLicense();
-  if (!license) return false;
-  
-  const lastBeat = new Date(license.lastHeartbeat).getTime();
+  if (!license) return "no_license";
+
   const now = Date.now();
-  
-  // Only check once per day
-  if (now - lastBeat < HEARTBEAT_INTERVAL_MS) return true;
-  
+  const next = license.nextCheck ? Date.parse(license.nextCheck) : NaN;
+  // Due when never scheduled, past its time, or scheduled further out than a day (an edited file).
+  if (!opts.force && Number.isFinite(next) && now < next && next - now <= HEARTBEAT_INTERVAL_MS + 60_000) return "fresh";
+
+  let response: Response;
   try {
-    const response = await fetch(`${ACTIVATION_API_BASE}/heartbeat`, {
+    response = await fetch(`${ACTIVATION_API_BASE}/heartbeat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -275,26 +315,71 @@ export async function heartbeat(): Promise<boolean> {
         machineId: getMachineId(),
         deltaVersion: license.deltaVersion,
       }),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 5_000),
     });
-    
-    if (response.ok) {
-      license.lastHeartbeat = new Date().toISOString();
-      saveLicense(license);
-      return true;
-    }
-    
-    // License revoked or expired server-side
-    console.error("[ContextEngine] ⚠ License validation failed — premium features disabled");
-    return false;
   } catch {
-    // Network error — allow offline grace period (7 days)
-    const daysSinceLastBeat = (now - lastBeat) / (1000 * 60 * 60 * 24);
-    if (daysSinceLastBeat > 7) {
-      console.error("[ContextEngine] ⚠ Offline too long — premium features disabled");
-      return false;
-    }
-    return true; // grace period
+    return markUnreachable(license);
   }
+
+  if (response.ok) {
+    license.lastHeartbeat = new Date().toISOString();
+    delete license.offlineSince;
+    delete license.refusedSince;
+    scheduleNext(license, HEARTBEAT_INTERVAL_MS);
+    saveLicense(license);
+    safeAppend("activation.heartbeat", { plan: license.plan, machine_id: license.machineId, outcome: "valid" });
+    return "valid";
+  }
+  if (response.status === 403) {
+    let body: { valid?: boolean; error?: string } | null = null;
+    try {
+      body = (await response.json()) as { valid?: boolean; error?: string };
+    } catch {
+      /* not the server's answer */
+    }
+    if (body && body.valid === false) {
+      const reason = String(body.error ?? "refused");
+      delete license.offlineSince; // the server answered
+      if (!license.refusedSince) license.refusedSince = { at: new Date().toISOString(), reason };
+      const refusedDays = (Date.now() - Date.parse(license.refusedSince.at)) / 86_400_000;
+      if (refusedDays > REFUSAL_GRACE_DAYS) {
+        license.revoked = { at: new Date().toISOString(), reason };
+        saveLicense(license);
+        safeAppend("activation.heartbeat", { plan: license.plan, machine_id: license.machineId, outcome: "revoked", reason });
+        console.error(`[ContextEngine] ⛔ The licence server has refused this licence since ${license.refusedSince.at} (${reason}) — premium features disabled.`);
+        return "revoked";
+      }
+      scheduleNext(license, RETRY_AFTER_FAILURE_MS);
+      saveLicense(license);
+      safeAppend("activation.heartbeat", { plan: license.plan, machine_id: license.machineId, outcome: "refused", reason });
+      console.error(`[ContextEngine] ⚠ The licence server refused this licence (${reason}). Premium features stop after ${REFUSAL_GRACE_DAYS} days of refusals unless it is renewed or re-activated.`);
+      return "refused";
+    }
+  }
+  return markUnreachable(license);
+}
+
+function markUnreachable(license: LicenseInfo): HeartbeatOutcome {
+  if (!license.offlineSince) license.offlineSince = new Date().toISOString();
+  scheduleNext(license, RETRY_AFTER_FAILURE_MS);
+  saveLicense(license);
+  return "unreachable";
+}
+
+/** Days the licence server has been unreachable since the first failed check; 0 when it was reached. */
+function offlineDays(license: LicenseInfo): number {
+  if (!license.offlineSince) return 0;
+  const since = Date.parse(license.offlineSince);
+  return Number.isFinite(since) ? (Date.now() - since) / 86_400_000 : 0;
+}
+
+/** Where the licence check stands, for activation_status. */
+export function licenceCheckState(): string {
+  const license = loadLicense();
+  if (!license) return "no licence";
+  if (license.refusedSince) return `refused by the licence server since ${license.refusedSince.at} (${license.refusedSince.reason}); Pro stops after ${REFUSAL_GRACE_DAYS} days of refusals`;
+  if (license.offlineSince) return `licence server unreachable since ${license.offlineSince}; Pro stops after ${OFFLINE_GRACE_DAYS} days`;
+  return `last confirmed ${license.lastHeartbeat}${license.nextCheck ? `, next check after ${license.nextCheck}` : ", checked at the next Pro tool call"}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,8 +466,21 @@ export function gateCheck(toolName: string): string | null {
       `save_session, load_session, list_sessions, end_session, save_learning, ` +
       `list_learnings, import_learnings`;
   }
-  
+
+  // [LOCK] [LICENSE-IS-CHECKED-DAILY]: past the grace, an unreachable licence server means no Pro.
+  const days = offlineDays(license);
+  if (days > OFFLINE_GRACE_DAYS) {
+    return `🔒 "${toolName}" needs a licence check, and the licence server has not been reachable for ${Math.floor(days)} days ` +
+      `(since ${license.offlineSince}). Connect to the internet and run it again.`;
+  }
+
   return null;
+}
+
+/** The gate, after the daily licence check when one is due. Use this, not gateCheck, before a Pro tool. */
+export async function gateCheckFresh(toolName: string): Promise<string | null> {
+  if (requiresActivation(toolName) && loadLicense()) await heartbeat();
+  return gateCheck(toolName);
 }
 
 // ---------------------------------------------------------------------------

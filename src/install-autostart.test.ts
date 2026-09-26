@@ -24,4 +24,25 @@ describe("buildPlist", () => {
     const p = A.buildPlist("/n", "/e", "/b", { CONTEXTENGINE_WORKSPACES: "/a&b/<c>" });
     expect(p).toContain("/a&amp;b/&lt;c>");
   });
+  // [LOCK] [AUTOSTART-ARGV-AND-XML-ESCAPED]: E2E_REVIEW_2026-09 A3-3, a home named "R&D home".
+  it("escapes every value, the home folder, node and entry paths included, and launchd can read it", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { spawnSync } = await import("node:child_process");
+    const saved = process.env.HOME;
+    process.env.HOME = "/Users/R&D home";
+    try {
+      const p = A.buildPlist("/opt/n&n/node", "/x/<dist>/index.js", "/opt/n&n", {});
+      expect(p).not.toMatch(/&(?!amp;|lt;)/);
+      expect(p).toContain("<string>/Users/R&amp;D home</string>");
+      if (process.platform === "darwin") {
+        const f = join(mkdtempSync(join(tmpdir(), "ce-plist-")), "t.plist");
+        writeFileSync(f, p);
+        expect(spawnSync("/usr/bin/plutil", ["-lint", f]).status).toBe(0);
+      }
+    } finally {
+      process.env.HOME = saved;
+    }
+  });
 });

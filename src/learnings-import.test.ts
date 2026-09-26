@@ -1,6 +1,7 @@
 // [LOCK] [AUTO-IMPORT-ONLY-MARKED-LEARNINGS]: what the importer takes from a doc, and what it
 // leaves alone. Throwaway HOME; the real ~/.contextengine is never touched.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { trustProjects } from "./trusted-projects.js";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -122,6 +123,7 @@ describe("strict import (the default, and the only mode of the auto-import)", ()
     reset();
     const p = join(home, "copilot-instructions.md");
     writeFileSync(p, ORDINARY_DOC);
+    trustProjects(["Proj"]); // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS]
     const r = L.autoImportFromSources([{ path: p, name: "Proj — copilot-instructions.md" }]);
     expect(r.imported).toBe(4);
     expect(r.ignored).toBe(7);

@@ -188,6 +188,9 @@ export type AuditEvent =
   | "vscode.prompt_submit"
   | "vscode.tool_call"
   | "vscode.session_start"
+  // The receiver refused a flood: how many records, since when (added 2026-09-25).
+  // [LOCK] [RECEIVER-ACCEPTS-ONLY-KNOWN-SENDERS] (src/http-server.ts)
+  | "ingest.rate_limited"
   // Detector outputs (Phase 3)
   | "drift.detected"
   | "notification.fired"

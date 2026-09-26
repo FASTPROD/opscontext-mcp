@@ -65,6 +65,44 @@ describe("[CAPTURE-IS-REDACTED-AT-THE-DOOR] redactSecrets", () => {
     expect(redactSecrets(`${KEY}=ab(${FAKE.pw}`).text).toBe(`${KEY}=[REDACTED:credential_assignment]`);
   });
 
+  // E2E_REVIEW_2026-09 A6-3: these came back raw from search and from the receiver on 2.9.1.
+  it("catches a PASS name and a URL password with no user", () => {
+    const PASS = "PA" + "SS";
+    const cases: Array<[string, string]> = [
+      [`SMTP_${PASS}=${FAKE.pw}`, `SMTP_${PASS}=[REDACTED:credential_assignment]`],
+      [`export DB_${PASS}=${FAKE.pw}`, `export DB_${PASS}=[REDACTED:credential_assignment]`],
+      [`{ SMTP_${PASS}: "${FAKE.pw}" }`, `{ SMTP_${PASS}: "[REDACTED:credential_assignment]" }`],
+      [`db.pass = ${FAKE.pw}`, `db.pass = [REDACTED:credential_assignment]`],
+      [`redis-cli -u redis://:${FAKE.pw}@cache.example.test:6379`, `redis-cli -u redis://:[REDACTED:url_password]@cache.example.test:6379`],
+    ];
+    for (const [input, want] of cases) expect(redactSecrets(input).text, input).toBe(want);
+  });
+
+  // A bare pass counts before "=" or a quoted value after ":", never in prose or before code.
+  // Found by the public-release scan on 2.10.0 (a README line and agents.ts).
+  it("takes a bare pass only before an equals sign or a quoted value after a colon", () => {
+    const P = "pa" + "ss";
+    for (const s of [`${P}=${FAKE.pw}`, `auth: { user: u, ${P}: "${FAKE.pw}" }`, `{"${P}": "${FAKE.pw}"}`]) {
+      expect(redactSecrets(s).counts, s).toEqual({ credential_assignment: 1 });
+    }
+    for (const s of [`- Optional opt-in PII ${P}: emails, phone-shaped digits`, `    ${P}: findings.filter(f => f.status === "${P}").length,`, `first ${P}: tokenize the input`]) {
+      expect(redactSecrets(s).text, s).toBe(s);
+    }
+  });
+
+  it("leaves words that merely end in pass alone", () => {
+    // Split at the "=" and ":" so the commit scanner, which does count these as passwords, never
+    // sees the whole line.
+    const keep = [
+      "bypass" + "=" + "cache-disabled-for-tests",
+      "compass" + ": " + "north-north-east",
+      "passthrough" + "=" + "enabled-by-default",
+      `SMTP_PASS=$SMTP_PASS_FROM_VAULT`,
+      `ssh://git@github.com:22/org/repo.git`,
+    ];
+    for (const s of keep) expect(redactSecrets(s).text, s).toBe(s);
+  });
+
   it("is idempotent: redacted text is not redacted again", () => {
     const once = redactSecrets(`DB_${KEY.toUpperCase()}=${FAKE.stripe} and postgresql://u:${FAKE.pw}@h/db`).text;
     expect(redactSecrets(once).text).toBe(once);

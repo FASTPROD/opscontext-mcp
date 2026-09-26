@@ -1,5 +1,5 @@
 import { execSync } from "child_process";
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { readFileSync, existsSync, readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from "fs";
 import { resolve, join, basename, dirname } from "path";
 import { homedir } from "os";
 import type { Chunk } from "./ingest.js";
@@ -38,15 +38,43 @@ function exec(cmd: string, cwd?: string): string {
   }
 }
 
+/** The last `count` lines of a file, read without a shell, from at most its last 256 KB. */
+export function readLastLines(path: string, count: number): string {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const len = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString("utf-8").split("\n");
+    if (len < size) lines.shift(); // the first line was cut by the window
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.slice(-count).join("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** Check if a command exists */
 function commandExists(cmd: string): boolean {
   return exec(`command -v ${cmd}`) !== "";
 }
 
-/** Redact sensitive values in .env content */
-function redactSensitive(content: string): string {
+// [LOCKED] [ENV-MASK-IS-LINE-BOUND] - 2026-09-25
+// [NEVER] let this pattern cross a newline, or look for the secret word anywhere but in the name
+//         (the part before the first "=").
+// WHY: the old pattern `^(.*(?:...KEY|TOKEN...)[^=]*=\s*).+$` let `[^=]*` and `\s*` run over line
+//      ends. A value that itself contained "key", "token", "auth" or "secret" (case-insensitive)
+//      matched there, the match ran on to the next line's "=", and that next line was masked
+//      while the real value stayed in clear. Two FLASK_SECRET_KEY values sat unmasked in the shared
+//      index this way; `SMTP_PASS` was never masked at all (E2E_REVIEW_2026-09 A6-3). An agent's
+//      screen hid the bug: the output guard redacted the value on display, not the tool.
+// FIX: the name is `[^=\r\n]*` on both sides of the secret word, spaces after "=" are `[ \t]*`, and
+//      PASS joins the word list (it also covers PASSWORD). Over-masking a config value in search
+//      costs nothing; under-masking hands a password to every agent.
+export function redactSensitive(content: string): string {
   const sensitivePatterns =
-    /^(.*(?:PASSWORD|SECRET|KEY|TOKEN|CREDENTIAL|AUTH|PRIVATE|API_KEY|DB_PASSWORD|MAIL_PASSWORD|JWT_SECRET|APP_KEY|ENCRYPT)[^=]*=\s*).+$/gim;
+    /^([^=\r\n]*(?:PASS|SECRET|KEY|TOKEN|CREDENTIAL|AUTH|PRIVATE|ENCRYPT)[^=\r\n]*=[ \t]*)\S[^\r\n]*$/gim;
   return content.replace(sensitivePatterns, "$1[REDACTED]");
 }
 
@@ -338,8 +366,9 @@ export function collectShellHistory(sourceName: string): Chunk[] {
   if (!existsSync(histFile)) return [];
 
   try {
-    // Read last 200 lines (most recent commands)
-    const raw = exec(`tail -200 ${histFile}`);
+    // Read last 200 lines (most recent commands). Read directly: the path comes from HOME, and a
+    // home folder with a space or a `$(` broke, or ran, the old `tail -200 ${histFile}` (E2E A1-1).
+    const raw = readLastLines(histFile, 200);
     if (!raw) return [];
 
     // Parse zsh extended history format: : timestamp:0;command
