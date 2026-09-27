@@ -167,7 +167,9 @@ describe("verifyChain", () => {
     writeFileSync(join(tempHome, "audit.log"), "this is not valid json at all\n");
     const r = verifyChain();
     expect(r.ok).toBe(false);
-    expect(r.breakReason).toMatch(/Corrupt audit line/);
+    // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]: named by file and line, the rest still checked.
+    expect(r.breakReason).toMatch(/not records, first at audit\.log line 1/);
+    expect(r.unreadable).toEqual([{ file: "audit.log", line: 1, beforeIndex: 0 }]);
   });
 });
 

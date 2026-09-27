@@ -51,6 +51,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  writeFileSync,
   appendFileSync,
   openSync,
   closeSync,
@@ -62,6 +63,8 @@ import {
   renameSync,
   linkSync,
   readdirSync,
+  ftruncateSync,
+  fstatSync,
   constants,
 } from "fs";
 import { basename, join } from "path";
@@ -201,7 +204,11 @@ export type AuditEvent =
   | "audit.rotate"
   | "audit.redact"
   // A lost segment put back from a backup (added 2026-09-24). [LOCK] [RESTORE-ONLY-CLOSES-A-PROVEN-GAP]
-  | "audit.restore";
+  | "audit.restore"
+  // A final record cut short (full disk, crash), set aside and noted (added 2026-09-27). [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED]
+  | "audit.torn_tail"
+  // Entries safeAppend() could not write, counted at the next good append (added 2026-09-27). [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]
+  | "audit.append_failed";
 
 export interface AuditRecord {
   ts: string;
@@ -282,6 +289,10 @@ function readLastHash(): string {
  *      was rendered as the specific, plausible claim "there is no history".
  * FIX: throw. appendAudit() must surface problems loudly (see [AUDIT-CHAIN]); call sites
  *      that need isolation already use safeAppend(), which logs to stderr and continues.
+ * 2026-09-27: a last record cut short (no final newline) is no longer left to block every append
+ *      for good: it is set aside and noted on the chain first. [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED]
+ *      This throw remains for a complete last line that is not a record, and for a log that holds
+ *      no complete record at all; neither ever chains onto genesis.
  */
 function parseHeadOrThrow(line: string): string {
   let rec: AuditRecord;
@@ -289,9 +300,9 @@ function parseHeadOrThrow(line: string): string {
     rec = JSON.parse(line) as AuditRecord;
   } catch {
     throw new Error(
-      "Audit log tail is not valid JSON — refusing to append onto an unknown head. " +
-        "Inspect the last line of ~/.contextengine/audit.log; a partial final record can be " +
-        "removed by hand, which verifyChain() will then confirm.",
+      "Audit log tail is not valid JSON, refusing to append onto an unknown head. " +
+        "The last line of ~/.contextengine/audit.log is complete but is not a record (a record cut " +
+        "short is set aside automatically); inspect it, and 'contextengine audit-verify' says where it is.",
     );
   }
   if (typeof rec.hash !== "string" || rec.hash.length !== 64) {
@@ -362,37 +373,219 @@ export function appendAudit(
   ensureDir();
   const release = acquireLockSync();
   try {
-    const path = auditPath();
-    // 🔒 LOCKED [AUDIT-HEAD-FROM-DISK] — 2026-08-17
-    // ⛔ NEVER derive the head hash from an in-process cache again.
-    // WHY: the previous code trusted `cachedLastHash` whenever `statSync().size` matched
-    //      a locally-tracked `cachedSize` that was ARITHMETIC (`cachedSize += byteLength`),
-    //      not observed. Any divergence between bytes-we-think-we-wrote and bytes-on-disk
-    //      — a partial write, a concurrent writer whose bytes happened to sum the same, an
-    //      externally rotated/truncated log — left us hashing onto a head that is not the
-    //      real tail, forking the chain. It was a correctness guarantee resting on a
-    //      perf cache, which the file's own [audit-001-write-race] LOCK explicitly warns
-    //      against ("the in-process chain cache is a perf optimization, NOT a correctness
-    //      guarantee").
-    // FIX: with [AUDIT-TAIL-READ-IS-O1] the true head costs ~0 ms, so there is nothing left
-    //      to optimise. Read it from disk under the lock, every time. The cache is gone.
-    const prevHash = readLastHash();
-    const ts = new Date().toISOString();
-    const hash = computeHash(prevHash, ts, event, actor, payload);
-    const record: AuditRecord = {
-      ts,
-      event,
-      actor,
-      payload,
-      prev_hash: prevHash,
-      hash,
-    };
-    const line = JSON.stringify(record) + "\n";
-    appendFileSync(path, line);
-    return record;
+    return appendHoldingLock(event, payload, actor);
   } finally {
     release();
   }
+}
+
+/** appendAudit() for a caller that already holds the append lock (the scrub of the live log). */
+function appendHoldingLock(event: AuditEvent, payload: Record<string, unknown>, actor: string): AuditRecord {
+  const path = auditPath();
+  settleTail(path);
+  // [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]
+  const refused = takeRefusals();
+  if (refused) {
+    try {
+      writeRecord(path, "audit.append_failed", refused.summary, "system");
+      refused.done();
+    } catch (e) {
+      refused.putBack();
+      throw e;
+    }
+  }
+  return writeRecord(path, event, payload, actor);
+}
+
+/** Under the append lock: a last record cut short is set aside and noted before anything else is
+ *  written, so the log ends with a newline afterwards. [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED] */
+function settleTail(path: string): void {
+  const torn = repairTornTail(path);
+  if (torn) {
+    writeRecord(path, "audit.torn_tail", {
+      kept: torn.kept,
+      bytes: torn.bytes,
+      sha256: torn.sha256,
+      note: "the last record was cut short (full disk or crash); its bytes were moved to the kept file and the log continues from the last complete record",
+    }, "system");
+  }
+}
+
+function writeRecord(path: string, event: AuditEvent, payload: Record<string, unknown>, actor: string): AuditRecord {
+  // 🔒 LOCKED [AUDIT-HEAD-FROM-DISK] — 2026-08-17
+  // ⛔ NEVER derive the head hash from an in-process cache again.
+  // WHY: the previous code trusted `cachedLastHash` whenever `statSync().size` matched
+  //      a locally-tracked `cachedSize` that was ARITHMETIC (`cachedSize += byteLength`),
+  //      not observed. Any divergence between bytes-we-think-we-wrote and bytes-on-disk
+  //      — a partial write, a concurrent writer whose bytes happened to sum the same, an
+  //      externally rotated/truncated log — left us hashing onto a head that is not the
+  //      real tail, forking the chain. It was a correctness guarantee resting on a
+  //      perf cache, which the file's own [audit-001-write-race] LOCK explicitly warns
+  //      against ("the in-process chain cache is a perf optimization, NOT a correctness
+  //      guarantee").
+  // FIX: with [AUDIT-TAIL-READ-IS-O1] the true head costs ~0 ms, so there is nothing left
+  //      to optimise. Read it from disk under the lock, every time. The cache is gone.
+  const prevHash = readLastHash();
+  const ts = new Date().toISOString();
+  const hash = computeHash(prevHash, ts, event, actor, payload);
+  const record: AuditRecord = {
+    ts,
+    event,
+    actor,
+    payload,
+    prev_hash: prevHash,
+    hash,
+  };
+  const line = JSON.stringify(record) + "\n";
+  appendFileSync(path, line);
+  return record;
+}
+
+/**
+ * [LOCKED] [TORN-TAIL-IS-KEPT-AND-CHAINED] - 2026-09-27
+ * [NEVER] leave a cut-short final record in place (every later append is refused for good), delete
+ *         its bytes, or chain the next record onto anything but the last complete record.
+ * WHY: a full disk cut one record in half. [UNREADABLE-HEAD-IS-NOT-GENESIS] then refused every
+ *      later append, correctly never chaining onto genesis, but for good: 194,875 refusals in the
+ *      replay, 5 of 5 still refused once space was back, each reported only on stderr, while the
+ *      receiver answered {"ok":true} and `emit-event` printed "Appended". audit-verify said "0
+ *      record(s) checked" about 3,564 intact ones (E2E_REVIEW_2026-09 B1-1, 3 of 3 runs). A torn
+ *      write has one signature: the file does not end with a newline. `kill -9` never produced one
+ *      (10 of 10 kills during 2 MB appends); a full disk did every time.
+ * FIX: under the append lock, when the file does not end with a newline: a fragment that is a
+ *      whole record only lost its newline, which is added back. Anything else is copied to
+ *      audit.torn-<time>.partial (fsynced, never deleted), the log is cut back to its last complete
+ *      record, and an `audit.torn_tail` record naming the kept file, its length and SHA-256 is
+ *      chained onto that record before the caller's. A file holding no complete record at all is
+ *      left alone and the append throws, as before. A last line that ends with a newline and is
+ *      not JSON is not a torn write: it still throws. [LOCK] [UNREADABLE-HEAD-IS-NOT-GENESIS]
+ */
+function repairTornTail(path: string): { kept: string; bytes: number; sha256: string } | null {
+  // One open and one fstat on the common path (runs before every append).
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDWR);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return null;
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    if (last[0] === 10) return null; // ends with a complete line: nothing was cut short
+
+    // Find the last newline, one window at a time from the end.
+    let nl = -1;
+    let pos = size;
+    const win = Buffer.alloc(TAIL_READ_BYTES);
+    while (pos > 0 && nl === -1) {
+      const start = Math.max(0, pos - win.length);
+      const n = readSync(fd, win, 0, pos - start, start);
+      const i = win.subarray(0, n).lastIndexOf(10);
+      if (i !== -1) nl = start + i;
+      pos = start;
+    }
+    const fragStart = nl + 1;
+    const frag = Buffer.alloc(size - fragStart);
+    readSync(fd, frag, 0, frag.length, fragStart);
+
+    let whole = false;
+    try {
+      const r = JSON.parse(frag.toString("utf-8")) as AuditRecord;
+      whole = typeof r?.hash === "string" && r.hash.length === 64;
+    } catch {
+      whole = false;
+    }
+    if (whole) {
+      writeSync(fd, "\n", size); // a complete record that only lost its newline
+      return null;
+    }
+    if (nl === -1) return null; // no complete record to continue from: the head read throws
+
+    const kept = `audit.torn-${new Date().toISOString().replace(/[:.]/g, "-")}.partial`;
+    try {
+      writeFileAndSync(join(auditDir(), kept), frag);
+    } catch (e) {
+      safeUnlink(join(auditDir(), kept)); // still a full disk: no half-written copy per attempt; the log is untouched
+      throw e;
+    }
+    ftruncateSync(fd, fragStart);
+    fsyncSync(fd);
+    return { kept, bytes: frag.length, sha256: createHash("sha256").update(frag).digest("hex") };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * [LOCKED] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED] - 2026-09-27
+ * [NEVER] let safeAppend() drop an entry with a stderr line as the only trace, or report success
+ *         for an append that failed.
+ * WHY: safeAppend() isolates hot paths from audit failures, and its only surface was stderr. A
+ *      writer that crashed inside the append lock cost every other writer ~4 entries over 10 s
+ *      (B1-2, 3 of 3 runs; 448 such lines in the real launchd log before 2.5.8), a torn tail cost
+ *      all of them (B1-1), and nothing on the chain or in fleet health said so. The receiver and
+ *      `emit-event` told their senders "written" regardless.
+ * FIX: safeAppend() returns whether it wrote. A refusal adds one line to audit-refused.jsonl (best
+ *      effort: on a full disk nothing can be written anywhere). The next append that succeeds takes
+ *      the file (rename, under the append lock) and chains one `audit.append_failed` record with
+ *      the count, the time span, the kinds and the errors, so the gap is on the chain; if that
+ *      record cannot be written the lines go back. Fleet health reads both. [LOCK] [HEALTH-SEES-THE-CHAIN]
+ */
+function refusedPath(): string {
+  return join(auditDir(), "audit-refused.jsonl");
+}
+
+function recordRefusal(event: string, error: string): void {
+  try {
+    appendFileSync(refusedPath(), JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, error: error.slice(0, 200) }) + "\n");
+  } catch {
+    /* a full disk: nothing can be written anywhere, stderr already has it */
+  }
+}
+
+/** Pending refusals, taken out of the way; `done` drops them once chained, `putBack` restores them. */
+function takeRefusals(): { summary: Record<string, unknown>; done: () => void; putBack: () => void } | null {
+  const path = refusedPath();
+  if (!existsSync(path)) return null;
+  const taking = `${path}.${process.pid}.taking`;
+  let body: string;
+  try {
+    renameSync(path, taking);
+    body = readFileSync(taking, "utf-8");
+  } catch {
+    return null; // another writer took it, or it vanished: nothing to chain from here
+  }
+  const events: Record<string, number> = {};
+  const errors: Record<string, number> = {};
+  const pids = new Set<number>();
+  let count = 0;
+  let first = "";
+  let last = "";
+  for (const line of body.split("\n")) {
+    if (!line) continue;
+    let r: { ts?: string; pid?: number; event?: string; error?: string };
+    try { r = JSON.parse(line); } catch { continue; }
+    count++;
+    if (r.ts && (!first || r.ts < first)) first = r.ts;
+    if (r.ts && r.ts > last) last = r.ts;
+    if (r.event) events[r.event] = (events[r.event] ?? 0) + 1;
+    if (r.error) errors[r.error] = (errors[r.error] ?? 0) + 1;
+    if (typeof r.pid === "number") pids.add(r.pid);
+  }
+  if (count === 0) {
+    safeUnlink(taking);
+    return null;
+  }
+  return {
+    summary: { count, first, last, events, errors, pids: [...pids] },
+    done: () => safeUnlink(taking),
+    putBack: () => {
+      try { appendFileSync(path, body); safeUnlink(taking); } catch { /* the taking file stays for the next run */ }
+    },
+  };
 }
 
 /**
@@ -503,17 +696,27 @@ function placeWithoutOverwrite(tmp: string, target: string): boolean {
   return true;
 }
 
-function parseLines(data: string, label: string): AuditRecord[] {
-  return data
-    .split("\n")
-    .filter(Boolean)
-    .map((line, i) => {
-      try {
-        return JSON.parse(line) as AuditRecord;
-      } catch {
-        throw new Error(`Corrupt audit line ${i + 1} in ${label}: not valid JSON`);
-      }
-    });
+/** A line of the history that is not a record: where it is, and the history index it sits before. */
+export interface UnreadableLine {
+  file: string;
+  line: number;
+  beforeIndex: number;
+}
+
+function parseLines(data: string, label: string, unreadable?: UnreadableLine[], baseIndex = 0): AuditRecord[] {
+  const out: AuditRecord[] = [];
+  const lines = data.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    try {
+      out.push(JSON.parse(line) as AuditRecord);
+    } catch {
+      if (!unreadable) throw new Error(`Corrupt audit line ${i + 1} in ${label}: not valid JSON`);
+      unreadable.push({ file: label, line: i + 1, beforeIndex: baseIndex + out.length });
+    }
+  }
+  return out;
 }
 
 export interface ReadOptions {
@@ -523,18 +726,35 @@ export interface ReadOptions {
 }
 
 export function readAuditLog(opts: ReadOptions = {}): AuditRecord[] {
-  const includeArchives = opts.includeArchives !== false;
+  return readHistory(opts.includeArchives !== false);
+}
+
+/**
+ * The history, segments then live log. With `unreadable`, a line that is not JSON is listed there
+ * and skipped instead of aborting the read.
+ *
+ * [LOCKED] [VERIFY-READS-PAST-AN-UNREADABLE-LINE] - 2026-09-27
+ * [NEVER] let one unreadable line stop the verifier from checking every other record.
+ * WHY: verifyChain() read through readAuditLog(), which throws on the first line that is not JSON,
+ *      so one cut-short record made audit-verify print "FAILED, 0 record(s) checked" and "treat the
+ *      affected records as unverified" about 3,564 intact ones (E2E_REVIEW_2026-09 B1-1): the
+ *      [VERIFY-FORK-IS-NOT-TAMPER] failure again, a verdict on everything from one bad line.
+ * FIX: the verifier reads tolerantly: an unreadable line is reported with its file and line number,
+ *      makes the report fail, and every other record is still checked. Every other reader keeps the
+ *      strict read, which throws.
+ */
+function readHistory(includeArchives: boolean, unreadable?: UnreadableLine[]): AuditRecord[] {
   const path = auditPath();
-  const live = existsSync(path) ? parseLines(readFileSync(path, "utf-8"), "audit.log") : [];
-  if (!includeArchives) return live;
+  const liveText = existsSync(path) ? readFileSync(path, "utf-8") : "";
+  if (!includeArchives) return parseLines(liveText, "audit.log", unreadable);
 
   const segments = listSegments();
-  if (segments.length === 0) return live;
+  if (segments.length === 0) return parseLines(liveText, "audit.log", unreadable);
 
   const history: AuditRecord[] = [];
   let lastSegmentHashes = new Set<string>();
   for (const f of segments) {
-    const recs = parseLines(readFileSync(join(archiveDir(), f), "utf-8"), f);
+    const recs = parseLines(readFileSync(join(archiveDir(), f), "utf-8"), f, unreadable, history.length);
     // 🔒 LOCKED [NO-SPREAD-OVER-A-SEGMENT] — 2026-08-20
     // ⛔ NEVER use push(...records) on a segment. Found on the first real rotation:
     //    a 494,152-record segment threw "Maximum call stack size exceeded" because the
@@ -544,12 +764,17 @@ export function readAuditLog(opts: ReadOptions = {}): AuditRecord[] {
     lastSegmentHashes = new Set(recs.map((r) => r.hash));
   }
 
+  const live = parseLines(liveText, "audit.log", unreadable, history.length);
   // Seam de-dup — see [ROTATE-ARCHIVE-BEFORE-TRUNCATE]. A crash after the segment was
   // renamed but before the live log was truncated leaves the archived prefix present in
   // both files. Drop only the LEADING run of live records already in the last segment;
   // anything else is real history and must never be dropped.
   let start = 0;
   while (start < live.length && lastSegmentHashes.has(live[start].hash)) start++;
+  if (unreadable && start > 0) {
+    const base = history.length;
+    for (const u of unreadable) if (u.file === "audit.log") u.beforeIndex = Math.max(base, u.beforeIndex - start);
+  }
   // [LOCK] [NO-SPREAD-OVER-A-SEGMENT] — same reason.
   for (let i = start; i < live.length; i++) history.push(live[i]);
   return history;
@@ -683,6 +908,7 @@ export function rotateAuditLog(opts: RotateOptions = {}): RotationResult {
     };
   }
   try {
+    finishInterruptedMoves(); // [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]
     return rotateHoldingLock(opts);
   } finally {
     lock.release();
@@ -741,8 +967,20 @@ function rotateHoldingLock(opts: RotateOptions): RotationResult {
 
   // Snapshot outside the lock: parsing 500k records is far too slow to hold the append
   // lock for, and acquireLockSync() force-breaks locks older than STALE_LOCK_MS.
-  const snapshotSize = statSync(path).size;
-  const live = parseLines(readFileSync(path, "utf-8"), "audit.log");
+  //
+  // [LOCKED] [ROTATION-SNAPSHOT-IS-THE-BYTES-READ] - 2026-09-27
+  // [NEVER] take the snapshot size from statSync() and the records from a separate read.
+  // WHY: Node 20's readFileSync(path, "utf-8") reads to the end of the file, past the size a
+  //      statSync() just before it returned, whenever a writer appends during the read (10 of 10
+  //      reads in a replay). The records appended in between were then parsed into the remainder
+  //      AND copied again as raw bytes from the old size: written twice. It happened for real:
+  //      20 learning.import records of 2026-09-25 19:45:46 sit twice in audit-0062.jsonl, and the
+  //      verifier called it a concurrent-append fork. Replayed 6 of 6 (E2E_REVIEW_2026-09 B2-1).
+  // FIX: one read, cut at its last newline; that byte length IS the snapshot, so the raw copy
+  //      below starts exactly where the parsed records end, whatever the read returned.
+  const snapshotBuf = readFileSync(path);
+  const snapshotSize = snapshotBuf.lastIndexOf(10) + 1;
+  const live = parseLines(snapshotBuf.subarray(0, snapshotSize).toString("utf-8"), "audit.log");
 
   // [LOCK] [ROTATION-HOLDS-THE-LOCK-BEFORE-IT-PLANS]: archiveCount is a count from the plan's
   // read. Appends at the tail since then are fine; a different head means someone else cut or
@@ -760,9 +998,20 @@ function rotateHoldingLock(opts: RotateOptions): RotationResult {
   const segName = plan.segmentFile!;
   const segTmp = join(adir, `.${segName}.tmp`);
   const segBody = archived.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  const rotateRecord = {
+    segment: segName,
+    archived_records: archived.length,
+    first_hash: archived[0].hash,
+    last_hash: archived[archived.length - 1].hash,
+    cutoff: plan.cutoff,
+  };
+  // [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]: from here to the audit.rotate record, a crash leaves
+  // this note, and the next rotation, restore or scrub finishes the job from it.
+  writeIntent(ROTATE_INTENT, rotateRecord);
   writeFileAndSync(segTmp, segBody);
   // [LOCK] [SEGMENT-IS-NEVER-OVERWRITTEN]
   if (!placeWithoutOverwrite(segTmp, join(adir, segName))) {
+    clearIntent(ROTATE_INTENT);
     return { ...empty, refusedReason: `segment ${segName} already exists; refusing to overwrite archived history` };
   }
 
@@ -780,6 +1029,7 @@ function rotateHoldingLock(opts: RotateOptions): RotationResult {
     // Our segment then only duplicates records that other rotation archived, so it goes.
     if (currentSize < snapshotSize || readFirstRecordHash(path) !== plan.firstLiveHash) {
       safeUnlink(join(adir, segName));
+      clearIntent(ROTATE_INTENT);
       return {
         ...empty,
         refusedReason: "the live log was cut by another writer during this rotation; our segment was removed and nothing else was written",
@@ -807,17 +1057,8 @@ function rotateHoldingLock(opts: RotateOptions): RotationResult {
 
   // Self-documenting evidence: the rotation itself is an audited event, chained onto the
   // new head like any other record.
-  appendAudit(
-    "audit.rotate",
-    {
-      segment: segName,
-      archived_records: archived.length,
-      first_hash: archived[0].hash,
-      last_hash: archived[archived.length - 1].hash,
-      cutoff: plan.cutoff,
-    },
-    "system",
-  );
+  appendAudit("audit.rotate", rotateRecord, "system");
+  clearIntent(ROTATE_INTENT);
 
   return {
     ...plan,
@@ -889,6 +1130,167 @@ function acquireRotateLock(): { release: () => void } | { heldMs: number } {
   return { heldMs: 0 };
 }
 
+/**
+ * [LOCKED] [AN-INTERRUPTED-MOVE-IS-FINISHED] - 2026-09-27
+ * [NEVER] let a rotation or a restore that stopped halfway be archived again, stay unrecorded on the
+ *         chain, or leave a temp file that outlives a scrub.
+ * WHY: replayed in real processes killed at each write (E2E_REVIEW_2026-09 B2-2, B2-3, B3-3):
+ *      - segment placed, live log not yet cut (9 of 9 kills, and a full disk 3 of 3): the seam de-dup
+ *        hid the overlap until the NEXT rotation archived the same 70,000 records again, and the
+ *        verifier then said "190,011 records verified" for 120,011. [ROTATE-ARCHIVE-BEFORE-TRUNCATE]
+ *        promised this state "loses nothing and is de-duplicated": true only until the next rotation;
+ *      - live log cut, or a restore placed, and the process gone before its record (9 of 9): history
+ *        moved or came back with no audit.rotate / audit.restore saying who, when and why, and a
+ *        retried restore is refused because its records are already there;
+ *      - segment linked, its temp name not yet removed (3 of 3): the hidden second name kept 700
+ *        planted keys through a scrub that reported success.
+ * FIX: before a rotation writes its segment, and before a restore places its block, a small note
+ *      (.rotate-intent.json, .restore-intent.json in audit-archive/) names the move. Every holder of
+ *      the rotate lock (rotation, auto-rotation even below its trigger, restore, scrub) first runs
+ *      finishInterruptedMoves(): temp files are removed (every writer of them holds this lock, and
+ *      each is a copy of records present elsewhere); for a noted rotation whose segment exists, the
+ *      leading live records already in that segment are dropped under the append lock and the
+ *      missing audit.rotate record is chained, marked completed_after_interruption; for a noted
+ *      restore whose segment exists, its audit.restore record, reason included, is chained the same
+ *      way. A record already in the live log is never written twice.
+ */
+const ROTATE_INTENT = ".rotate-intent.json";
+const RESTORE_INTENT = ".restore-intent.json";
+const LIVE_TEMPS = [".audit.log.tmp", ".audit.log.scrub.tmp"];
+
+function writeIntent(name: string, data: Record<string, unknown>): void {
+  mkdirSync(archiveDir(), { recursive: true });
+  writeFileAndSync(join(archiveDir(), name), JSON.stringify(data));
+}
+
+/** The note, or null. A note that exists but cannot be read (cut short by the same crash) is
+ *  removed and reported: it names nothing we can finish, and left in place it would keep every
+ *  hourly auto-rotation taking the lock for nothing. */
+function readIntent(name: string): Record<string, unknown> | null {
+  const path = join(archiveDir(), name);
+  if (!existsSync(path)) return null;
+  try {
+    const v = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+    if (v && typeof v.segment === "string") return v;
+  } catch { /* unreadable: dropped below */ }
+  console.error(`[ContextEngine] audit: ${name} could not be read and was removed; audit-verify reports anything it left unfinished`);
+  safeUnlink(path);
+  return null;
+}
+
+function clearIntent(name: string): void {
+  safeUnlink(join(archiveDir(), name));
+}
+
+function leftoverTemps(): string[] {
+  const out: string[] = [];
+  if (existsSync(archiveDir())) {
+    for (const f of readdirSync(archiveDir())) if (f.startsWith(".") && f.endsWith(".tmp")) out.push(join(archiveDir(), f));
+  }
+  for (const f of LIVE_TEMPS) if (existsSync(join(auditDir(), f))) out.push(join(auditDir(), f));
+  return out;
+}
+
+/** Cheap: is there anything for finishInterruptedMoves() to do? */
+export function interruptedMovePending(): boolean {
+  return existsSync(join(archiveDir(), ROTATE_INTENT)) || existsSync(join(archiveDir(), RESTORE_INTENT)) || leftoverTemps().length > 0;
+}
+
+export interface FinishReport {
+  tempsRemoved: string[];
+  rotation: { segment: string; duplicatesDropped: number; recorded: boolean } | null;
+  restore: { segment: string; recorded: boolean } | null;
+}
+
+function describeFinish(f: FinishReport): string {
+  const parts: string[] = [];
+  if (f.rotation) parts.push(`rotation to ${f.rotation.segment} finished (${f.rotation.duplicatesDropped} record(s) already archived dropped from the live log, record ${f.rotation.recorded ? "chained" : "already there"})`);
+  if (f.restore) parts.push(`restore of ${f.restore.segment} recorded ${f.restore.recorded ? "late" : "already"}`);
+  if (f.tempsRemoved.length > 0) parts.push(`${f.tempsRemoved.length} leftover temp file(s) removed`);
+  return parts.length > 0 ? parts.join("; ") : "nothing to finish";
+}
+
+/** Does the live log text hold a record of this kind naming this segment? */
+function liveNames(text: string, event: string, segment: string): boolean {
+  const hint = `"event":"${event}"`;
+  for (const line of text.split("\n")) {
+    if (!line.includes(hint) || !line.includes(segment)) continue;
+    try {
+      const r = JSON.parse(line) as AuditRecord;
+      if (r.event === event && (r.payload as { segment?: unknown }).segment === segment) return true;
+    } catch { /* not a record */ }
+  }
+  return false;
+}
+
+/** Run with the rotate lock held. [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED] */
+export function finishInterruptedMoves(): FinishReport {
+  const report: FinishReport = { tempsRemoved: [], rotation: null, restore: null };
+  for (const t of leftoverTemps()) {
+    safeUnlink(t);
+    if (!existsSync(t)) report.tempsRemoved.push(basename(t));
+  }
+
+  const ri = readIntent(ROTATE_INTENT);
+  if (ri && typeof ri.segment === "string") {
+    const seg = join(archiveDir(), ri.segment);
+    if (existsSync(seg)) {
+      const segHashes = new Set(parseLines(readFileSync(seg, "utf-8"), ri.segment).map((r) => r.hash));
+      const path = auditPath();
+      const release = acquireLockSync();
+      try {
+        settleTail(path);
+        const text = existsSync(path) ? readFileSync(path, "utf-8") : "";
+        const lines = text.split("\n");
+        let dropped = 0;
+        while (dropped < lines.length && lines[dropped]) {
+          let h: string | undefined;
+          try { h = (JSON.parse(lines[dropped]) as AuditRecord).hash; } catch { break; }
+          if (!segHashes.has(h)) break;
+          dropped++;
+        }
+        if (dropped > 0) {
+          const tmp = join(auditDir(), ".audit.log.tmp");
+          writeFileAndSync(tmp, lines.slice(dropped).join("\n"));
+          renameSync(tmp, path);
+        }
+        const recorded = !liveNames(text, "audit.rotate", ri.segment);
+        if (recorded) {
+          writeRecord(path, "audit.rotate", { ...ri, completed_after_interruption: true, duplicates_dropped: dropped }, "system");
+        }
+        report.rotation = { segment: ri.segment, duplicatesDropped: dropped, recorded };
+      } finally {
+        release();
+      }
+    }
+    clearIntent(ROTATE_INTENT);
+  }
+
+  const si = readIntent(RESTORE_INTENT);
+  if (si && typeof si.segment === "string") {
+    if (existsSync(join(archiveDir(), si.segment))) {
+      const path = auditPath();
+      const release = acquireLockSync();
+      try {
+        settleTail(path);
+        const text = existsSync(path) ? readFileSync(path, "utf-8") : "";
+        const recorded = !liveNames(text, "audit.restore", si.segment);
+        const { actor, ...payload } = si;
+        if (recorded) writeRecord(path, "audit.restore", { ...payload, completed_after_interruption: true }, typeof actor === "string" ? actor : "system");
+        report.restore = { segment: si.segment, recorded };
+      } finally {
+        release();
+      }
+    }
+    clearIntent(RESTORE_INTENT);
+  }
+
+  if (report.tempsRemoved.length > 0 || report.rotation || report.restore) {
+    console.error(`[ContextEngine] audit: finished an interrupted move: ${describeFinish(report)}`);
+  }
+  return report;
+}
+
 /** Count newline-terminated lines without parsing. The live log is small by construction. */
 export function countLiveRecords(): number {
   const path = auditPath();
@@ -900,7 +1302,7 @@ export function countLiveRecords(): number {
 }
 
 export interface AutoRotateOutcome {
-  action: "disabled" | "below_trigger" | "in_progress" | "rotated" | "refused" | "error";
+  action: "disabled" | "below_trigger" | "in_progress" | "rotated" | "refused" | "error" | "finished";
   liveRecords: number;
   detail: string;
   result?: RotationResult;
@@ -915,6 +1317,20 @@ export function autoRotateAuditLog(opts: { trigger?: number; maxRecords?: number
   }
   const liveRecords = countLiveRecords();
   if (liveRecords <= trigger) {
+    // A move interrupted after the live log was cut leaves the log below the trigger: finish it now,
+    // not when the log next grows past it. [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]
+    if (interruptedMovePending()) {
+      const lock = acquireRotateLock();
+      if ("heldMs" in lock) return { action: "in_progress", liveRecords, detail: "another rotation holds the lock" };
+      try {
+        const f = finishInterruptedMoves();
+        return { action: "finished", liveRecords, detail: describeFinish(f) };
+      } catch (e) {
+        return { action: "error", liveRecords, detail: (e as Error).message };
+      } finally {
+        lock.release();
+      }
+    }
     return { action: "below_trigger", liveRecords, detail: `${liveRecords} live record(s), trigger is ${trigger}` };
   }
 
@@ -939,10 +1355,13 @@ export function autoRotateAuditLog(opts: { trigger?: number; maxRecords?: number
   }
 }
 
-function writeFileAndSync(target: string, body: string): void {
+function writeFileAndSync(target: string, body: string | Buffer): void {
+  const buf = typeof body === "string" ? Buffer.from(body, "utf-8") : body;
   const fd = openSync(target, "w");
   try {
-    writeSync(fd, body);
+    // writeSync may write fewer bytes than asked (a disk filling up): loop until all are down.
+    let off = 0;
+    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -963,6 +1382,12 @@ export interface IntegrityReport {
   /** Records whose prev_hash names a KNOWN earlier head — a concurrent-append fork.
    *  Content is provably intact; only the linkage is non-linear. Not tampering. */
   forkIndices?: number[];
+  /** Records whose hash already appeared earlier in the history: a second copy of a record,
+   *  counted once and never relinked. Not tampering, not a fork. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER] */
+  duplicateIndices?: number[];
+  /** Lines that are not records: file, line number, and the history index they sit before.
+   *  Non-empty makes `ok` false; every other record is still checked. [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE] */
+  unreadable?: UnreadableLine[];
   /** Records whose content was altered AND whose alteration is acknowledged by a later, intact
    *  `audit.redact` record binding the original hash to the current content. Not counted as
    *  tampering. */
@@ -991,11 +1416,17 @@ export interface IntegrityReport {
  *      `ok` is true when there are no tampered and no orphan records. Forks are surfaced
  *      with counts and indices so the report stays honest in both directions — it must
  *      never claim a forked log is pristine either.
+ * 2026-09-27: a fourth class. A record whose hash was already seen is a DUPLICATE (a second copy
+ *      of the same record), counted once and skipped for linkage, so the record after a copied
+ *      block links to the original. Before, the first copy read as a "fork" and the total counted
+ *      every copy: 190,011 records "verified" for 120,011 real ones after an interrupted rotation
+ *      (E2E_REVIEW_2026-09 B2-1, B2-2). A copy's content is still checked against its own hash.
  */
 export function verifyChain(): IntegrityReport {
   let records: AuditRecord[];
+  const unreadable: UnreadableLine[] = [];
   try {
-    records = readAuditLog();
+    records = readHistory(true, unreadable); // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]
   } catch (e) {
     return {
       ok: false,
@@ -1007,6 +1438,7 @@ export function verifyChain(): IntegrityReport {
   const tampered: number[] = [];
   const orphans: number[] = [];
   const forks: number[] = [];
+  const duplicates: number[] = [];
 
   // Every hash observed so far, so a fork (parent = a known earlier head) can be told
   // apart from an orphan (parent never existed in this log).
@@ -1021,6 +1453,13 @@ export function verifyChain(): IntegrityReport {
     //    for every record after it.
     const expected = computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload);
     if (r.hash !== expected) tampered.push(i);
+
+    // 1b. A second copy of a record already in the history: counted once, never relinked, so
+    //     the record after a copied block still links to the original. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER]
+    if (seen.has(r.hash)) {
+      duplicates.push(i);
+      continue;
+    }
 
     // 2. Linkage — fork vs orphan.
     if (r.prev_hash !== prev) {
@@ -1059,13 +1498,15 @@ export function verifyChain(): IntegrityReport {
   tampered.length = 0;
   tampered.push(...stillTampered);
 
-  const ok = tampered.length === 0 && orphans.length === 0;
+  const ok = tampered.length === 0 && orphans.length === 0 && unreadable.length === 0;
   const firstProblem =
-    tampered.length > 0 ? tampered[0] : orphans.length > 0 ? orphans[0] : null;
+    tampered.length > 0 ? tampered[0] : unreadable.length > 0 ? unreadable[0].beforeIndex : orphans.length > 0 ? orphans[0] : null;
 
   let reason: string | null = null;
   if (tampered.length > 0) {
     reason = `${tampered.length} record(s) with altered content — first at index ${tampered[0]}`;
+  } else if (unreadable.length > 0) {
+    reason = `${unreadable.length} line(s) that are not records, first at ${unreadable[0].file} line ${unreadable[0].line}; every other record was checked, and the record after such a line cannot be linked`;
   } else if (orphans.length > 0) {
     reason = `${orphans.length} record(s) whose parent is absent from the log (deleted or truncated history) — first at index ${orphans[0]}`;
   }
@@ -1078,8 +1519,114 @@ export function verifyChain(): IntegrityReport {
     tamperedIndices: tampered,
     orphanIndices: orphans,
     forkIndices: forks,
+    duplicateIndices: duplicates,
+    unreadable,
     redactedIndices: redacted,
   };
+}
+
+/**
+ * The result of the last full check, kept for fleet health: the check costs seconds and gigabytes
+ * (measured 2026-09-27: 26 s and 3.5 GB for 4,927,803 records), so health reads its result and
+ * never runs it. [LOCK] [HEALTH-SEES-THE-CHAIN] (src/fleet-health.ts)
+ */
+export interface VerifyState {
+  checkedAt: string;
+  ms: number;
+  by: "cli" | "scheduled";
+  ok: boolean;
+  total: number;
+  unique: number;
+  altered: number;
+  orphans: number;
+  unreadable: number;
+  duplicates: number;
+  forks: number;
+  redacted: number;
+  reason: string | null;
+}
+
+export function verifyStatePath(): string {
+  return join(auditDir(), "audit-verify.json");
+}
+
+/** Keep the result of a full check. Best effort: a check that cannot record still printed its verdict. */
+export function recordVerifyState(report: IntegrityReport, ms: number, by: VerifyState["by"]): VerifyState {
+  const dups = (report.duplicateIndices ?? []).length;
+  const state: VerifyState = {
+    checkedAt: new Date().toISOString(),
+    ms,
+    by,
+    ok: report.ok,
+    total: report.total,
+    unique: report.total - dups,
+    altered: (report.tamperedIndices ?? []).length,
+    orphans: (report.orphanIndices ?? []).length,
+    unreadable: (report.unreadable ?? []).length,
+    duplicates: dups,
+    forks: (report.forkIndices ?? []).length,
+    redacted: (report.redactedIndices ?? []).length,
+    reason: report.breakReason,
+  };
+  try {
+    ensureDir();
+    const tmp = `${verifyStatePath()}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n");
+    renameSync(tmp, verifyStatePath());
+  } catch {
+    /* the verdict was printed; health will say the chain was not checked recently */
+  }
+  return state;
+}
+
+export function readVerifyState(): VerifyState | null {
+  try {
+    const s = JSON.parse(readFileSync(verifyStatePath(), "utf-8")) as VerifyState;
+    return typeof s.checkedAt === "string" && typeof s.ok === "boolean" ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Refusals written by safeAppend() and not chained yet: count, and the newest one. */
+export function pendingRefusals(): { count: number; last: string | null; error: string | null } {
+  let body = "";
+  try { body = readFileSync(refusedPath(), "utf-8"); } catch { return { count: 0, last: null, error: null }; }
+  let count = 0;
+  let last: string | null = null;
+  let error: string | null = null;
+  for (const line of body.split("\n")) {
+    if (!line) continue;
+    try {
+      const r = JSON.parse(line) as { ts?: string; error?: string };
+      count++;
+      if (r.ts && (!last || r.ts > last)) { last = r.ts; error = r.error ?? null; }
+    } catch { /* a line being written */ }
+  }
+  return { count, last, error };
+}
+
+/** One scheduled full check at a time across processes: O_EXCL, stale after two hours. */
+export function acquireVerifyLock(): (() => void) | null {
+  const lock = join(auditDir(), "audit-verify.lock");
+  ensureDir();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lock, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      try { writeSync(fd, `${process.pid}\n`); } catch { /* courtesy */ }
+      closeSync(fd);
+      return () => safeUnlink(lock);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") return null;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs < 2 * 3_600_000) return null;
+      } catch {
+        continue;
+      }
+      safeUnlink(lock);
+    }
+  }
+  return null;
 }
 
 /**
@@ -1254,10 +1801,26 @@ export function restoreSegment(
       return refuse(`the verifier does not report the record after ${prev.name} as an orphan; nothing to restore`, base);
     }
     const adir = archiveDir();
+    const restorePayload = {
+      segment: segName,
+      after: prev.name,
+      records: block.length,
+      first_hash: block[0].hash,
+      last_hash: block[block.length - 1].hash,
+      first_ts: block[0].ts,
+      last_ts: block[block.length - 1].ts,
+      source: basename(file),
+      reason: opts.reason!.trim(),
+    };
+    // [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]: a crash from here to the record leaves this note.
+    writeIntent(RESTORE_INTENT, { ...restorePayload, actor: opts.actor ?? "system" });
     const tmp = join(adir, `.${segName}.tmp`);
     writeFileAndSync(tmp, block.map((x) => JSON.stringify(x)).join("\n") + "\n");
     const target = join(adir, segName);
-    if (!placeWithoutOverwrite(tmp, target)) return refuse(`segment ${segName} already exists; refusing to overwrite it`, base);
+    if (!placeWithoutOverwrite(tmp, target)) {
+      clearIntent(RESTORE_INTENT);
+      return refuse(`segment ${segName} already exists; refusing to overwrite it`, base);
+    }
 
     const afterReport = verifyChain();
     // `>=` on the total: live appends keep landing during two full verifies (seconds on a real
@@ -1268,24 +1831,12 @@ export function restoreSegment(
       afterReport.total >= beforeReport.total + block.length;
     if (!improved) {
       safeUnlink(target);
+      clearIntent(RESTORE_INTENT);
       return refuse("the chain did not come out exactly one orphan better; the restored segment was removed again", base);
     }
 
-    const record = appendAudit(
-      "audit.restore",
-      {
-        segment: segName,
-        after: prev.name,
-        records: block.length,
-        first_hash: block[0].hash,
-        last_hash: block[block.length - 1].hash,
-        first_ts: block[0].ts,
-        last_ts: block[block.length - 1].ts,
-        source: basename(file),
-        reason: opts.reason!.trim(),
-      },
-      opts.actor ?? "system",
-    );
+    const record = appendAudit("audit.restore", restorePayload, opts.actor ?? "system");
+    clearIntent(RESTORE_INTENT);
     return { ...plan, restored: true, record };
   };
 
@@ -1294,6 +1845,7 @@ export function restoreSegment(
   const lock = acquireRotateLock();
   if ("heldMs" in lock) return refuse("a rotation is in progress; try again in a minute", base);
   try {
+    finishInterruptedMoves(); // [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]
     return planAndMaybeWrite();
   } finally {
     lock.release();
@@ -1383,6 +1935,8 @@ function scrubText(text: string, redact: Redactor): ScrubbedFile {
  *      the live log under the append lock (appends wait, none is lost), then one audit.redact
  *      record per 100 rewrites names each original hash and its new content hash
  *      ([REDACTION-IS-A-CHAINED-RECORD]). Running it again changes nothing.
+ * 2026-09-27 (Yan's GO): the order is now acknowledgement first, rewrite second, for every file.
+ *      [LOCK] [SCRUB-ACKNOWLEDGES-BEFORE-IT-REWRITES]
  */
 export function scrubAuditLog(opts: { apply?: boolean; reason?: string; redact: Redactor; actor?: string }): ScrubReport {
   const report: ScrubReport = { applied: false, refusedReason: null, files: [], redactedRecords: 0, counts: {}, acknowledgements: [] };
@@ -1393,15 +1947,23 @@ export function scrubAuditLog(opts: { apply?: boolean; reason?: string; redact: 
     report.redactedRecords += s.redacted.length;
     for (const [k, n] of Object.entries(s.counts)) report.counts[k] = (report.counts[k] ?? 0) + n;
   };
-  // Acknowledge each file right after it is rewritten, so a scrub that stops halfway leaves no
-  // rewritten record unacknowledged.
-  const acknowledge = (entries: ScrubbedFile["redacted"]) => {
+  // [LOCKED] [SCRUB-ACKNOWLEDGES-BEFORE-IT-REWRITES] - 2026-09-27
+  // [NEVER] rewrite a file before the acknowledgements for its rewrites are on the chain.
+  // WHY: the scrub renamed each rewritten segment into place, then acknowledged it. Killed between the
+  //      two (3 of 3 runs, E2E_REVIEW_2026-09 B3-1), 100 records read as "altered content: this is
+  //      tampering", and a rerun could not repair it: it found nothing left to change in them. The
+  //      product's own act was reported as an attack, recoverable only by listing 100 indices by hand.
+  // FIX: acknowledge first, rewrite second. A crash in between leaves an acknowledgement for a rewrite
+  //      that did not happen: it binds content that is not there, so it is simply unused, and a rerun
+  //      rewrites and acknowledges again. The live log is acknowledged and rewritten under one hold of
+  //      the append lock: its acknowledgements are appended, then the rewritten records plus exactly
+  //      the bytes appended since go in place. [LOCK] [SCRUB-IS-ACKNOWLEDGED-REDACTION]
+  const acknowledge = (entries: ScrubbedFile["redacted"], write: (payload: Record<string, unknown>) => AuditRecord) => {
     for (let i = 0; i < entries.length; i += SCRUB_ACK_BATCH) {
-      report.acknowledgements.push(
-        appendAudit("audit.redact", { reason: opts.reason!.trim(), redacted: entries.slice(i, i + SCRUB_ACK_BATCH) }, opts.actor ?? "system"),
-      );
+      report.acknowledgements.push(write({ reason: opts.reason!.trim(), redacted: entries.slice(i, i + SCRUB_ACK_BATCH) }));
     }
   };
+  const actor = opts.actor ?? "system";
 
   const run = (): ScrubReport => {
     const adir = archiveDir();
@@ -1412,8 +1974,8 @@ export function scrubAuditLog(opts: { apply?: boolean; reason?: string; redact: 
       if (opts.apply && s.redacted.length > 0) {
         const tmp = join(adir, `.${name}.scrub.tmp`);
         writeFileAndSync(tmp, s.body);
+        acknowledge(s.redacted, (payload) => appendAudit("audit.redact", payload, actor));
         renameSync(tmp, path);
-        acknowledge(s.redacted);
       }
     }
     const live = auditPath();
@@ -1421,21 +1983,22 @@ export function scrubAuditLog(opts: { apply?: boolean; reason?: string; redact: 
       if (!opts.apply) {
         tally("audit.log", scrubText(readFileSync(live, "utf-8"), opts.redact));
       } else {
-        let liveAcks: ScrubbedFile["redacted"] = [];
         const release = acquireLockSync();
         try {
-          const s = scrubText(readFileSync(live, "utf-8"), opts.redact);
+          settleTail(live); // the log ends with a newline from here on
+          const before = readFileSync(live);
+          const s = scrubText(before.toString("utf-8"), opts.redact);
           tally("audit.log", s);
           if (s.redacted.length > 0) {
+            acknowledge(s.redacted, (payload) => writeRecord(live, "audit.redact", payload, actor));
+            const grown = readFileSync(live).subarray(before.length); // our acknowledgements, nothing else: we hold the lock
             const tmp = join(auditDir(), ".audit.log.scrub.tmp");
-            writeFileAndSync(tmp, s.body);
+            writeFileAndSync(tmp, Buffer.concat([Buffer.from(s.body, "utf-8"), grown]));
             renameSync(tmp, live);
-            liveAcks = s.redacted;
           }
         } finally {
           release();
         }
-        acknowledge(liveAcks); // after the release: appendAudit takes the same lock
       }
     }
     return { ...report, applied: !!opts.apply };
@@ -1445,6 +2008,7 @@ export function scrubAuditLog(opts: { apply?: boolean; reason?: string; redact: 
   const lock = acquireRotateLock();
   if ("heldMs" in lock) return { ...report, refusedReason: "a rotation is in progress; try again in a minute" };
   try {
+    finishInterruptedMoves(); // [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]: no leftover temp keeps a secret
     return run();
   } finally {
     lock.release();
@@ -1481,17 +2045,21 @@ export function resetCacheForTest(): void {
 // Safe wrapper that never throws into hot paths. Use this from production
 // call sites so a failed audit append cannot break a learning save or
 // session write.
+// Returns whether the entry was written. A refusal is counted in audit-refused.jsonl and chained
+// as `audit.append_failed` by the next append that succeeds. [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]
 export function safeAppend(
   event: AuditEvent,
   payload: Record<string, unknown>,
   actor = "system",
-): void {
+): boolean {
   try {
     appendAudit(event, payload, actor);
+    return true;
   } catch (e) {
-    // Last-resort surface — stderr only, never throw upward.
-    process.stderr.write(
-      `[ContextEngine] audit append failed: ${e instanceof Error ? e.message : String(e)}\n`,
-    );
+    const message = e instanceof Error ? e.message : String(e);
+    // Never throw upward: stderr, plus the count the chain and fleet health will carry.
+    process.stderr.write(`[ContextEngine] audit append failed: ${message}\n`);
+    recordRefusal(event, message);
+    return false;
   }
 }

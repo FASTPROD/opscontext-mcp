@@ -47,7 +47,7 @@ import {
   formatSession,
   formatSessionList,
 } from "./sessions.js";
-import { verifyChain, readAuditLog, filterByRange, autoRotateAuditLog, safeAppend } from "./audit.js";
+import { verifyChain, readAuditLog, filterByRange, autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
 import { registerServer, listServers, formatServers, liveDaemonPid } from "./server-registry.js";
 import { secureCeHome } from "./ce-home.js";
 import { QUOTED_TEXT_NOTE } from "./framing.js";
@@ -74,7 +74,8 @@ import {
 import { readFileSync, existsSync, watch, statSync, writeFileSync, mkdirSync } from "fs";
 import { basename, join, dirname } from "path";
 import { homedir } from "os";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
+import { setPriority } from "os";
 import { scanCodeDir } from "./code-chunker.js";
 import { fileURLToPath } from "url";
 import { TOOL_COUNT, FREE_TOOL_COUNT, PREMIUM_TOOL_NAMES } from "./tools-manifest.js";
@@ -569,6 +570,36 @@ function evaluateRole(reason: string): void {
 
 let healthTick = 0;
 let lastStaleCount = -1;
+const SERVER_STARTED_AT = Date.now();
+let lastChainCheckSpawn = 0;
+
+/**
+ * The indexing server starts the daily full check of the audit chain, in its own process.
+ * [LOCK] [HEALTH-SEES-THE-CHAIN] (src/fleet-health.ts): the check costs 26 s and 3.5 GB on 4.9M
+ * records (measured 2026-09-27), so it never runs in this long-lived process, whose event loop
+ * serves the receiver and the tools. A separate low-priority `audit-verify --scheduled`, at most
+ * one attempt an hour, never in the first 10 minutes after a start, one at a time across processes
+ * (its own lock). CONTEXTENGINE_CHAIN_CHECK=0 turns it off.
+ */
+function maybeScheduleChainCheck(): void {
+  if (role !== "indexer" || process.env.CONTEXTENGINE_CHAIN_CHECK === "0") return;
+  const now = Date.now();
+  if (now - SERVER_STARTED_AT < 10 * 60_000 || now - lastChainCheckSpawn < 60 * 60_000) return;
+  const state = readVerifyState();
+  if (state && now - Date.parse(state.checkedAt) < 24 * 3_600_000) return;
+  lastChainCheckSpawn = now;
+  try {
+    const cli = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
+    const child = spawn(process.execPath, [cli, "audit-verify", "--scheduled"], { stdio: "ignore", detached: true, env: process.env });
+    if (child.pid) {
+      try { setPriority(child.pid, 10); } catch { /* the check still runs, at normal priority */ }
+    }
+    child.unref();
+    console.error(`[ContextEngine] 🔎 daily audit chain check started (pid ${child.pid ?? "?"})`);
+  } catch (err) {
+    console.error(`[ContextEngine] ⚠ could not start the daily audit chain check: ${(err as Error).message}`);
+  }
+}
 
 /**
  * The indexer writes ~/.contextengine/fleet-health.json once a minute: version drift, reindex
@@ -583,6 +614,7 @@ function publishHealth(): void {
       if (lastStaleCount > 0) console.error(`[ContextEngine] 🧭 ${lastStaleCount} server(s) on an old build: pid ${h.servers.stale.map((s) => s.pid).join(", ")}`);
     }
     if (role === "indexer") writeFleetHealth(h);
+    maybeScheduleChainCheck();
   } catch (err) {
     console.error(`[ContextEngine] ⚠ fleet health failed: ${(err as Error).message}`);
   }
@@ -1706,7 +1738,7 @@ async function main() {
   const runAutoRotate = () => {
     try {
       const o = autoRotateAuditLog();
-      if (o.action === "rotated" || o.action === "refused" || o.action === "error" || o.action === "in_progress") {
+      if (o.action === "rotated" || o.action === "refused" || o.action === "error" || o.action === "in_progress" || o.action === "finished") {
         console.error(`[ContextEngine] 📦 audit auto-rotate (${o.action}): ${o.detail}`);
       }
     } catch (err) {

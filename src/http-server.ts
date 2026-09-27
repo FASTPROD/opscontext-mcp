@@ -274,13 +274,21 @@ function handleEvents(req: http.IncomingMessage, res: http.ServerResponse) {
       return;
     }
     // All valid — write them to audit log via safeAppend.
+    // [LOCK] [RECEIVER-SAYS-WHAT-WAS-WRITTEN] (src/cli.ts emit-event): count what the log took, and
+    // answer 503 when it refused any. On 2026-09-27 a stuck log answered {"ok":true,"written":25}
+    // with 0 of 25 recorded (E2E_REVIEW_2026-09 B1-1).
     let written = 0;
+    let failed = 0;
     for (const ev of batch.events) {
       const actor = typeof ev.actor === "string" ? ev.actor : "browser-ext";
       // event/payload were validated above — cast is safe.
       // [LOCK] [CAPTURE-IS-REDACTED-AT-THE-DOOR]: redact before the append, never after.
-      safeAppend(ev.event as AuditEvent, prepareCapturedPayload(ev.payload!, ev.event), actor);
-      written++;
+      if (safeAppend(ev.event as AuditEvent, prepareCapturedPayload(ev.payload!, ev.event), actor)) written++;
+      else failed++;
+    }
+    if (failed > 0) {
+      sendJson(req, res, 503, { ok: false, error: "audit_append_failed", written, failed });
+      return;
     }
     sendJson(req, res, 200, { ok: true, written });
   });

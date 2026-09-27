@@ -4,8 +4,49 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
-## [Unreleased]
+## [2.11.0] 2026-09-27: the end-to-end review, phase B (the evidence stays true when things go wrong)
 
+Fixes from the end-to-end review, phase B (`docs/audits/E2E_REVIEW_2026-09.md`, section "Phase B").
+Every finding was replayed in real processes killed at the exact write, and on real full disks.
+
+### Audit log
+
+- **A log trim no longer keeps entries twice.** It took its size from one read of the file and its
+  records from another; entries that arrived in between were archived and kept again (29 copies in
+  the test on the old code; 20 real ones on 2026-09-25). The snapshot is now the bytes read.
+  LOCK `[ROTATION-SNAPSHOT-IS-THE-BYTES-READ]`. (B2-1)
+- **The verifier names a copy a copy.** A record whose hash already appeared is counted once and
+  reported as a duplicate, not as a concurrent-append fork. (B2-1, B2-2)
+- **A record cut short by a full disk no longer stops the log.** Every later append used to be
+  refused for good, only on stderr, while the receiver answered "written" and `emit-event` printed
+  "Appended". The fragment is now kept in `audit.torn-<time>.partial`, the log continues from its last
+  complete record, and an `audit.torn_tail` record says so. LOCK `[TORN-TAIL-IS-KEPT-AND-CHAINED]`. (B1-1)
+- **The verifier reads past a line that is not a record**, names its file and line, and checks every
+  other record (it used to say "0 record(s) checked"). LOCK `[VERIFY-READS-PAST-AN-UNREADABLE-LINE]`.
+- **A refused entry is counted and put on the chain.** `safeAppend()` returns whether it wrote; the
+  next good append chains an `audit.append_failed` record. The receiver answers 503 with the real
+  counts when the log refused entries; `emit-event` exits 1. LOCKs
+  `[A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]`, `[RECEIVER-SAYS-WHAT-WAS-WRITTEN]`. (B1-1, B1-2)
+- **An interrupted trim, restore or scrub is finished, never repeated.** A trim killed after writing its
+  archive file used to be archived again by the next one (70,000 copies), a trim or restore killed
+  before its record was never recorded, and a leftover temp file kept secrets through a scrub. Each
+  move now writes a small note first; the next holder of the lock finishes it and chains the missing
+  record (a restore keeps its reason). LOCK `[AN-INTERRUPTED-MOVE-IS-FINISHED]`. (B2-2, B2-3, B3-3)
+- **The scrub acknowledges before it rewrites.** Killed in between, 100 scrubbed records used to read
+  as tampering for good. `audit-verify` now lists every altered index in the command it suggests.
+  LOCK `[SCRUB-ACKNOWLEDGES-BEFORE-IT-REWRITES]`. (B3-1)
+
+### Fleet health
+
+- **Health sees the audit chain.** It was green on three broken logs. Every `audit-verify` records its
+  result in `~/.contextengine/audit-verify.json`; the indexing server runs a full check once a day in a
+  separate low-priority process (a full check costs about 26 s and 3.5 GB on 4.9 million records;
+  `CONTEXTENGINE_CHAIN_CHECK=0` turns it off). A failed check, a check older than 48 h, refused entries
+  and records cut short are warnings. LOCK `[HEALTH-SEES-THE-CHAIN]`. (B6-1)
+
+### Other
+
+- Appends cost about 0.03 ms more (one extra read of the log's last byte); measured at 8 processes x 3,000.
 - The bare `pass` name added in 2.10.0 now counts only before an equals sign or before a quoted value
   after a colon (nodemailer's auth block): it also
   took prose (a README's "PII pass" list) and code (a count of passing checks), which the public-release

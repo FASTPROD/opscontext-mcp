@@ -737,6 +737,8 @@ import {
   acknowledgeRedaction,
   restoreSegment,
   scrubAuditLog,
+  recordVerifyState,
+  acquireVerifyLock,
 } from "./audit.js";
 import { redactPayload, redactChunk } from "./secret-shapes.js";
 import {
@@ -1874,7 +1876,16 @@ safeAppend), visible via 'contextengine audit-verify' and consumed by the
     console.error(`❌ ${refused}`);
     process.exit(1);
   }
-  safeAppend(eventKind as AuditEvent, prepareCapturedPayload(payload, eventKind), actor);
+  // [LOCKED] [RECEIVER-SAYS-WHAT-WAS-WRITTEN] - 2026-09-27
+  // [NEVER] report "Appended" or exit 0 for an entry the audit log refused.
+  // WHY: on a stuck log (a record cut short by a full disk) this printed "Appended vscode.tool_call to
+  //      audit log." and exited 0 while nothing landed (E2E_REVIEW_2026-09 B1-1); the VS Code
+  //      extension emits through this command and believed it.
+  // FIX: safeAppend() returns whether it wrote; a refusal exits 1. [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]
+  if (!safeAppend(eventKind as AuditEvent, prepareCapturedPayload(payload, eventKind), actor)) {
+    console.error(`❌ Not recorded: the audit log refused ${eventKind} (reason above). The refusal is counted and will be noted on the chain.`);
+    process.exit(1);
+  }
   console.log(`✅ Appended ${eventKind} to audit log.`);
 }
 
@@ -2271,12 +2282,34 @@ function cliAuditRedactAck(args: string[]): void {
 }
 
 async function cliAuditVerify(): Promise<void> {
+  // [LOCK] [HEALTH-SEES-THE-CHAIN]: every full check leaves its result for fleet health. The
+  // daily one (--scheduled, started by the indexing server) runs one at a time and prints nothing.
+  const scheduled = process.argv.includes("--scheduled");
+  let releaseVerifyLock: (() => void) | null = null;
+  if (scheduled) {
+    releaseVerifyLock = acquireVerifyLock();
+    if (!releaseVerifyLock) return; // another check is running
+  }
+  const t0 = Date.now();
   const report = verifyChain();
+  recordVerifyState(report, Date.now() - t0, scheduled ? "scheduled" : "cli");
+  if (scheduled) {
+    releaseVerifyLock?.();
+    return;
+  }
   const forks = report.forkIndices ?? [];
 
   const redacted = report.redactedIndices ?? [];
+  const dups = report.duplicateIndices ?? [];
+  // [LOCK] [VERIFY-FORK-IS-NOT-TAMPER]: a second copy of a record is counted once and named as a copy.
+  const copiesNote = () => {
+    if (dups.length === 0) return;
+    console.log(`\n⚠️  ${dups.length} record(s) appear twice (a second copy of a record already in the log).`);
+    console.log(`   Counted once. Content intact, nothing missing. Usually a log trim that was interrupted or`);
+    console.log(`   ran while entries arrived. At: ${dups.slice(0, 8).join(", ")}${dups.length > 8 ? `, … (+${dups.length - 8} more)` : ""}`);
+  };
   if (report.ok) {
-    console.log(`✅ Audit chain verified — ${report.total} record(s).`);
+    console.log(`✅ Audit chain verified — ${report.total - dups.length} record(s).`);
     console.log(redacted.length === 0
       ? `   No record was altered, and no history is missing.`
       : `   No history is missing. ${redacted.length} record(s) redacted and acknowledged on the chain (indices ${redacted.slice(0, 8).join(", ")}${redacted.length > 8 ? ", …" : ""}), 0 altered.`);
@@ -2299,6 +2332,7 @@ async function cliAuditVerify(): Promise<void> {
       );
       console.log(`   the evidence it exists to provide.`);
     }
+    copiesNote();
     return;
   }
 
@@ -2309,11 +2343,21 @@ async function cliAuditVerify(): Promise<void> {
     console.error(`\n   Altered records (content does not match its own hash):`);
     console.error(`     ${t.slice(0, 10).join(", ")}${t.length > 10 ? `, … (+${t.length - 10} more)` : ""}`);
     console.error(`   This is tampering: the record's bytes were changed after it was written.`);
-    console.error(`   If this was a deliberate redaction of a secret, acknowledge it on the chain:`);
-    console.error(`     contextengine audit-redact-ack --index ${t.slice(0, 3).join(",")} --reason "<what was removed and why>"`);
+    console.error(`   If this was a deliberate redaction of a secret, acknowledge it on the chain`);
+    console.error(`   (every altered index is listed, so the command can be pasted as it is):`);
+    console.error(`     contextengine audit-redact-ack --index ${t.join(",")} --reason "<what was removed and why>"`);
   }
   if (redacted.length > 0) {
     console.error(`\n   Also ${redacted.length} redacted record(s), acknowledged on the chain, not counted above.`);
+  }
+  // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]: say where, and that the rest was checked.
+  const unreadable = report.unreadable ?? [];
+  if (unreadable.length > 0) {
+    console.error(`\n   Lines that are not records (every other record was checked):`);
+    for (const u of unreadable.slice(0, 10)) console.error(`     ${u.file} line ${u.line}`);
+    if (unreadable.length > 10) console.error(`     … (+${unreadable.length - 10} more)`);
+    console.error(`   A last record cut short by a full disk is set aside by the next append on its own;`);
+    console.error(`   a line like these is damage: keep a copy of the file before touching it.`);
   }
   if ((report.orphanIndices ?? []).length > 0) {
     const o = report.orphanIndices!;
@@ -2325,6 +2369,9 @@ async function cliAuditVerify(): Promise<void> {
   }
   if (forks.length > 0) {
     console.error(`\n   (Also ${forks.length} concurrent-append fork(s) — benign, see docs.)`);
+  }
+  if (dups.length > 0) {
+    console.error(`\n   (Also ${dups.length} second copies of records, counted once, benign.)`);
   }
   console.error(`\nFor compliance-graded evidence, treat the affected records as unverified.`);
   process.exit(2);

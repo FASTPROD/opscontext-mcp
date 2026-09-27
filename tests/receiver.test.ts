@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, mkdtempSync, appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -61,6 +61,21 @@ describe("who may read the receiver", () => {
   });
 });
 
+describe("[RECEIVER-SAYS-WHAT-WAS-WRITTEN] the answer matches what the log took", () => {
+  it("answers 503 with the real counts when the audit log refuses the entries", async () => {
+    await post([ev("vscode.session_start")]); // make sure the log exists
+    const before = readFileSync(AUDIT(), "utf8");
+    appendFileSync(AUDIT(), "garbage that someone typed\n"); // a stuck log: every append refused
+    try {
+      const r = await post([ev("vscode.tool_call", { tool: "Edit" }), ev("vscode.tool_call", { tool: "Bash" })]);
+      expect(r.status).toBe(503);
+      expect(JSON.parse(r.body)).toMatchObject({ ok: false, error: "audit_append_failed", written: 0, failed: 2 });
+    } finally {
+      writeFileSync(AUDIT(), before);
+    }
+  });
+});
+
 describe("what the receiver accepts", () => {
   it("takes exactly the capture kinds", async () => {
     for (const k of ["cli.anything_at_all", "vscode.", "browser.x", "audit.redact", "learning.save"]) {
@@ -95,8 +110,16 @@ describe("what the receiver accepts", () => {
   it("refuses a flood with 429 past the burst, and records how many it dropped", async () => {
     // 40 batches at once (2,000 records): twice the burst, so the refill during the run (200 a
     // second) cannot make room for all of them even on a loaded machine.
+    // The clock is frozen for the flood: no refill while it runs, so the result does not depend on
+    // how fast this machine appends (on 2026-09-27 a slower append path let every record fit once).
     const batch = Array.from({ length: 50 }, () => ev("vscode.tool_call", { tool: "Bash" }));
-    const statuses = (await Promise.all(Array.from({ length: 40 }, () => post(batch)))).map((r) => r.status);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let statuses: number[];
+    try {
+      statuses = (await Promise.all(Array.from({ length: 40 }, () => post(batch)))).map((r) => r.status);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
     expect(statuses.every((s) => s === 200 || s === 429)).toBe(true);
     await R.stopEventIngestServer(); // flushes the dropped count
@@ -174,6 +197,20 @@ describe("[EMIT-EVENT-GOES-THROUGH-THE-DOOR] contextengine emit-event", () => {
     expect(emit(["audit.redact", '{"reason":"forged","redacted":[]}']).code).toBe(1);
     expect(emit(["vscode.tool_call", '{"a":1}', "--actor", "system"]).code).toBe(1);
     expect(log()).not.toMatch(/audit\.redact/);
+  });
+
+  it("exits 1 and says so when the audit log refuses the entry ([RECEIVER-SAYS-WHAT-WAS-WRITTEN])", () => {
+    const dir = join(home, ".contextengine");
+    mkdirSync(dir, { recursive: true });
+    const before = log();
+    appendFileSync(join(dir, "audit.log"), "garbage that someone typed\n");
+    try {
+      const r = emit(["vscode.tool_call", '{"tool":"Edit"}']);
+      expect(r.code).toBe(1);
+      expect(r.out).toMatch(/Not recorded/);
+    } finally {
+      writeFileSync(join(dir, "audit.log"), before);
+    }
   });
 
   it("redacts the payload and drops prompt text like the receiver", () => {

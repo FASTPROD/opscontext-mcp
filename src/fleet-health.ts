@@ -13,6 +13,7 @@ import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, readdi
 import { join } from "path";
 import { homedir } from "os";
 import { listServers, type ServerReport } from "./server-registry.js";
+import { readVerifyState, pendingRefusals } from "./audit.js";
 import { claudeHookRegistrations } from "./install-claude-hook.js";
 
 export interface FleetHealth {
@@ -52,6 +53,22 @@ export interface FleetHealth {
     /** Newest last: time, kind, one-line detail. */
     lastBlocks: Array<{ ts: string; kind: string; detail: string }>;
   };
+  /** The last full check of the audit chain (`audit-verify`, run by hand or daily by the indexing
+   *  server), or null when it never ran here. [LOCK] [HEALTH-SEES-THE-CHAIN] */
+  chain: {
+    checkedAt: string;
+    ageHours: number;
+    ok: boolean;
+    unique: number;
+    altered: number;
+    orphans: number;
+    unreadable: number;
+    duplicates: number;
+    reason: string | null;
+  } | null;
+  /** Entries the audit log refused today (chained as audit.append_failed, or still pending), and
+   *  records cut short today (audit.torn_tail). */
+  auditLog: { refusedToday: number; lastRefusal: string | null; tornToday: number; lastTornKept: string | null };
   /** The newest release for which verify-release passed on this machine, or null. */
   lastVerifiedRelease: string | null;
   /** Measured problems only. Empty means green. */
@@ -64,6 +81,8 @@ export const REINDEX_PER_HOUR_WARN = 30;
 export const DOUBLED_HOOK_EVENTS_WARN_PCT = 5;
 export const DOUBLED_MIN_EVENTS = 10;
 export const DOUBLED_WINDOW_MS = 2000;
+/** A full check older than this is reported: the indexing server runs one a day. */
+export const CHAIN_CHECK_STALE_HOURS = 48;
 const TAIL_BYTES = 8 * 1024 * 1024;
 
 function ceHome(): string {
@@ -149,6 +168,8 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   let lastHourWrites = 0, blocks = 0, refusals = 0, learningsSaved = 0, hookEvents = 0, doubledHookEvents = 0;
   const lastBlocks: FleetHealth["today"]["lastBlocks"] = [];
   let prevHook: { t: number; event: string; payload: string } | null = null;
+  let refusedToday = 0, tornToday = 0;
+  let lastRefusal: string | null = null, lastTornKept: string | null = null;
   for (const r of records) {
     const t = Date.parse(r.ts);
     if (Number.isNaN(t)) continue;
@@ -164,6 +185,12 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
       perCorpus[c] = (perCorpus[c] ?? 0) + 1;
     }
     if (t < midnight) continue;
+    if (r.event === "audit.append_failed") {
+      refusedToday += Number(r.payload?.count ?? 0) || 0;
+      const errs = r.payload?.errors as Record<string, number> | undefined;
+      if (errs && Object.keys(errs).length > 0) lastRefusal = Object.keys(errs)[0];
+    }
+    if (r.event === "audit.torn_tail") { tornToday++; lastTornKept = String(r.payload?.kept ?? ""); }
     if (r.event === "hook.block") { blocks++; lastBlocks.push({ ts: r.ts, kind: "pre-commit", detail: blockDetail(r.payload) }); }
     else if (r.event === "learning.store_unreadable" || r.event === "learning.store_shrink_refused" || r.event === "learning.store_growth_refused") {
       refusals++;
@@ -191,6 +218,38 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   }
   if (lastHourWrites > REINDEX_PER_HOUR_WARN) warnings.push(`${lastHourWrites} shared-index writes in the last hour (ceiling ${REINDEX_PER_HOUR_WARN}): something saves in a loop`);
   if (refusals > 0) warnings.push(`${refusals} learnings-store refusal(s) today: a write looked like a wipe or a runaway import`);
+
+  // [LOCKED] [HEALTH-SEES-THE-CHAIN] - 2026-09-27
+  // [NEVER] report green while the audit chain failed its last check, or while the log refuses entries.
+  // WHY: fleet health read the audit log for counts only. On three broken logs (a stuck log whose
+  //      appends were all refused, missing history, 100 altered records) the verifier said FAILED
+  //      and health said 0 warnings (E2E_REVIEW_2026-09 B6-1). The chain is the product's claim.
+  // FIX: health never runs the check (26 s and 3.5 GB on 4.9M records, measured): it reads the
+  //      result every `audit-verify` leaves, which the indexing server refreshes daily in a separate
+  //      low-priority process. A failed check, a check older than CHAIN_CHECK_STALE_HOURS, refused
+  //      entries (chained as audit.append_failed or still pending) and records cut short today are
+  //      each a warning. [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED] [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED]
+  const vs = readVerifyState();
+  const chain = vs
+    ? {
+        checkedAt: vs.checkedAt,
+        ageHours: Math.max(0, Math.round((now.getTime() - Date.parse(vs.checkedAt)) / 3_600_000)),
+        ok: vs.ok,
+        unique: vs.unique,
+        altered: vs.altered,
+        orphans: vs.orphans,
+        unreadable: vs.unreadable,
+        duplicates: vs.duplicates,
+        reason: vs.reason,
+      }
+    : null;
+  if (chain && !chain.ok) warnings.push(`the audit chain did not verify at its last check (${chain.checkedAt.slice(0, 16).replace("T", " ")}Z): ${chain.reason ?? "see contextengine audit-verify"}`);
+  else if (chain && chain.ageHours > CHAIN_CHECK_STALE_HOURS) warnings.push(`the audit chain was last checked ${chain.ageHours} h ago: run contextengine audit-verify`);
+  const pending = pendingRefusals();
+  if (pending.count > 0 && pending.error) lastRefusal = pending.error; // the newest refusal wins
+  const refusedTotal = refusedToday + pending.count;
+  if (refusedTotal > 0) warnings.push(`the audit log refused ${refusedTotal} entr${refusedTotal === 1 ? "y" : "ies"} today${lastRefusal ? ` (${lastRefusal})` : ""}: they are not in the log, and the gap is noted on the chain`);
+  if (tornToday > 0) warnings.push(`${tornToday} audit record(s) were cut short today (a full disk?); the bytes are kept in ${lastTornKept}`);
   for (const w of report.warnings) if (/index on their own/.test(w)) warnings.push(w);
 
   return {
@@ -201,6 +260,8 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     reindex: { lastHourWrites, perCorpus, threshold: REINDEX_PER_HOUR_WARN },
     claudeHooks,
     today: { hookEvents, doubledHookEvents, blocks, refusals, learningsSaved, lastBlocks: lastBlocks.slice(-3) },
+    chain,
+    auditLog: { refusedToday: refusedTotal, lastRefusal, tornToday, lastTornKept },
     lastVerifiedRelease: lastVerifiedRelease(),
     warnings,
   };
@@ -222,6 +283,9 @@ export function formatFleetHealth(h: FleetHealth): string {
   lines.push(`  servers ${h.servers.total}: ${h.servers.indexers} indexing, ${h.servers.readers} reading, ${h.servers.stale.length} on an old build`);
   lines.push(`  shared-index writes last hour: ${h.reindex.lastHourWrites} (ceiling ${h.reindex.threshold})`);
   lines.push(`  today: ${h.today.blocks} block(s) prevented, ${h.today.refusals} store refusal(s), ${h.today.learningsSaved} learning(s) saved`);
+  lines.push(h.chain
+    ? `  audit chain: ${h.chain.ok ? "verified" : "FAILED"} ${h.chain.ageHours} h ago, ${h.chain.unique} record(s)${h.chain.duplicates ? `, ${h.chain.duplicates} copies counted once` : ""}; ${h.auditLog?.refusedToday ?? 0} entr(ies) refused today`
+    : `  audit chain: not checked on this machine yet (the indexing server runs a full check daily; or run contextengine audit-verify)`);
   lines.push(`  claude code: ${h.today.hookEvents} hook event(s) today, ${h.today.doubledHookEvents} doubled; registrations ${h.claudeHooks ? Object.entries(h.claudeHooks).map(([ev, n]) => `${ev}=${n}`).join(" ") : "no settings.json"}`);
   for (const b of h.today.lastBlocks) lines.push(`    ${b.ts.slice(11, 19)}Z ${b.kind}: ${b.detail}`);
   for (const w of h.warnings) lines.push(`  ⚠ ${w}`);

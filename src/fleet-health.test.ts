@@ -1,7 +1,7 @@
 // [LOCK] [HEALTH-IS-MEASURED-NEVER-ESTIMATED]: every number from the audit log, the registry or
 // a file; warnings only on measured problems. Throwaway HOME via src/test-setup.ts.
 import { describe, it, expect, beforeAll } from "vitest";
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 let H: typeof import("./fleet-health.js");
@@ -127,5 +127,54 @@ describe("computeFleetHealth", () => {
     const text = H.formatFleetHealth(h);
     expect(text).toMatch(/^health: green/);
     expect(text).toMatch(/servers 1: 1 indexing, 0 reading, 0 on an old build/);
+  });
+});
+
+describe("[HEALTH-SEES-THE-CHAIN] the chain's last check, refused entries, records cut short", () => {
+  const state = (over: Record<string, unknown>) =>
+    writeFileSync(join(home(), "audit-verify.json"), JSON.stringify({ checkedAt: "2026-09-06T07:00:00.000Z", ms: 1, by: "scheduled", ok: true, total: 10, unique: 10, altered: 0, orphans: 0, unreadable: 0, duplicates: 0, forks: 0, redacted: 0, reason: null, ...over }));
+  const clean = () => {
+    for (const f of ["audit-verify.json", "audit-refused.jsonl", "audit.log"]) rmSync(join(home(), f), { force: true });
+  };
+
+  it("is silent when the last check passed recently and nothing was refused", () => {
+    clean();
+    state({});
+    writeFileSync(join(home(), "audit.log"), "");
+    const h = H.computeFleetHealth({ now, report: report([]) });
+    expect(h.chain).toMatchObject({ ok: true, ageHours: 3, unique: 10 });
+    expect(h.warnings.filter((w) => /audit/.test(w))).toEqual([]);
+  });
+
+  it("warns when the last check failed, naming why", () => {
+    clean();
+    state({ ok: false, orphans: 1, reason: "1 record(s) whose parent is absent from the log" });
+    const h = H.computeFleetHealth({ now, report: report([]) });
+    expect(h.warnings.join("\n")).toMatch(/audit chain did not verify at its last check .*parent is absent/);
+  });
+
+  it("warns when the last check is older than two days", () => {
+    clean();
+    state({ checkedAt: "2026-09-03T10:00:00.000Z" });
+    const h = H.computeFleetHealth({ now, report: report([]) });
+    expect(h.warnings.join("\n")).toMatch(/last checked 72 h ago/);
+  });
+
+  it("counts refused entries, chained today and still pending, and records cut short today", () => {
+    clean();
+    writeFileSync(join(home(), "audit.log"), [
+      rec("2026-09-06T09:10:00.000Z", "audit.append_failed", { count: 3, errors: { "Failed to acquire audit lock": 3 } }),
+      rec("2026-09-06T09:20:00.000Z", "audit.torn_tail", { kept: "audit.torn-2026-09-06T09-19-59-000Z.partial", bytes: 120 }),
+    ].join("\n") + "\n");
+    writeFileSync(join(home(), "audit-refused.jsonl"), [
+      JSON.stringify({ ts: "2026-09-06T09:50:00.000Z", pid: 1, event: "vscode.tool_call", error: "tail is not valid JSON" }),
+      JSON.stringify({ ts: "2026-09-06T09:51:00.000Z", pid: 1, event: "vscode.tool_call", error: "tail is not valid JSON" }),
+    ].join("\n") + "\n");
+    const h = H.computeFleetHealth({ now, report: report([]) });
+    expect(h.auditLog).toMatchObject({ refusedToday: 5, tornToday: 1 });
+    const w = h.warnings.join("\n");
+    expect(w).toMatch(/refused 5 entries today \(tail is not valid JSON\)/);
+    expect(w).toMatch(/1 audit record\(s\) were cut short today .*audit\.torn-2026-09-06T09-19-59-000Z\.partial/);
+    clean();
   });
 });
