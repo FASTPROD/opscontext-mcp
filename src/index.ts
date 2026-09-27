@@ -570,6 +570,23 @@ function evaluateRole(reason: string): void {
 
 let healthTick = 0;
 let lastStaleCount = -1;
+let stopRegistry: (() => void) | null = null;
+let ending = false;
+
+/**
+ * End this server. Everything that matters is already on disk (audit appends and store writes are
+ * synchronous); the registry record is removed first. With the embedding model loaded, a normal exit
+ * aborts in the model runtime's native teardown ("libc++abi: ... mutex lock failed", SIGABRT, 3 of 3
+ * runs, releasing the model does not help) and leaves a macOS crash report per exit, so such a server
+ * ends with SIGKILL, which skips that teardown. [LOCK] [A-CHAT-SERVER-ENDS-WITH-ITS-CHAT]
+ */
+function endThisServer(): void {
+  if (ending) return;
+  ending = true;
+  try { stopRegistry?.(); } catch { /* the lister removes a dead record anyway */ }
+  if (isEmbeddingsReady()) process.kill(process.pid, "SIGKILL");
+  else process.exit(0);
+}
 const SERVER_STARTED_AT = Date.now();
 let lastChainCheckSpawn = 0;
 
@@ -1667,7 +1684,8 @@ async function main() {
     }
   }
   try {
-    const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined, daemon: process.env.OPSCONTEXT_DAEMON === "1" });
+    const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined, daemon: process.env.OPSCONTEXT_DAEMON === "1", onSignal: endThisServer });
+    stopRegistry = reg.stop;
     setRegistryRole = reg.setRole;
     setRegistryEventPort = reg.setEventPort;
     const fleet = listServers();
@@ -1729,6 +1747,27 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[ContextEngine] 🚀 MCP server running on stdio (keyword search ready)");
+
+  // [LOCKED] [A-CHAT-SERVER-ENDS-WITH-ITS-CHAT] - 2026-09-27
+  // [NEVER] let a server whose client closed its stdin keep running, unless it is the launchd agent.
+  // WHY: the file watchers and the event receiver keep the event loop alive, and nothing listened for
+  //      the end of stdin. When a chat's client died without stopping its server (3 of 3 runs,
+  //      E2E_REVIEW_2026-09 B5-2), the server lived on, adopted by launchd, still the indexer, still
+  //      holding the event port, running its build for good; new servers became its readers.
+  // FIX: stdin's end or close ends a chat server (its registry record goes with it, and a reader takes
+  //      over the index within one role poll, 15 s). The launchd agent (OPSCONTEXT_DAEMON=1) has
+  //      stdin on /dev/null by design and is exempt. [LOCK] [AUTOSTART-IS-THE-STANDING-INDEXER]
+  //      Ending goes through endThisServer(): with the embedding model loaded, a normal exit aborts in
+  //      native code and leaves a macOS crash report each time, so such a server ends with SIGKILL
+  //      after its record is removed; the stop signals (SIGTERM, SIGINT, SIGHUP) take the same path.
+  if (process.env.OPSCONTEXT_DAEMON !== "1") {
+    const leave = () => {
+      console.error("[ContextEngine] 👋 the client closed the connection: this server stops");
+      endThisServer();
+    };
+    process.stdin.once("end", leave);
+    process.stdin.once("close", leave);
+  }
 
   // 3a. Audit log auto-rotation. Deferred so the first requests are answered before the
   // synchronous verify + rewrite (a few seconds on a 500k-record chain) blocks the loop.

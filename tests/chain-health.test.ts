@@ -37,7 +37,7 @@ describe("audit-verify records its result", () => {
   it("scheduled: prints nothing, records, and steps aside while another check holds the lock", () => {
     const s = sandbox();
     s.run(["emit-event", "vscode.tool_call", '{"tool":"Edit"}']);
-    writeFileSync(join(s.ce, "audit-verify.lock"), "99999\n");
+    writeFileSync(join(s.ce, "audit-verify.lock"), `${process.pid}\n`); // a live holder
     expect(s.run(["audit-verify", "--scheduled"])).toEqual({ code: 0, out: "" });
     expect(existsSync(join(s.ce, "audit-verify.json"))).toBe(false);
     rmSync(join(s.ce, "audit-verify.lock"));

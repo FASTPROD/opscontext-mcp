@@ -212,3 +212,17 @@ describe("a note cut short by the same crash", () => {
     expect(autoRotateAuditLog({ trigger: 1_000_000 }).action).toBe("below_trigger");
   });
 });
+
+describe("audit-verify shows who acknowledged a redaction, when and why", () => {
+  it("lists each acknowledgement the verdict relied on", () => {
+    seed(200, 50);
+    expect(scrubAuditLog({ apply: true, reason: "planted test keys removed", redact: redactPayload, actor: "cli" }).redactedRecords).toBe(4);
+    const v = verifyChain();
+    expect(v.ok).toBe(true);
+    expect(v.acknowledgements).toHaveLength(1);
+    expect(v.acknowledgements![0]).toMatchObject({ actor: "cli", reason: "planted test keys removed", records: 4 });
+    const out = execFileSync(process.execPath, [CLI, "audit-verify"], { env: { HOME: home, PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, CONTEXTENGINE_HOME: home }, encoding: "utf8" });
+    expect(out).toMatch(/Acknowledged by .*cannot tell a removal from a rewrite/);
+    expect(out).toMatch(/cli {2}4 record\(s\) {2}"planted test keys removed"/);
+  });
+});

@@ -27,7 +27,7 @@ In CC7.2 terms:
 | Auditor question | What OpsContext provides |
 |---|---|
 | "Show evidence of anomaly detection." | The audit log records drift / hallucination / silent-failure heuristic firings as event kinds. Run `opscontext audit_search --kind drift.* --since 2026-04-01`. |
-| "How do you know the evidence wasn't edited?" | `opscontext audit_verify` re-computes every `hash` field and reports the first mismatch. The chain anchors to the earliest record; a forged entry near the end is detectable. |
+| "How do you know the evidence wasn't edited?" | `opscontext audit_verify` re-computes every `hash` field and reports each anomaly by kind: altered content, missing history (a record whose parent is gone), a line that is not a record, a second copy of a record, a concurrent-append fork. Records changed with an on-chain redaction acknowledgement are listed as redacted, with who acknowledged them, when and why. The chain anchors to the earliest record; a forged entry near the end is detectable. |
 | "What is your response process?" | This is on you — OpsContext records the detection; your runbook defines the action. Link your runbook here and reference the relevant log kinds. |
 
 ## What this is NOT
@@ -47,6 +47,7 @@ When your auditor asks for CC7.2 evidence on AI-tool activity:
 
 ## Open questions an auditor will ask (and the honest answer)
 
-- *"Who has write access to the log file?"* — Anyone with shell access to the machine. OpsContext does not enforce file ACLs; that is the deploying organization's responsibility (typically `chmod 600`, owned by the OpsContext service account).
+- *"Who has write access to the log file?"*: The account that runs OpsContext. Since 2.10.0 it creates `~/.contextengine` as 0700 and its files as 0600, so other accounts on the machine cannot read or write it; anyone who can act as that account can. Stronger separation (a dedicated service account) is the deploying organization's control.
 - *"What stops an attacker from re-computing the chain after modifying entries?"* — Nothing intrinsic. Hash-chaining detects tampering; it does not prevent it. To strengthen this, periodically anchor the latest `hash` to an external system (S3 Object Lock with a daily PUT, a transparency log, etc.). OpsContext does not ship this anchor — it is your control to add.
-- *"How do you handle log rotation?"* — OpsContext does not rotate by default. For long-lived examinations, keep the log as a single append-only file; if it grows beyond practical limits, segment by year and chain each segment's first record to the prior segment's last `hash`.
+- *"How do you handle log rotation?"*: Automatically, and without deleting anything. When the live log passes 100,000 records, the oldest part moves into a numbered segment under `~/.contextengine/audit-archive/` (never overwritten, never deleted), each move is itself a chained `audit.rotate` record, and `audit_verify` reads the segments and the live log as one chain. A move interrupted by a crash or a full disk is finished by the next one and recorded (2.11.0). A lost segment can be put back from a backup with `contextengine audit-restore`, which accepts only the original records into a gap the verifier reports.
+- *"What does a redaction acknowledgement prove?"*: That whoever ran `audit-redact-ack` or `audit-scrub` on this machine stated, on the chain, at that time, that a record's content was changed, and why. The chain can prove that the change was made and acknowledged; it cannot prove the change only removed a secret, because the original content is gone. `audit_verify` lists every acknowledgement it relied on (time, actor, reason). Against someone who can act as the account that runs OpsContext, only an external anchor (above) helps.

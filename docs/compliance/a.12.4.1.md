@@ -37,9 +37,9 @@ In A.12.4.1 terms:
 | Auditor requirement | What OpsContext provides |
 |---|---|
 | **Production** | Events are written synchronously to JSONL at every state change. Verify with `tail -f ~/.contextengine/audit.log` while running any of the above. |
-| **Retention** | OpsContext writes a single append-only file; the deploying organization controls retention. Default is forever (no rotation). Configure your backup policy accordingly. |
+| **Retention** | Nothing is deleted. The live log is append-only; past 100,000 records its oldest part moves into numbered archive segments that are never overwritten and are kept until the deploying organization archives them. Configure your backup policy accordingly. |
 | **Review** | `opscontext audit_search` for ad-hoc queries; `opscontext audit_verify` for chain integrity; the VS Code extension surfaces drift events in real time. The *cadence* of review is your control to document. |
-| **Integrity** | `prev_hash` + `hash` chain ties each record to its predecessor. `opscontext audit_verify` re-walks the chain end-to-end and reports the first divergence. |
+| **Integrity** | `prev_hash` + `hash` chain ties each record to its predecessor. `opscontext audit_verify` re-walks the whole chain (archive segments included) and reports each anomaly by kind; redactions acknowledged on the chain are listed with who acknowledged them, when and why. Since 2.11.0 the indexing server runs this check daily and fleet health warns when it fails. |
 
 ## What this is NOT
 
@@ -60,5 +60,5 @@ When your auditor asks for A.12.4.1 evidence on AI-tool activity:
 
 - *"What is your retention period?"* — OpsContext does not enforce one. Your ISMS document specifies; back it up to immutable storage if your retention exceeds typical local-disk reliability.
 - *"How frequent is regular review?"* — A.12.4.1 does not prescribe; your ISMS does. The OpsContext VS Code extension provides a continuous-review surface (status bar + popup) for engineers; periodic batch review (e.g. monthly drift-event summary) is your control to document.
-- *"What if the chain breaks because a backup restore replaced the file?"* — Document your restore procedure: capture the post-restore `hash` and treat it as a new chain anchor. The auditor expects a documented break, not a hidden one.
+- *"What if the chain breaks because a backup restore replaced the file?"*: Records lost from the archive can be put back with `contextengine audit-restore <file>`: it accepts only the original records, and only into a gap the verifier reports, and records itself as `audit.restore` with a reason. If a whole file had to be replaced some other way, document it: capture the post-restore `hash` and treat it as a new chain anchor. The auditor expects a documented break, not a hidden one.
 - *"What about log access controls?"* — OpsContext relies on filesystem permissions. Your control is to restrict read+write on `~/.contextengine/` to the OpsContext service account and the SOC team. Document that ACL.

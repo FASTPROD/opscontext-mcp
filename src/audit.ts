@@ -127,13 +127,10 @@ function acquireLockSync(): () => void {
       // Lockfile exists. Check if it's stale.
       try {
         const st = statSync(path);
-        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
-          // Orphaned — force-unlink and retry.
-          try {
-            unlinkSync(path);
-          } catch {
-            /* another process just cleaned it; retry */
-          }
+        // [LOCK] [A-DEAD-HOLDER-LOSES-THE-LOCK-AT-ONCE]
+        if (lockHolderIsGone(path, st) || Date.now() - st.mtimeMs > STALE_LOCK_MS) {
+          // Orphaned — force-unlink and retry, only if it is still the file we judged.
+          unlinkIfUnchanged(path, st);
           continue;
         }
       } catch {
@@ -145,6 +142,43 @@ function acquireLockSync(): () => void {
   throw new Error(
     `Failed to acquire audit lock at ${path} within ${LOCK_TIMEOUT_MS}ms`,
   );
+}
+
+/**
+ * [LOCKED] [A-DEAD-HOLDER-LOSES-THE-LOCK-AT-ONCE] - 2026-09-27
+ * [NEVER] make writers wait out STALE_LOCK_MS for a holder that is provably gone.
+ * WHY: a writer killed while holding the append lock left it for 10 s; every other writer waited 2 s
+ *      per entry and lost it (4 per writer per crash, 3 of 3 runs, E2E_REVIEW_2026-09 B1-2; 448 such
+ *      losses in the launchd log before 2.5.8). It happened again on 2026-09-27 at 17:01Z: a chat
+ *      server died holding the lock and a new server lost two entries. The lock file names its
+ *      holder's pid; nothing read it.
+ * FIX: a lock whose pid no longer exists, or an empty lock older than a second (its holder died
+ *      between creating it and writing its pid; a live holder writes it at once), is broken now. A
+ *      live pid, even a reused one, keeps today's 10 s rule. The file is removed only if it is still
+ *      the one judged (same inode and time), which narrows the gap where two waiters both break it.
+ *      [LOCK] [AUDIT-001-WRITE-RACE-FIX]: the lock stays; only the stale test is sharper.
+ */
+function lockHolderIsGone(path: string, st: { mtimeMs: number }): boolean {
+  let body = "";
+  try { body = readFileSync(path, "utf-8"); } catch { return false; }
+  const pid = parseInt(body.split("\n")[0], 10);
+  if (!Number.isInteger(pid) || pid <= 0) return Date.now() - st.mtimeMs > 1000;
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false; // alive (or not ours to signal): wait as before
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+function unlinkIfUnchanged(path: string, judged: { ino: number; mtimeMs: number }): void {
+  try {
+    const now = statSync(path);
+    if (now.ino === judged.ino && now.mtimeMs === judged.mtimeMs) unlinkSync(path);
+  } catch {
+    /* already gone: another waiter broke it */
+  }
 }
 
 function auditDir(): string {
@@ -1108,14 +1142,16 @@ function acquireRotateLock(): { release: () => void } | { heldMs: number } {
       fd = openSync(lock, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      let age: number;
+      let st: ReturnType<typeof statSync>;
       try {
-        age = Date.now() - statSync(lock).mtimeMs;
+        st = statSync(lock);
       } catch {
         continue; // released between our open and our stat: try again
       }
-      if (age < ROTATE_LOCK_STALE_MS) return { heldMs: age };
-      safeUnlink(lock);
+      const age = Date.now() - st.mtimeMs;
+      // [LOCK] [A-DEAD-HOLDER-LOSES-THE-LOCK-AT-ONCE]: a crashed rotation no longer blocks the next for 10 minutes.
+      if (age < ROTATE_LOCK_STALE_MS && !lockHolderIsGone(lock, st)) return { heldMs: age };
+      unlinkIfUnchanged(lock, st);
       continue;
     }
     try {
@@ -1385,6 +1421,10 @@ export interface IntegrityReport {
   /** Records whose hash already appeared earlier in the history: a second copy of a record,
    *  counted once and never relinked. Not tampering, not a fork. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER] */
   duplicateIndices?: number[];
+  /** The acknowledgements that turned altered records into redacted ones: who said so, when, why.
+   *  An acknowledgement is a statement by whoever ran it, so the verifier shows every one it used.
+   *  [LOCK] [REDACTION-IS-A-CHAINED-RECORD] */
+  acknowledgements?: Array<{ index: number; ts: string; actor: string; reason: string; records: number }>;
   /** Lines that are not records: file, line number, and the history index they sit before.
    *  Non-empty makes `ok` false; every other record is still checked. [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE] */
   unreadable?: UnreadableLine[];
@@ -1477,24 +1517,34 @@ export function verifyChain(): IntegrityReport {
   //    "altered". Binding to the current content means a second edit after the acknowledgement
   //    makes it tampered again.
   const tamperedSet = new Set(tampered);
-  const acks = new Map<string, string>();
+  const acks = new Map<string, { contentHash: string; ackIndex: number }>();
   for (let i = 0; i < records.length; i++) {
     const r = records[i];
     if (r.event !== "audit.redact" || tamperedSet.has(i)) continue;
     const list = (r.payload as { redacted?: Array<{ hash?: unknown; content_hash?: unknown }> }).redacted;
     if (!Array.isArray(list)) continue;
     for (const e of list) {
-      if (typeof e.hash === "string" && typeof e.content_hash === "string") acks.set(e.hash, e.content_hash);
+      if (typeof e.hash === "string" && typeof e.content_hash === "string") acks.set(e.hash, { contentHash: e.content_hash, ackIndex: i });
     }
   }
   const redacted: number[] = [];
   const stillTampered: number[] = [];
+  const usedAcks = new Map<number, number>(); // ack record index -> records it covers here
   for (const i of tampered) {
     const r = records[i];
     const bound = acks.get(r.hash);
-    if (bound && bound === computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload)) redacted.push(i);
-    else stillTampered.push(i);
+    if (bound && bound.contentHash === computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload)) {
+      redacted.push(i);
+      usedAcks.set(bound.ackIndex, (usedAcks.get(bound.ackIndex) ?? 0) + 1);
+    } else stillTampered.push(i);
   }
+  const acknowledgements = [...usedAcks.entries()].sort((a, b) => a[0] - b[0]).map(([index, n]) => ({
+    index,
+    ts: records[index].ts,
+    actor: records[index].actor,
+    reason: String((records[index].payload as { reason?: unknown }).reason ?? ""),
+    records: n,
+  }));
   tampered.length = 0;
   tampered.push(...stillTampered);
 
@@ -1520,6 +1570,7 @@ export function verifyChain(): IntegrityReport {
     orphanIndices: orphans,
     forkIndices: forks,
     duplicateIndices: duplicates,
+    acknowledgements,
     unreadable,
     redactedIndices: redacted,
   };
@@ -1618,12 +1669,15 @@ export function acquireVerifyLock(): (() => void) | null {
       return () => safeUnlink(lock);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") return null;
+      let st: ReturnType<typeof statSync>;
       try {
-        if (Date.now() - statSync(lock).mtimeMs < 2 * 3_600_000) return null;
+        st = statSync(lock);
       } catch {
         continue;
       }
-      safeUnlink(lock);
+      // [LOCK] [A-DEAD-HOLDER-LOSES-THE-LOCK-AT-ONCE]
+      if (Date.now() - st.mtimeMs < 2 * 3_600_000 && !lockHolderIsGone(lock, st)) return null;
+      unlinkIfUnchanged(lock, st);
     }
   }
   return null;

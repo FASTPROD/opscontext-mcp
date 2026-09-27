@@ -105,9 +105,59 @@ export function isAlive(pid: number): boolean {
 }
 
 /**
+ * [LOCKED] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS] - 2026-09-27
+ * [NEVER] treat a registry record as a live server because its pid exists.
+ * WHY: pids are reused. A dead launchd agent's record pointed at a live unrelated process (3 of 3
+ *      valid runs, E2E_REVIEW_2026-09 B5-1): for as long as that process lived, no reader took over
+ *      indexing (a doc change never reached the index), nobody answered on the event port, a new chat
+ *      server did not take it, and `contextengine servers` listed the unrelated process as the
+ *      current launchd agent holding the port. Records survive a crash or a power cut, and pids wrap.
+ * FIX: a record is alive when its pid exists AND that process started no later than the record says
+ *      the server did (the server registers after its process starts; a reused pid belongs to a
+ *      process that started later). Start times come from one `ps -o pid=,lstart=` for all uncached
+ *      pids of a listing, cached 60 s per pid. When ps cannot answer, the pid test alone decides, as
+ *      before. A record that fails is dead: removed by the lister, never elected, never the daemon.
+ */
+const START_CACHE_MS = 60_000;
+const startCache = new Map<number, { startedMs: number | null; at: number }>();
+
+function refreshStartTimes(pids: number[]): void {
+  const now = Date.now();
+  const need = pids.filter((p) => { const c = startCache.get(p); return !c || now - c.at > START_CACHE_MS; });
+  if (need.length === 0) return;
+  let out = "";
+  try {
+    // Hardcoded argv, no shell: the only variables are numbers.
+    out = execFileSync("ps", ["-o", "pid=,lstart=", "-p", need.join(",")], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+  } catch (e) {
+    const stdout = (e as { stdout?: unknown }).stdout;
+    out = typeof stdout === "string" ? stdout : ""; // ps exits 1 when some pid is gone; keep what it printed
+  }
+  const seen = new Set<number>();
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const t = Date.parse(m[2]);
+    seen.add(Number(m[1]));
+    startCache.set(Number(m[1]), { startedMs: Number.isNaN(t) ? null : t, at: now });
+  }
+  for (const p of need) if (!seen.has(p)) startCache.set(p, { startedMs: null, at: now });
+}
+
+/** The record's own process is still running. [LOCK] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS] */
+export function recordIsLive(rec: Pick<ServerRecord, "pid" | "started">): boolean {
+  if (!isAlive(rec.pid)) return false;
+  refreshStartTimes([rec.pid]);
+  const startedMs = startCache.get(rec.pid)?.startedMs ?? null;
+  const registered = Date.parse(rec.started);
+  if (startedMs === null || Number.isNaN(registered)) return true; // cannot tell: the pid test decides
+  return startedMs <= registered + 5_000; // lstart has one-second resolution
+}
+
+/**
  * Register the running server. Returns a stop() that removes the record; exit handlers call it too.
  */
-export function registerServer(opts: { version: string; script: string; corpus?: string; role?: "indexer" | "reader"; daemon?: boolean }): {
+export function registerServer(opts: { version: string; script: string; corpus?: string; role?: "indexer" | "reader"; daemon?: boolean; onSignal?: () => void }): {
   record: ServerRecord;
   stop: () => void;
   setRole: (role: "indexer" | "reader") => void;
@@ -145,7 +195,8 @@ export function registerServer(opts: { version: string; script: string; corpus?:
   };
   process.on("exit", stop);
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
-    process.on(sig, () => { stop(); process.exit(0); });
+    // The record goes first; the caller may end the process its own way. [LOCK] [A-CHAT-SERVER-ENDS-WITH-ITS-CHAT]
+    process.on(sig, () => { stop(); if (opts.onSignal) opts.onSignal(); else process.exit(0); });
   }
   const setRole = (role: "indexer" | "reader") => { record.role = role; write(); };
   const setEventPort = (port: number | null) => {
@@ -164,7 +215,7 @@ export function liveDaemonPid(exceptPid: number = process.pid): number | null {
     if (!f.endsWith(".json")) continue;
     try {
       const rec = JSON.parse(readFileSync(join(dir, f), "utf8")) as ServerRecord;
-      if (rec.daemon && rec.pid !== exceptPid && isAlive(rec.pid)) return rec.pid;
+      if (rec.daemon && rec.pid !== exceptPid && recordIsLive(rec)) return rec.pid;
     } catch {
       /* a record being rewritten: the next tick reads it */
     }
@@ -177,12 +228,18 @@ export function listServers(): ServerReport {
   const dir = registryDir();
   const report: ServerReport = { servers: [], removed: 0, warnings: [] };
   if (!existsSync(dir)) return report;
+  const records: Array<{ path: string; rec: ServerRecord }> = [];
   for (const f of readdirSync(dir)) {
     if (!f.endsWith(".json")) continue;
     const path = join(dir, f);
     let rec: ServerRecord;
     try { rec = JSON.parse(readFileSync(path, "utf8")); } catch { try { unlinkSync(path); } catch { /* */ } report.removed++; continue; }
-    if (!isAlive(rec.pid)) { try { unlinkSync(path); } catch { /* */ } report.removed++; continue; }
+    records.push({ path, rec });
+  }
+  refreshStartTimes(records.filter(({ rec }) => isAlive(rec.pid)).map(({ rec }) => rec.pid)); // one ps for the listing
+  for (const { path, rec } of records) {
+    // [LOCK] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS]
+    if (!recordIsLive(rec)) { try { unlinkSync(path); } catch { /* */ } report.removed++; continue; }
     const currentBuild = buildHashOf(rec.script);
     const staleBuild = currentBuild !== null && rec.build !== "unknown" && currentBuild !== rec.build;
     report.servers.push({ ...rec, alive: true, currentBuild, staleBuild });

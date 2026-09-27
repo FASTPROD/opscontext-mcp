@@ -13,7 +13,7 @@
 // This is the first MCP server that enforces agent behavior
 // through progressive response degradation.
 
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -609,20 +609,26 @@ export class ProtocolFirewall {
       this.gitCache.timestamp = now;
       this.gitCache.data = [];
       for (const dir of this.projectDirs.slice(0, 5)) {
+        // [LOCKED] [GIT-FAILURE-IS-UNKNOWN-NOT-CLEAN] - 2026-09-27 (Yan's GO for this one line, file under DO NOT RE-AUDIT)
+        // [NEVER] count dirty files through a shell pipe that turns a failed git into "0".
+        // WHY: `git status --porcelain 2>/dev/null | wc -l` printed 0 when git failed, so a repository
+        //      git could not read (a corrupt index: exit 128, 8 changed files) was reported "Git: ok,
+        //      clean" (E2E_REVIEW_2026-09 B6-2). [EXEC-FAILURE-IS-NOT-EMPTY] fixed the same shape in agents.ts.
+        // FIX: git by argument list, lines counted here; a folder that is not a repository is skipped as
+        //      before; any other failure (unreadable repo, timeout) is reported as unknown, never clean.
         try {
-          const out = execSync(
-            "git status --porcelain 2>/dev/null | wc -l",
-            {
-              cwd: dir.path,
-              encoding: "utf-8",
-              timeout: 3000,
-              stdio: ["pipe", "pipe", "pipe"],
-            }
-          ).trim();
-          const n = parseInt(out);
+          const out = execFileSync("git", ["status", "--porcelain"], {
+            cwd: dir.path,
+            encoding: "utf-8",
+            timeout: 3000,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          const n = out.split("\n").filter(Boolean).length;
           if (n > 0) this.gitCache.data.push(`${dir.name}(${n})`);
-        } catch {
-          /* skip */
+        } catch (e) {
+          const stderr = String((e as { stderr?: unknown }).stderr ?? "");
+          if (/not a git repository/i.test(stderr)) continue;
+          this.gitCache.data.push(`${dir.name}(unknown: git could not read it)`);
         }
       }
     }

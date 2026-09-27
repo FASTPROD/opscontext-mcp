@@ -4,6 +4,39 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.12.0] 2026-09-27: phase B, second half (liveness, the learnings store, two decisions)
+
+### Servers and locks
+
+- **A crashed process no longer holds a lock for seconds or minutes.** The audit log, rotation,
+  daily-check and learnings-store locks name their holder; a lock whose holder is gone, or an empty lock
+  older than a second, is broken at once. A writer killed inside the audit lock used to cost every
+  other writer about four entries (it happened on the author's machine on 2026-09-27); a saver killed
+  inside the store lock made saves fail for 20 s. Temp copies left by dead writers are removed.
+  LOCKs `[A-DEAD-HOLDER-LOSES-THE-LOCK-AT-ONCE]`, `[A-DEAD-STORE-HOLDER-LOSES-THE-LOCK-AT-ONCE]`. (B1-2, B4-2)
+- **A registry record belongs to its own process.** A crashed server's record whose process number was
+  reused by another program froze the indexer election and silenced the event port. A record is now
+  alive only if its process started no later than the record says. LOCK `[A-RECORD-BELONGS-TO-ITS-OWN-PROCESS]`. (B5-1)
+- **A chat server ends with its chat.** A server whose client died used to live on, still indexing and
+  holding the event port. It now stops when its input closes (the launchd agent excepted). A server with
+  the embedding model loaded stops without the model runtime's native abort, which used to leave a macOS
+  crash report on every stop. LOCK `[A-CHAT-SERVER-ENDS-WITH-ITS-CHAT]`. (B5-2)
+
+### Learnings
+
+- **A read never writes the store without the lock.** A read that found a bundled default missing used
+  to rewrite the whole store unlocked (a concurrent save could be lost), and a deleted default came back at
+  the next read. Now the read takes the lock or only shows the default; a deleted default stays deleted,
+  and a re-add is recorded. LOCK `[A-READ-NEVER-WRITES-THE-STORE]`. (B4-1)
+
+### Firewall and compliance
+
+- **A failed `git status` reads "unknown", never "clean"** in the firewall's git check (a repository git
+  could not read was reported clean). LOCK `[GIT-FAILURE-IS-UNKNOWN-NOT-CLEAN]`. (B6-2)
+- **`audit-verify` shows every redaction acknowledgement it relied on** (time, actor, reason), and the
+  compliance pages say what an acknowledgement cannot prove. Four claims on those pages that had stopped
+  being true since June are corrected (rotation, verification, file permissions, restore). (B3-2)
+
 ## [2.11.0] 2026-09-27: the end-to-end review, phase B (the evidence stays true when things go wrong)
 
 Fixes from the end-to-end review, phase B (`docs/audits/E2E_REVIEW_2026-09.md`, section "Phase B").

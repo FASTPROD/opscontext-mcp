@@ -45,7 +45,10 @@ describe("listServers", () => {
     const dead = spawnSync("true").pid as number;
     const script = join(home(), "fake-server3.js");
     writeFileSync(script, "x");
-    const rec = (pid: number) => ({ pid, ppid: 1, parent: "test", started: "2026-09-05T00:00:00.000Z", heartbeat: "2026-09-05T00:00:00.000Z", version: "1", script, build: R.buildHashOf(script), cwd: "/", node: "v20" });
+    // `started` is now: a live process's record must not claim a start before the process began, or
+    // it reads as a reused pid and is removed. [LOCK] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS]
+    const now = new Date().toISOString();
+    const rec = (pid: number) => ({ pid, ppid: 1, parent: "test", started: now, heartbeat: now, version: "1", script, build: R.buildHashOf(script), cwd: "/", node: "v20" });
     writeFileSync(join(dir(), `${dead}.json`), JSON.stringify(rec(dead)));
     // Alive impostors: this process under several fake pids is not possible, so use live pids that exist: our own and our parent.
     writeFileSync(join(dir(), `${process.pid}.json`), JSON.stringify(rec(process.pid)));

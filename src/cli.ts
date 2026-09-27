@@ -2308,11 +2308,20 @@ async function cliAuditVerify(): Promise<void> {
     console.log(`   Counted once. Content intact, nothing missing. Usually a log trim that was interrupted or`);
     console.log(`   ran while entries arrived. At: ${dups.slice(0, 8).join(", ")}${dups.length > 8 ? `, … (+${dups.length - 8} more)` : ""}`);
   };
+  // [LOCK] [REDACTION-IS-A-CHAINED-RECORD]: an acknowledgement is a statement by whoever ran it; show each one used.
+  const acksNote = (log: (s: string) => void) => {
+    const acks = report.acknowledgements ?? [];
+    if (acks.length === 0) return;
+    log(`   Acknowledged by (a statement by whoever ran it; the chain cannot tell a removal from a rewrite):`);
+    for (const a of acks.slice(0, 10)) log(`     ${a.ts.slice(0, 19).replace("T", " ")}Z  ${a.actor}  ${a.records} record(s)  "${a.reason.slice(0, 80)}"`);
+    if (acks.length > 10) log(`     … (+${acks.length - 10} more)`);
+  };
   if (report.ok) {
     console.log(`✅ Audit chain verified — ${report.total - dups.length} record(s).`);
     console.log(redacted.length === 0
       ? `   No record was altered, and no history is missing.`
       : `   No history is missing. ${redacted.length} record(s) redacted and acknowledged on the chain (indices ${redacted.slice(0, 8).join(", ")}${redacted.length > 8 ? ", …" : ""}), 0 altered.`);
+    acksNote((x) => console.log(x));
     if (forks.length > 0) {
       // [VERIFY-FORK-IS-NOT-TAMPER] — surface this, but do not call it tampering.
       console.log(
@@ -2349,6 +2358,7 @@ async function cliAuditVerify(): Promise<void> {
   }
   if (redacted.length > 0) {
     console.error(`\n   Also ${redacted.length} redacted record(s), acknowledged on the chain, not counted above.`);
+    acksNote((x) => console.error(x));
   }
   // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]: say where, and that the rest was checked.
   const unreadable = report.unreadable ?? [];

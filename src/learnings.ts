@@ -48,6 +48,9 @@ export interface LearningsStore {
   version: number;
   count: number;
   learnings: Learning[];
+  /** Bundled default rules (lowercased, trimmed) the owner deleted: never merged back.
+   *  [LOCK] [A-READ-NEVER-WRITES-THE-STORE] */
+  dismissed_defaults?: string[];
 }
 
 /** Valid categories for learnings */
@@ -102,15 +105,17 @@ function loadBundledDefaults(): Array<{ category: string; rule: string; context:
  * Merge bundled defaults into user store if they don't already exist.
  * Uses rule text (lowercased) for dedup — user learnings always win.
  */
-function mergeDefaults(store: LearningsStore): boolean {
+function mergeDefaults(store: LearningsStore): number {
   const bundled = loadBundledDefaults();
-  if (bundled.length === 0) return false;
+  if (bundled.length === 0) return 0;
 
   const existingRules = new Set(
     store.learnings
       .filter((l) => typeof l.rule === "string")
       .map((l) => l.rule.toLowerCase().trim())
   );
+  // A default the owner deleted stays deleted. [LOCK] [A-READ-NEVER-WRITES-THE-STORE]
+  for (const r of store.dismissed_defaults ?? []) existingRules.add(r);
 
   let added = 0;
   const now = new Date().toISOString();
@@ -131,7 +136,13 @@ function mergeDefaults(store: LearningsStore): boolean {
     added++;
   }
 
-  return added > 0;
+  return added;
+}
+
+/** Is this rule text one of the bundled defaults? */
+function isBundledDefault(rule: string): boolean {
+  const key = rule.toLowerCase().trim();
+  return loadBundledDefaults().some((d) => d.rule.toLowerCase().trim() === key);
 }
 
 // [LOCKED] [STORE-NEVER-STARTS-FRESH-OVER-DATA] 2026-09-05
@@ -164,6 +175,37 @@ function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// [LOCKED] [A-DEAD-STORE-HOLDER-LOSES-THE-LOCK-AT-ONCE] 2026-09-27
+// [NEVER] make a save wait out LOCK_STALE_MS for a holder that is provably gone, or leave a dead
+//         writer's full copy of the store on disk.
+// WHY: a saver killed inside the lock made every other save in the next ~20 s wait 10 s and fail
+//      with "locked by another process" (6 per run, 3 of 3, E2E_REVIEW_2026-09 B4-2), and left its
+//      temp copy of the whole store behind for good. The lock directory names its holder's pid;
+//      nothing read it.
+// FIX: a lock whose pid no longer exists, or a lock directory older than a second with no pid in
+//      it, is taken over at once; a live pid keeps the 30 s rule. Inside the lock, temp copies
+//      written by a pid that no longer exists are removed.
+function storeHolderIsGone(age: number): boolean {
+  let pid = NaN;
+  try { pid = parseInt(readFileSync(join(STORE_LOCK_DIR, "pid"), "utf-8"), 10); } catch { /* no pid yet */ }
+  if (!Number.isInteger(pid) || pid <= 0) return age > 1000;
+  if (pid === process.pid) return false;
+  try { process.kill(pid, 0); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+function removeDeadWritersTemps(): void {
+  try {
+    const dir = dirname(LEARNINGS_PATH);
+    for (const f of readdirSync(dir)) {
+      const m = /^learnings\.json\.tmp-(\d+)-\d+$/.exec(f);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid) continue;
+      try { process.kill(pid, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ESRCH") unlinkSync(join(dir, f)); }
+    }
+  } catch { /* cleanup is a courtesy; the store is untouched either way */ }
+}
+
 /** Cross-process, re-entrant (within this process) lock around the store file. */
 export function withStoreLock<T>(fn: () => T): T {
   if (lockDepth > 0) { lockDepth++; try { return fn(); } finally { lockDepth--; } }
@@ -179,7 +221,8 @@ export function withStoreLock<T>(fn: () => T): T {
       if (e?.code !== "EEXIST") throw e;
       let age = 0;
       try { age = Date.now() - statSync(STORE_LOCK_DIR).mtimeMs; } catch { age = 0; }
-      if (age > LOCK_STALE_MS) {
+      // [LOCK] [A-DEAD-STORE-HOLDER-LOSES-THE-LOCK-AT-ONCE]
+      if (age > LOCK_STALE_MS || storeHolderIsGone(age)) {
         // Holder died (or hung) without releasing: take it over.
         try { rmSync(STORE_LOCK_DIR, { recursive: true, force: true }); } catch { /* retry below */ }
         continue;
@@ -192,6 +235,7 @@ export function withStoreLock<T>(fn: () => T): T {
   }
   lockDepth = 1;
   try {
+    removeDeadWritersTemps();
     return fn();
   } finally {
     lockDepth = 0;
@@ -242,11 +286,38 @@ function readStoreFromDisk(): LearningsStore {
     store = { version: 1, count: 0, learnings: [] };
   }
 
-  // Auto-merge bundled defaults on first load or when new defaults are added
-  if (mergeDefaults(store)) {
+  // [LOCKED] [A-READ-NEVER-WRITES-THE-STORE] - 2026-09-27
+  // [NEVER] write the store from a read that does not hold the store lock, and never merge back a
+  //         bundled default the owner deleted.
+  // WHY: a plain read (listLearnings, searchLearnings, the index build) merged a missing bundled
+  //      default and wrote the whole store WITHOUT the lock. With that read held 1.5 s before its
+  //      write, a concurrent saver's 5 learnings, each saved with success, were gone (3 of 3,
+  //      E2E_REVIEW_2026-09 B4-1); at natural speed the window is milliseconds and opens after every
+  //      release that adds a default. And a deleted default came back at the next read, with a new id
+  //      and no audit record: the delete never stuck. [LOCK] [STORE-NEVER-STARTS-FRESH-OVER-DATA]
+  //      already said "never let two processes write it without the lock".
+  // FIX: holding the lock (a save, a delete, a batch), the merge is written as before. A plain read
+  //      takes the lock for it (re-reading inside), and if the lock is busy only shows the defaults,
+  //      writing nothing. A deleted default is remembered in `dismissed_defaults`; every persisted
+  //      merge is recorded as a learning.import of the bundled defaults.
+  if (!hasMissingDefaults(store)) return store;
+  if (lockDepth > 0) {
+    const added = mergeDefaults(store);
     if (batchStore) batchDirty = true; else writeStoreToDisk(store);
+    safeAppend("learning.import", { source: "bundled defaults", format: "json", imported: added, updated: 0, skipped: 0 });
+    return store;
   }
-  return store;
+  try {
+    return withStoreLock(() => readStoreFromDisk());
+  } catch {
+    mergeDefaults(store); // the lock is busy: show them, persist at the next locked read or write
+    return store;
+  }
+}
+
+function hasMissingDefaults(store: LearningsStore): boolean {
+  const probe: LearningsStore = { version: store.version, count: 0, learnings: store.learnings.slice(), dismissed_defaults: store.dismissed_defaults };
+  return mergeDefaults(probe) > 0;
 }
 
 function loadStore(): LearningsStore {
@@ -542,12 +613,19 @@ function deleteLearningUnlocked(id: string): boolean {
   if (index === -1) return false;
   const removed = store.learnings[index];
   store.learnings.splice(index, 1);
+  // A deleted bundled default stays deleted. [LOCK] [A-READ-NEVER-WRITES-THE-STORE]
+  const dismissed = typeof removed.rule === "string" && isBundledDefault(removed.rule);
+  if (dismissed) {
+    const key = removed.rule.toLowerCase().trim();
+    store.dismissed_defaults = [...new Set([...(store.dismissed_defaults ?? []), key])];
+  }
   saveStore(store);
   safeAppend("learning.delete", {
     id: removed.id,
     category: removed.category,
     project: removed.project,
     rule_length: typeof removed.rule === "string" ? removed.rule.length : 0,
+    ...(dismissed ? { default_dismissed: true } : {}),
   });
   return true;
 }
