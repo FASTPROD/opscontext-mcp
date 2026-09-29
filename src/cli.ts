@@ -682,6 +682,7 @@ import { summarizeSource } from "./source-summary.js";
 import { searchChunks } from "./search.js";
 import { SERVER_COMMANDS, suggestCommands } from "./cli-commands.js";
 import { collectProjectOps, collectSystemOps } from "./collectors.js";
+import { repoStatus } from "./repo-status.js";
 import { scanCodeDir } from "./code-chunker.js";
 import {
   listProjects,
@@ -811,16 +812,21 @@ async function initEngine(): Promise<EngineState> {
   const config = loadConfig();
   const projectDirs = loadProjectDirs();
 
-  // Collect operational data
+  // Collect operational data. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a collector that could not run is said, once.
+  const collectorFailures: string[] = [];
+  const onCollectorFailure = (collector: string, reason: string) => { collectorFailures.push(`${collector}: ${reason}`); };
   if (config.collectOps !== false) {
     for (const dir of projectDirs) {
-      const ops = collectProjectOps(dir.path, dir.name);
+      const ops = collectProjectOps(dir.path, dir.name, onCollectorFailure);
       chunks.push(...ops);
     }
   }
   if (config.collectSystemOps !== false) {
-    const sysOps = collectSystemOps();
+    const sysOps = collectSystemOps(onCollectorFailure);
     chunks.push(...sysOps);
+  }
+  if (collectorFailures.length > 0) {
+    console.error(`[ContextEngine] ${collectorFailures.length} collector(s) failed (${collectorFailures.join("; ")})`);
   }
 
   // Scan code files
@@ -2399,6 +2405,7 @@ async function cliEndSession(): Promise<void> {
   const checks: string[] = [];
   let passCount = 0;
   let failCount = 0;
+  let uncheckedCount = 0; // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a repo git could not check is neither clean nor dirty
 
   checks.push("═══════════════════════════════════════");
   checks.push("  ContextEngine — End-of-Session Checklist");
@@ -2444,7 +2451,12 @@ async function cliEndSession(): Promise<void> {
         passCount++;
       }
     } catch {
-      // Not a git repo
+      // a plain folder stays silent; a repository git could not read is said (src/repo-status.ts)
+      const st = repoStatus(dir.path);
+      if (st.state === "failed") {
+        checks.push(`- ❔ UNCHECKED — ${dir.name} could not be checked: ${st.error}`);
+        uncheckedCount++;
+      }
     }
   }
 
@@ -2471,7 +2483,13 @@ async function cliEndSession(): Promise<void> {
         checks.push(`- ✅ PASS — ${repoName} is clean`);
         passCount++;
       }
-    } catch { /* Not a git repo */ }
+    } catch {
+      const st = repoStatus(repoPath);
+      if (st.state === "failed") {
+        checks.push(`- ❔ UNCHECKED — ${basename(repoPath)} could not be checked: ${st.error}`);
+        uncheckedCount++;
+      }
+    }
   }
 
   checks.push("");
@@ -2591,7 +2609,7 @@ async function cliEndSession(): Promise<void> {
   checks.push("");
 
   checks.push("## 4. Sessions\n");
-  const sessions = listSessions();
+  const sessions = listSessions().filter((s) => !s.error);
   if (sessions.length > 0) {
     checks.push(`- 📁 **${sessions.length} saved sessions**`);
     // Show 3 most recent
@@ -2612,8 +2630,10 @@ async function cliEndSession(): Promise<void> {
   // --- Summary ---
   checks.push("═══════════════════════════════════════");
   checks.push("## Summary\n");
-  const total = passCount + failCount;
-  if (failCount === 0) {
+  const total = passCount + failCount + uncheckedCount;
+  if (failCount === 0 && uncheckedCount > 0) {
+    checks.push(`❔ ${uncheckedCount} check(s) could not run — ${passCount}/${total} passed, nothing failed, but not every repo was seen (see UNCHECKED above).`);
+  } else if (failCount === 0) {
     checks.push(`✅ ALL CLEAR — ${passCount}/${total} checks passed. Safe to end session.`);
   } else {
     checks.push(`⚠️  ${failCount} item(s) need attention — ${passCount}/${total} passed.`);

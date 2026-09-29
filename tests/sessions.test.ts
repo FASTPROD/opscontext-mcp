@@ -113,3 +113,21 @@ describe("sessions", () => {
     deleteSession("test/with:special<chars>");
   });
 });
+
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] at the session list. E2E_REVIEW_2026-09 C6-5: a session file that
+// could not be parsed was dropped from the list in silence, as if it had never been saved.
+import { writeFileSync } from "fs";
+describe("a session file that cannot be read", () => {
+  const CORRUPT = "vitest-corrupt-temp";
+  const corruptPath = join(SESSIONS_DIR, `${CORRUPT}.json`);
+  afterEach(() => { if (existsSync(corruptPath)) rmSync(corruptPath); });
+
+  it("is listed by its file name with the error, not dropped", () => {
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+    writeFileSync(corruptPath, "{ not json");
+    const entry = listSessions().find((s) => s.name === CORRUPT);
+    expect(entry).toBeDefined();
+    expect(entry!.error).toMatch(/JSON/);
+    expect(formatSessionList(listSessions())).toMatch(new RegExp(`\\| ${CORRUPT} \\| could not be read: `));
+  });
+});

@@ -88,14 +88,16 @@ function ensureDir(): void {
  * Load bundled starter learnings from the npm package's defaults/ directory.
  * These are curated, universal best practices shipped with every install.
  */
-function loadBundledDefaults(): Array<{ category: string; rule: string; context: string; tags: string[] }> {
+export function loadBundledDefaults(
   // defaults/ sits next to dist/ in the package root
-  const defaultsPath = join(__dirname, "..", "defaults", "learnings.json");
+  defaultsPath: string = join(__dirname, "..", "defaults", "learnings.json"),
+): Array<{ category: string; rule: string; context: string; tags: string[] }> {
   if (existsSync(defaultsPath)) {
     try {
       return JSON.parse(readFileSync(defaultsPath, "utf-8"));
-    } catch {
-      // Malformed defaults — skip silently
+    } catch (err) {
+      // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: malformed defaults were skipped in silence; say it once (2026-09-29, C6-5).
+      console.error(`[ContextEngine] bundled defaults could not be read or parsed (${defaultsPath}): ${err instanceof Error ? err.message : String(err)}; none merged`);
     }
   }
   return [];
@@ -335,7 +337,14 @@ function dailyBackup(): void {
     const dir = dirname(LEARNINGS_PATH);
     const daily = readdirSync(dir).filter((f) => /^learnings\.json\.bak-\d{8}$/.test(f)).sort();
     for (const f of daily.slice(0, Math.max(0, daily.length - 7))) unlinkSync(join(dir, f));
-  } catch { /* a missing backup must never block a save */ }
+  } catch (err) {
+    // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: the daily copy is the store's only restore path. A copy that
+    // failed must never block the save, and must never go unsaid: one line on stderr and one chained
+    // record, which fleet health counts (2026-09-29, E2E_REVIEW_2026-09 C6-5).
+    const error = err instanceof Error ? err.message : String(err);
+    console.error(`[ContextEngine] daily learnings backup failed (${bak}): ${error}`);
+    safeAppend("learning.backup_failed", { path: bak, error });
+  }
 }
 
 // [LOCKED] [STORE-GROWTH-IS-A-TRIPWIRE-TOO] 2026-09-05

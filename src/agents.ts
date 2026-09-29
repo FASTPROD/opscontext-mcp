@@ -99,6 +99,12 @@ function exec(cmd: string, cwd?: string): string {
  *      a fixture with a .git directory that is not a real repository.
  * FIX: security- and correctness-relevant callers use execChecked() and emit "unknown" when
  *      ok === false. Absence of output is a measurement, not a decision.
+ * 2026-09-29 (E2E_REVIEW_2026-09 C6, phase C batch 2): widened beyond exec() to every read a check
+ *      makes. A readdir or readFile that fails is "unknown" with its error, never 0, [] or a pass:
+ *      the Tests, Docker, CI/CD and npm scripts checks and the project folder itself here; the
+ *      Stop hook (src/session-gate.ts), the drift detector (src/detector.ts), the collectors
+ *      (src/collectors.ts) and the smaller sites each carry a [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]
+ *      cross-reference naming what they used to hide.
  */
 function execChecked(cmd: string, cwd?: string): { ok: boolean; output: string } {
   try {
@@ -193,7 +199,7 @@ function detectLanguages(p: string): Set<ProjectLanguage> {
     }
   };
   scan(p);
-  for (const sub of safeSubdirs(p)) scan(join(p, sub));
+  for (const sub of safeSubdirs(p) ?? []) scan(join(p, sub));
   if (found.size === 0) found.add("other");
   return found;
 }
@@ -203,7 +209,7 @@ function findConfig(p: string, candidates: string[]): string | null {
   for (const c of candidates) {
     if (existsSync(join(p, c))) return c;
   }
-  for (const sub of safeSubdirs(p)) {
+  for (const sub of safeSubdirs(p) ?? []) {
     for (const c of candidates) {
       if (existsSync(join(p, sub, c))) return `${sub}/${c}`;
     }
@@ -211,8 +217,18 @@ function findConfig(p: string, candidates: string[]): string | null {
   return null;
 }
 
-/** Immediate subdirectories worth searching — skips vendored, hidden and build output. */
-function safeSubdirs(p: string): string[] {
+/** Text of a thrown value, for a detail line. */
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Immediate subdirectories worth searching — skips vendored, hidden and build output.
+ * null when the folder itself cannot be listed. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a folder that
+ * could not be listed is not an empty one. scoreProject() reports the root case as one unknown;
+ * the callers here read null as "could not look one level down".
+ */
+function safeSubdirs(p: string): string[] | null {
   const SKIP = new Set(["node_modules", "vendor", "dist", "build", ".git", "__pycache__", "venv", ".venv", "coverage", "_deprecated"]);
   try {
     return readdirSync(p, { withFileTypes: true })
@@ -220,7 +236,7 @@ function safeSubdirs(p: string): string[] {
       .map(d => d.name)
       .slice(0, 24); // bounded — this runs for every project on every fleet scan
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -275,17 +291,25 @@ function isLintInstalled(projectPath: string): boolean {
 
 /**
  * Count real test files recursively (not just directories or symlinks).
- * Returns the number of actual test files (*.test.*, *.spec.*, *_test.*).
+ * Returns the number of actual test files (*.test.*, *.spec.*, *_test.*), or the error when a
+ * folder on the way could not be read.
+ * [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY], widened here on 2026-09-29: this returned 0 on a read
+ * failure, so a tests/ folder at mode 000 scored "1/8, exists but empty" and cost 4 points for a
+ * permission problem (E2E_REVIEW_2026-09 C6-2). A count that could not be made is unknown.
  */
-function countTestFiles(dirPath: string, depth: number = 0): number {
-  if (depth > 3) return 0; // Don't recurse too deep
+type TestCount = { count: number; error: null } | { count: null; error: string };
+
+function countTestFiles(dirPath: string, depth: number = 0): TestCount {
+  if (depth > 3) return { count: 0, error: null }; // Don't recurse too deep
   try {
     const entries = readdirSync(dirPath, { withFileTypes: true });
     let count = 0;
     for (const entry of entries) {
       const fullPath = join(dirPath, entry.name);
       if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
-        count += countTestFiles(fullPath, depth + 1);
+        const sub = countTestFiles(fullPath, depth + 1);
+        if (sub.error !== null) return sub;
+        count += sub.count;
       } else if (entry.isFile()) {
         // 🔒 [SCORE-LANGUAGE-AWARE] — the extension list is part of the language assumption.
         // `dart` was absent, so PLANK.io's 68 Flutter tests in plank_app/test/ counted as ZERO:
@@ -300,9 +324,9 @@ function countTestFiles(dirPath: string, depth: number = 0): number {
         }
       }
     }
-    return count;
-  } catch {
-    return 0;
+    return { count, error: null };
+  } catch (err) {
+    return { count: null, error: errText(err) };
   }
 }
 
@@ -375,7 +399,10 @@ export function analyzeProject(dir: ProjectDirectory): ProjectInfo {
       if (allDeps["vue"]) info.deps["vue"] = allDeps["vue"];
       if (allDeps["@mui/material"]) info.deps["@mui/material"] = allDeps["@mui/material"];
       if (allDeps["@material-ui/core"]) info.deps["@material-ui/core"] = allDeps["@material-ui/core"];
-    } catch { /* ignore */ }
+    } catch (err) {
+      // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: say it, one line, instead of typing the project "unknown" in silence.
+      console.error(`[contextengine] ${dir.name}: package.json could not be read or parsed (${errText(err)}); type detection skipped`);
+    }
   }
 
   // PHP project
@@ -393,7 +420,9 @@ export function analyzeProject(dir: ProjectDirectory): ProjectInfo {
       } else if (allDeps["symfony/framework-bundle"]) {
         info.framework = "symfony";
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error(`[contextengine] ${dir.name}: composer.json could not be read or parsed (${errText(err)}); type detection skipped`);
+    }
   }
 
   // Python project
@@ -552,7 +581,9 @@ export function checkPorts(projectDirs: ProjectDirectory[]): {
             });
           }
         }
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.error(`[contextengine] ${dir.name}: package.json could not be read or parsed (${errText(err)}); its ports were not scanned`);
+      }
     }
   }
 
@@ -1358,6 +1389,17 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   const checks: ScoreCheck[] = [];
   const p = dir.path;
 
+  // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a folder the scorer cannot list is one unknown worth the
+  // whole exam, never thirty "missing" verdicts about files it could not look for (2026-09-29).
+  try {
+    readdirSync(p);
+  } catch (err) {
+    return {
+      project: dir.name, path: p, score: 0, maxScore: 100, percentage: 0, grade: "?",
+      checks: [{ name: "Project folder", category: "Meta", points: 0, maxPoints: 100, status: "unknown", detail: `❔ the project folder could not be read (${errText(err)}); nothing was assessed` }],
+    };
+  }
+
   // Language decides which tooling checks apply at all — see [SCORE-LANGUAGE-AWARE].
   const langs = detectLanguages(p);
 
@@ -1541,7 +1583,9 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   const hasDockerfile = existsSync(join(p, "Dockerfile"));
   const hasCompose = existsSync(join(p, "docker-compose.yml")) || existsSync(join(p, "docker-compose.prod.yml"));
 
-  // Detect if project actually uses Docker in its deployment
+  // Detect if project actually uses Docker in its deployment.
+  // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a Docker file that cannot be read is not a placeholder.
+  let dockerReadError: string | null = null;
   const usesDockerForReal = (() => {
     // If Dockerfile has real content (not just a stub), it's genuine
     if (hasDockerfile) {
@@ -1549,17 +1593,15 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
         const df = readFileSync(join(p, "Dockerfile"), "utf-8");
         const effectiveLines = df.split("\n").filter(l => l.trim() && !l.trim().startsWith("#")).length;
         if (effectiveLines >= 3) return true; // Real Dockerfile
-      } catch { /* ignore */ }
+      } catch (err) { dockerReadError = `Dockerfile could not be read (${errText(err)})`; }
     }
     // If docker-compose has services with image/build, it's genuine
     if (hasCompose) {
+      const composeName = existsSync(join(p, "docker-compose.yml")) ? "docker-compose.yml" : "docker-compose.prod.yml";
       try {
-        const composePath = existsSync(join(p, "docker-compose.yml"))
-          ? join(p, "docker-compose.yml")
-          : join(p, "docker-compose.prod.yml");
-        const dc = readFileSync(composePath, "utf-8");
+        const dc = readFileSync(join(p, composeName), "utf-8");
         if (dc.includes("image:") || dc.includes("build:")) return true; // Real compose
-      } catch { /* ignore */ }
+      } catch (err) { dockerReadError = `${composeName} could not be read (${errText(err)})`; }
     }
     return false;
   })();
@@ -1571,7 +1613,9 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
     existsSync(join(p, "fly.toml")) ||
     existsSync(join(p, "railway.json"));
 
-  if (usesDockerForReal && hasDockerfile && hasCompose) {
+  if (!usesDockerForReal && dockerReadError) {
+    checks.push({ name: "Docker", category: "Infrastructure", points: 0, maxPoints: 4, status: "unknown", detail: `❔ ${dockerReadError}; cannot tell whether Docker is really used` });
+  } else if (usesDockerForReal && hasDockerfile && hasCompose) {
     checks.push({ name: "Docker", category: "Infrastructure", points: 4, maxPoints: 4, status: "pass", detail: "Dockerfile + compose (active deployment)" });
   } else if (usesDockerForReal && (hasDockerfile || hasCompose)) {
     checks.push({ name: "Docker", category: "Infrastructure", points: 2, maxPoints: 4, status: "partial", detail: hasDockerfile ? "Dockerfile only" : "Compose only" });
@@ -1590,6 +1634,7 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   const foundCI = ciPaths.filter(ci => existsSync(join(p, ci)));
   if (foundCI.length > 0) {
     let ciHasActions = false;
+    let ciReadError: string | null = null; // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: unread is not a stub
     const ghWorkflows = join(p, ".github", "workflows");
     if (existsSync(ghWorkflows)) {
       try {
@@ -1598,13 +1643,15 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
           const wfContent = readFileSync(join(ghWorkflows, wf), "utf-8");
           if (wfContent.includes("run:") || wfContent.includes("uses:")) { ciHasActions = true; break; }
         }
-      } catch { /* ignore read errors */ }
+      } catch (err) { ciReadError = `.github/workflows could not be read (${errText(err)})`; }
     } else {
       // Non-GH CI (gitlab-ci.yml, Jenkinsfile, etc.) — trust existence since formats vary
       ciHasActions = true;
     }
     if (ciHasActions) {
       checks.push({ name: "CI/CD", category: "Infrastructure", points: 5, maxPoints: 5, status: "pass", detail: foundCI.join(", ") });
+    } else if (ciReadError) {
+      checks.push({ name: "CI/CD", category: "Infrastructure", points: 0, maxPoints: 5, status: "unknown", detail: `❔ ${ciReadError}; cannot tell whether the workflows are real` });
     } else {
       checks.push({ name: "CI/CD", category: "Infrastructure", points: 1, maxPoints: 5, status: "partial", detail: "Workflows exist but no run/uses actions found — may be stubs" });
     }
@@ -1645,7 +1692,7 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   const testDirNames = ["tests", "test", "__tests__", "spec", "src/__tests__"];
   const testDirs = [
     ...testDirNames,
-    ...safeSubdirs(p).flatMap(sub => testDirNames.map(td => `${sub}/${td}`)),
+    ...(safeSubdirs(p) ?? []).flatMap(sub => testDirNames.map(td => `${sub}/${td}`)),
   ];
   const foundTests = testDirs.filter(td => existsSync(join(p, td)));
   if (foundTests.length > 0) {
@@ -1653,16 +1700,23 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
     // in plank_app/test/ and 38 backend tests in backend/__tests__/; taking foundTests[0] credited
     // the backend alone and rendered the larger codebase invisible. Any polyglot or multi-package
     // repo hit this — the bug was the `[0]`, not the search.
-    const perDir = foundTests.map(td => ({ rel: td, count: countTestFiles(join(p, td)), symlink: isSymlink(join(p, td)) }));
+    type Counted = { rel: string; symlink: boolean } & TestCount;
+    const counted: Counted[] = foundTests.map(td => ({ rel: td, symlink: isSymlink(join(p, td)), ...countTestFiles(join(p, td)) }));
+    // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a folder that could not be counted is unknown, not empty.
+    const unread = counted.filter(d => d.error !== null);
+    const perDir = counted.filter((d): d is Counted & { count: number; error: null } => d.error === null);
     const testFileCount = perDir.reduce((sum, d) => sum + d.count, 0);
     const contributing = perDir.filter(d => d.count > 0);
     const where = (contributing.length > 0 ? contributing : perDir)
       .map(d => `${d.rel}/ (${d.count})`)
       .slice(0, 3)
       .join(", ") + (perDir.length > 3 ? `, +${perDir.length - 3} more` : "");
-    const allSymlinks = perDir.every(d => d.symlink);
+    const allSymlinks = counted.every(d => d.symlink);
 
-    if (allSymlinks) {
+    if (unread.length > 0) {
+      const gaps = unread.map(d => `${d.rel}/ could not be read (${d.error})`).join("; ");
+      checks.push({ name: "Tests", category: "Code Quality", points: 0, maxPoints: 8, status: "unknown", detail: `❔ ${gaps}${perDir.length > 0 ? `; counted elsewhere: ${where}` : ""}` });
+    } else if (allSymlinks) {
       checks.push({ name: "Tests", category: "Code Quality", points: 3, maxPoints: 8, status: "partial", detail: `${where} — symlinked, should be real test directories` });
     } else if (testFileCount >= RUBRIC.testsFull) {
       checks.push({ name: "Tests", category: "Code Quality", points: 8, maxPoints: 8, status: "pass", detail: `${testFileCount} test files across ${contributing.length} dir(s): ${where}` });
@@ -1671,7 +1725,7 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
     } else {
       let hasAnyFiles = false;
       for (const d of perDir) {
-        try { if (readdirSync(join(p, d.rel)).length > 0) { hasAnyFiles = true; break; } } catch { /* unreadable dir counts as empty */ }
+        try { if (readdirSync(join(p, d.rel)).length > 0) { hasAnyFiles = true; break; } } catch { /* not reached: an unreadable folder is reported above */ }
       }
       checks.push(hasAnyFiles
         ? { name: "Tests", category: "Code Quality", points: 4, maxPoints: 8, status: "partial", detail: `${where} has files but no standard test files detected` }
@@ -1761,7 +1815,10 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
       } else {
         checks.push({ name: "npm scripts", category: "Code Quality", points: 1, maxPoints: 3, status: "partial", detail: `Has scripts but no build/dev/test: ${scripts.join(", ")}` });
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a package.json that cannot be read or parsed is not "no scripts".
+      checks.push({ name: "npm scripts", category: "Code Quality", points: 0, maxPoints: 3, status: "unknown", detail: `❔ package.json present but could not be read or parsed (${errText(err)})` });
+    }
   }
 
   // --- Security (20 points max) ---

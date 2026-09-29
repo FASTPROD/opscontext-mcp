@@ -40,7 +40,7 @@ export interface ServerRecord {
 }
 
 export interface ServerReport {
-  servers: Array<ServerRecord & { alive: true; currentBuild: string | null; staleBuild: boolean }>;
+  servers: Array<ServerRecord & { alive: true; currentBuild: string | null; staleBuild: boolean; buildError: string | null }>;
   removed: number;
   warnings: string[];
 }
@@ -64,24 +64,36 @@ function registryDir(): string {
  * FIX: hash the name and content of every .js file in the entry's folder, in name order. A
  *      script outside such a folder falls back to its own content.
  */
-export function buildHashOf(scriptPath: string): string | null {
+/** The build fingerprint, or why it could not be read. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a build
+ *  folder that cannot be read is not a missing script; `servers` said "script missing on disk" for
+ *  both and the stale-build check skipped the server in silence (2026-09-29, E2E_REVIEW C6-5). */
+export function buildHashOrError(scriptPath: string): { hash: string; error: null } | { hash: null; error: string } {
   try {
-    const dir = dirname(scriptPath);
-    const files = readdirSync(dir).filter((f) => f.endsWith(".js")).sort();
-    if (!files.includes(basename(scriptPath))) {
-      return createHash("sha256").update(readFileSync(scriptPath)).digest("hex").slice(0, 12);
-    }
-    const signature = files.map((f) => { const s = statSync(join(dir, f)); return `${f}:${s.size}:${s.mtimeMs}`; }).join("|");
-    const cached = buildHashCache.get(dir);
-    if (cached && cached.signature === signature) return cached.hash;
-    const h = createHash("sha256");
-    for (const f of files) h.update(f).update("\0").update(readFileSync(join(dir, f))).update("\0");
-    const hash = h.digest("hex").slice(0, 12);
-    buildHashCache.set(dir, { signature, hash });
-    return hash;
-  } catch {
-    return null;
+    return { hash: buildHashUnsafe(scriptPath), error: null };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return { hash: null, error: e.code === "ENOENT" ? "script missing on disk" : e.message };
   }
+}
+
+export function buildHashOf(scriptPath: string): string | null {
+  return buildHashOrError(scriptPath).hash;
+}
+
+function buildHashUnsafe(scriptPath: string): string {
+  const dir = dirname(scriptPath);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".js")).sort();
+  if (!files.includes(basename(scriptPath))) {
+    return createHash("sha256").update(readFileSync(scriptPath)).digest("hex").slice(0, 12);
+  }
+  const signature = files.map((f) => { const s = statSync(join(dir, f)); return `${f}:${s.size}:${s.mtimeMs}`; }).join("|");
+  const cached = buildHashCache.get(dir);
+  if (cached && cached.signature === signature) return cached.hash;
+  const h = createHash("sha256");
+  for (const f of files) h.update(f).update("\0").update(readFileSync(join(dir, f))).update("\0");
+  const hash = h.digest("hex").slice(0, 12);
+  buildHashCache.set(dir, { signature, hash });
+  return hash;
 }
 const buildHashCache = new Map<string, { signature: string; hash: string }>();
 
@@ -240,9 +252,11 @@ export function listServers(): ServerReport {
   for (const { path, rec } of records) {
     // [LOCK] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS]
     if (!recordIsLive(rec)) { try { unlinkSync(path); } catch { /* */ } report.removed++; continue; }
-    const currentBuild = buildHashOf(rec.script);
+    const b = buildHashOrError(rec.script);
+    const currentBuild = b.hash;
     const staleBuild = currentBuild !== null && rec.build !== "unknown" && currentBuild !== rec.build;
-    report.servers.push({ ...rec, alive: true, currentBuild, staleBuild });
+    report.servers.push({ ...rec, alive: true, currentBuild, staleBuild, buildError: b.error });
+    if (b.error && b.error !== "script missing on disk") report.warnings.push(`pid ${rec.pid}: its build on disk cannot be read (${b.error}); the stale-build check does not cover it`);
   }
   report.servers.sort((a, b) => a.started.localeCompare(b.started));
   const stale = report.servers.filter((s) => s.staleBuild);
@@ -299,7 +313,7 @@ export function formatServers(report: ServerReport, home: string = homedir(), op
   let cpuTotal = 0, rssTotal = 0;
   for (const s of report.servers) {
     const t = s.started.slice(11, 19) + "Z";
-    const flag = s.staleBuild ? `STALE BUILD (disk ${s.currentBuild})` : s.currentBuild === null ? "script missing on disk" : "current";
+    const flag = s.staleBuild ? `STALE BUILD (disk ${s.currentBuild})` : s.currentBuild === null ? `build unknown (${s.buildError ?? "script missing on disk"})` : "current";
     const role = (s.role ? `  ${s.role.padEnd(7)} corpus ${s.corpus ?? "?"}` : "") + (s.daemon ? "  launchd agent" : "") + (s.eventPort ? `  holds :${s.eventPort}` : "");
     let cost = "";
     if (opts.cost) {

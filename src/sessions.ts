@@ -97,13 +97,16 @@ export function loadSession(name: string): Session | null {
 /**
  * List all saved sessions.
  */
-export function listSessions(): Array<{ name: string; entries: number; created: string; updated: string }> {
+/** One row of the session list; `error` is set when the file could not be read or parsed. */
+export interface SessionListEntry { name: string; entries: number; created: string; updated: string; error?: string }
+
+export function listSessions(): SessionListEntry[] {
   ensureDir();
 
   try {
     return readdirSync(SESSIONS_DIR)
       .filter((f) => f.endsWith(".json"))
-      .map((f) => {
+      .map((f): SessionListEntry => {
         try {
           const session: Session = JSON.parse(
             readFileSync(join(SESSIONS_DIR, f), "utf-8")
@@ -114,12 +117,14 @@ export function listSessions(): Array<{ name: string; entries: number; created: 
             created: session.created,
             updated: session.updated,
           };
-        } catch {
-          return null;
+        } catch (err) {
+          // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a session file that cannot be read is listed by its
+          // file name with the error, never dropped as if it had never been saved (2026-09-29, C6-5).
+          return { name: f.slice(0, -5), entries: 0, created: "", updated: "", error: err instanceof Error ? err.message : String(err) };
         }
-      })
-      .filter(Boolean) as Array<{ name: string; entries: number; created: string; updated: string }>;
-  } catch {
+      });
+  } catch (err) {
+    console.error(`[ContextEngine] sessions folder could not be read (${SESSIONS_DIR}): ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
 }
@@ -162,7 +167,7 @@ export function formatSession(session: Session): string {
 /**
  * Format session list for display.
  */
-export function formatSessionList(sessions: Array<{ name: string; entries: number; created: string; updated: string }>): string {
+export function formatSessionList(sessions: SessionListEntry[]): string {
   if (sessions.length === 0) {
     return "No saved sessions. Use `save_session` to create one.";
   }
@@ -173,6 +178,10 @@ export function formatSessionList(sessions: Array<{ name: string; entries: numbe
   lines.push("|---------|---------|---------|-------------|");
 
   for (const s of sessions) {
+    if (s.error) {
+      lines.push(`| ${s.name} | could not be read: ${s.error} | | |`);
+      continue;
+    }
     const created = s.created.split("T")[0];
     const updated = s.updated.split("T")[0];
     lines.push(`| ${s.name} | ${s.entries} | ${created} | ${updated} |`);

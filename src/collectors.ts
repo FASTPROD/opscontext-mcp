@@ -15,7 +15,13 @@ import type { Chunk } from "./ingest.js";
  *
  * Design principles:
  * - All collectors are **read-only** and **safe** — no writes, no side effects
- * - Failed commands produce empty arrays (never crash the server)
+ * - A collector never crashes the server: a source it cannot run or read yields no chunks AND a
+ *   call to `onFail(collector, reason)`, so the caller can count "N collector(s) failed (pm2: not
+ *   found)". [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] (src/agents.ts), widened here on 2026-09-29:
+ *   exec() returned "" on every failure, so collectPM2() gave the same [] with pm2 absent, failing
+ *   or empty, and a reader of the sources list was told "no PM2 processes" about a box with no pm2
+ *   (E2E_REVIEW_2026-09 C6-4). "Absent" stays silent (no .git, no package.json, no crontab for the
+ *   user); "could not" is reported.
  * - Sensitive values (.env passwords, tokens) are **redacted**
  * - Each collector operates on a project directory path
  */
@@ -24,18 +30,37 @@ import type { Chunk } from "./ingest.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Run a shell command, return stdout or empty string on failure */
-function exec(cmd: string, cwd?: string): string {
+/** What a collector reports when it could not run or read its source. */
+export type CollectorFailure = (collector: string, reason: string) => void;
+
+type Run = { ok: true; out: string } | { ok: false; error: string };
+
+/** Run a shell command: its trimmed stdout, or the first line of what it said on stderr. */
+function run(cmd: string, cwd?: string): Run {
   try {
-    return execSync(cmd, {
+    const out = execSync(cmd, {
       cwd,
       encoding: "utf-8",
       timeout: 10_000,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-  } catch {
-    return "";
+    return { ok: true, out };
+  } catch (err) {
+    const e = err as { stderr?: string | Buffer; message?: string };
+    const stderr = e.stderr ? String(e.stderr).trim().split("\n")[0] : "";
+    return { ok: false, error: stderr || e.message || "failed" };
   }
+}
+
+/** Run a shell command, return stdout or "" on failure: for decorations only (a branch name, a
+ *  diff stat). A source that stands or falls on the result uses run(). */
+function exec(cmd: string, cwd?: string): string {
+  const r = run(cmd, cwd);
+  return r.ok ? r.out : "";
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** The last `count` lines of a file, read without a shell, from at most its last 256 KB. */
@@ -55,9 +80,9 @@ export function readLastLines(path: string, count: number): string {
   }
 }
 
-/** Check if a command exists */
+/** Check if a command exists (cmd is a constant at every call site, CLAUDE.md rule 4) */
 function commandExists(cmd: string): boolean {
-  return exec(`command -v ${cmd}`) !== "";
+  return run(`command -v ${cmd}`).ok;
 }
 
 // [LOCKED] [ENV-MASK-IS-LINE-BOUND] - 2026-09-25
@@ -87,17 +112,21 @@ export function redactSensitive(content: string): string {
  * Produces chunks with commit messages, authors, dates — gives AI
  * context about recent changes and development velocity.
  */
-export function collectGitLog(projectDir: string, sourceName: string): Chunk[] {
+export function collectGitLog(projectDir: string, sourceName: string, onFail?: CollectorFailure): Chunk[] {
   if (!existsSync(join(projectDir, ".git"))) return [];
 
   // Recent 50 commits, one-line format with hash, date, author, message
-  const log = exec(
+  const log = run(
     `git --no-pager log --oneline --format="%h|%ai|%an|%s" -50`,
     projectDir
   );
-  if (!log) return [];
+  if (!log.ok) {
+    // a repository with no commit yet is a real empty; anything else (a .git git cannot read) is a failure
+    if (!/does not have any commits/i.test(log.error)) onFail?.("git", `${sourceName}: ${log.error}`);
+    return [];
+  }
 
-  const lines = log.split("\n").filter(Boolean);
+  const lines = log.out.split("\n").filter(Boolean);
   if (lines.length === 0) return [];
 
   // Current branch + remote info
@@ -155,7 +184,8 @@ export function collectGitLog(projectDir: string, sourceName: string): Chunk[] {
  */
 export function collectPackageJson(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const pkgPath = join(projectDir, "package.json");
   if (!existsSync(pkgPath)) return [];
@@ -224,7 +254,8 @@ export function collectPackageJson(
     }
 
     return chunks;
-  } catch {
+  } catch (err) {
+    onFail?.("package.json", `${sourceName}: ${errText(err)}`);
     return [];
   }
 }
@@ -238,7 +269,8 @@ export function collectPackageJson(
  */
 export function collectComposerJson(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const composerPath = join(projectDir, "composer.json");
   if (!existsSync(composerPath)) return [];
@@ -306,7 +338,8 @@ export function collectComposerJson(
     }
 
     return chunks;
-  } catch {
+  } catch (err) {
+    onFail?.("composer.json", `${sourceName}: ${errText(err)}`);
     return [];
   }
 }
@@ -321,7 +354,8 @@ export function collectComposerJson(
  */
 export function collectEnvFile(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const envPath = join(projectDir, ".env");
   if (!existsSync(envPath)) return [];
@@ -347,7 +381,8 @@ export function collectEnvFile(
         lineEnd: meaningful.split("\n").length,
       },
     ];
-  } catch {
+  } catch (err) {
+    onFail?.(".env", `${sourceName}: ${errText(err)}`);
     return [];
   }
 }
@@ -361,7 +396,7 @@ export function collectEnvFile(
  * Useful for understanding what the developer has been doing recently.
  * Passwords in history are redacted.
  */
-export function collectShellHistory(sourceName: string): Chunk[] {
+export function collectShellHistory(sourceName: string, onFail?: CollectorFailure): Chunk[] {
   const histFile = resolve(homedir(), ".zsh_history");
   if (!existsSync(histFile)) return [];
 
@@ -397,7 +432,8 @@ export function collectShellHistory(sourceName: string): Chunk[] {
         lineEnd: commands.length,
       },
     ];
-  } catch {
+  } catch (err) {
+    onFail?.("shell history", errText(err));
     return [];
   }
 }
@@ -409,17 +445,24 @@ export function collectShellHistory(sourceName: string): Chunk[] {
 /**
  * Collect Docker container info — what's running, ports, images.
  */
-export function collectDocker(sourceName: string): Chunk[] {
-  if (!commandExists("docker")) return [];
+export function collectDocker(sourceName: string, onFail?: CollectorFailure): Chunk[] {
+  if (!commandExists("docker")) {
+    onFail?.("docker", "not found");
+    return [];
+  }
 
   const chunks: Chunk[] = [];
 
   // Running containers
-  const ps = exec(
-    'docker ps --format "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}" 2>/dev/null'
+  const ps = run(
+    'docker ps --format "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"'
   );
-  if (ps) {
-    const formatted = ps
+  if (!ps.ok) {
+    onFail?.("docker", ps.error);
+    return [];
+  }
+  if (ps.out) {
+    const formatted = ps.out
       .split("\n")
       .filter(Boolean)
       .map((line) => {
@@ -437,9 +480,9 @@ export function collectDocker(sourceName: string): Chunk[] {
     });
   }
 
-  // Docker images
+  // Docker images (a decoration next to the container list, so exec() is fine here)
   const images = exec(
-    'docker images --format "{{.Repository}}:{{.Tag}} ({{.Size}})" 2>/dev/null | head -20'
+    'docker images --format "{{.Repository}}:{{.Tag}} ({{.Size}})" | head -20'
   );
   if (images) {
     chunks.push({
@@ -461,17 +504,30 @@ export function collectDocker(sourceName: string): Chunk[] {
 /**
  * Collect PM2 process list — what apps are running, ports, status.
  */
-export function collectPM2(sourceName: string): Chunk[] {
-  if (!commandExists("pm2")) return [];
+export function collectPM2(sourceName: string, onFail?: CollectorFailure): Chunk[] {
+  if (!commandExists("pm2")) {
+    onFail?.("pm2", "not found");
+    return [];
+  }
 
   // Use jlist for structured data
-  const raw = exec("pm2 jlist 2>/dev/null");
-  if (!raw) return [];
+  const raw = run("pm2 jlist");
+  if (!raw.ok) {
+    onFail?.("pm2", raw.error);
+    return [];
+  }
+  if (!raw.out) return [];
 
+  let processes: unknown;
   try {
-    const processes = JSON.parse(raw);
-    if (!Array.isArray(processes) || processes.length === 0) return [];
+    processes = JSON.parse(raw.out);
+  } catch {
+    onFail?.("pm2", "pm2 jlist printed something that is not JSON");
+    return [];
+  }
+  if (!Array.isArray(processes) || processes.length === 0) return [];
 
+  {
     const formatted = processes
       .map((p: any) => {
         const env = p.pm2_env || {};
@@ -495,8 +551,6 @@ export function collectPM2(sourceName: string): Chunk[] {
         lineEnd: processes.length,
       },
     ];
-  } catch {
-    return [];
   }
 }
 
@@ -508,7 +562,7 @@ export function collectPM2(sourceName: string): Chunk[] {
  * Collect Nginx site configurations — domains, roots, proxy settings.
  * Reads from common config locations.
  */
-export function collectNginx(sourceName: string): Chunk[] {
+export function collectNginx(sourceName: string, onFail?: CollectorFailure): Chunk[] {
   const configDirs = [
     "/etc/nginx/sites-enabled",
     "/etc/nginx/conf.d",
@@ -571,12 +625,12 @@ export function collectNginx(sourceName: string): Chunk[] {
               lineEnd: 1,
             });
           }
-        } catch {
-          // Permission denied — skip
+        } catch (err) {
+          onFail?.("nginx", `${filePath}: ${errText(err)}`);
         }
       }
-    } catch {
-      // Permission denied — skip
+    } catch (err) {
+      onFail?.("nginx", `${dir}: ${errText(err)}`);
     }
   }
 
@@ -590,12 +644,21 @@ export function collectNginx(sourceName: string): Chunk[] {
 /**
  * Collect crontab entries — scheduled tasks and maintenance jobs.
  */
-export function collectCrontab(sourceName: string): Chunk[] {
-  const cron = exec("crontab -l 2>/dev/null");
-  if (!cron) return [];
+export function collectCrontab(sourceName: string, onFail?: CollectorFailure): Chunk[] {
+  if (!commandExists("crontab")) {
+    onFail?.("crontab", "not found");
+    return [];
+  }
+  const cron = run("crontab -l");
+  if (!cron.ok) {
+    // "no crontab for <user>" is a real empty; a refusal or any other failure is reported
+    if (!/no crontab for/i.test(cron.error)) onFail?.("crontab", cron.error);
+    return [];
+  }
+  if (!cron.out) return [];
 
   // Filter out comments and empty lines for summary
-  const entries = cron
+  const entries = cron.out
     .split("\n")
     .filter((line) => line.trim() && !line.trim().startsWith("#"));
 
@@ -621,7 +684,8 @@ export function collectCrontab(sourceName: string): Chunk[] {
  */
 export function collectEcosystemConfig(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const configNames = ["ecosystem.config.js", "ecosystem.config.cjs"];
 
@@ -640,7 +704,8 @@ export function collectEcosystemConfig(
           lineEnd: content.split("\n").length,
         },
       ];
-    } catch {
+    } catch (err) {
+      onFail?.("ecosystem.config", `${sourceName}: ${errText(err)}`);
       continue;
     }
   }
@@ -657,7 +722,8 @@ export function collectEcosystemConfig(
  */
 export function collectDockerCompose(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const composeNames = [
     "docker-compose.yml",
@@ -684,8 +750,8 @@ export function collectDockerCompose(
         lineStart: 1,
         lineEnd: redacted.split("\n").length,
       });
-    } catch {
-      // Permission denied — skip
+    } catch (err) {
+      onFail?.(name, `${sourceName}: ${errText(err)}`);
     }
   }
 
@@ -702,16 +768,17 @@ export function collectDockerCompose(
  */
 export function collectProjectOps(
   projectDir: string,
-  sourceName: string
+  sourceName: string,
+  onFail?: CollectorFailure
 ): Chunk[] {
   const allChunks: Chunk[] = [];
 
-  allChunks.push(...collectGitLog(projectDir, sourceName));
-  allChunks.push(...collectPackageJson(projectDir, sourceName));
-  allChunks.push(...collectComposerJson(projectDir, sourceName));
-  allChunks.push(...collectEnvFile(projectDir, sourceName));
-  allChunks.push(...collectEcosystemConfig(projectDir, sourceName));
-  allChunks.push(...collectDockerCompose(projectDir, sourceName));
+  allChunks.push(...collectGitLog(projectDir, sourceName, onFail));
+  allChunks.push(...collectPackageJson(projectDir, sourceName, onFail));
+  allChunks.push(...collectComposerJson(projectDir, sourceName, onFail));
+  allChunks.push(...collectEnvFile(projectDir, sourceName, onFail));
+  allChunks.push(...collectEcosystemConfig(projectDir, sourceName, onFail));
+  allChunks.push(...collectDockerCompose(projectDir, sourceName, onFail));
 
   return allChunks;
 }
@@ -720,15 +787,15 @@ export function collectProjectOps(
  * Collect system-wide operational data (not project-specific).
  * These run once, not per-project.
  */
-export function collectSystemOps(): Chunk[] {
+export function collectSystemOps(onFail?: CollectorFailure): Chunk[] {
   const allChunks: Chunk[] = [];
   const sourceName = "System";
 
-  allChunks.push(...collectShellHistory(sourceName));
-  allChunks.push(...collectDocker(sourceName));
-  allChunks.push(...collectPM2(sourceName));
-  allChunks.push(...collectNginx(sourceName));
-  allChunks.push(...collectCrontab(sourceName));
+  allChunks.push(...collectShellHistory(sourceName, onFail));
+  allChunks.push(...collectDocker(sourceName, onFail));
+  allChunks.push(...collectPM2(sourceName, onFail));
+  allChunks.push(...collectNginx(sourceName, onFail));
+  allChunks.push(...collectCrontab(sourceName, onFail));
 
   return allChunks;
 }

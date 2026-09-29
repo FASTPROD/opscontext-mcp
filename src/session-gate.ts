@@ -31,7 +31,8 @@ export interface GateInput {
 
 export interface GateResult {
   block: boolean;
-  reason: "loop_guard" | "not_git" | "no_commits" | "fresh" | "stale";
+  /** `git_failed`: git could not answer for this repo; the gate passes and `message` says why. */
+  reason: "loop_guard" | "not_git" | "git_failed" | "no_commits" | "fresh" | "stale";
   sessionName: string;
   sessionTs: number;
   commitTs: number;
@@ -50,12 +51,26 @@ function mtime(p: string): number {
   try { return Math.floor(statSync(p).mtimeMs / 1000); } catch { return 0; }
 }
 
-function git(repo: string, args: string[]): string | null {
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] (src/agents.ts), widened to the Stop hook on 2026-09-29.
+// git() returned null for every failure, and evaluateSessionGate read null as "not a repository":
+// a .git at mode 000, a corrupt gitfile or a missing git made the gate exit 0 in silence, the turn
+// ended with the session unsaved, and nobody was told (E2E_REVIEW_2026-09 C6-1). git prints the
+// same "not a git repository" for an unreadable .git as for a plain folder (measured 2026-09-29),
+// so the gate looks for the .git entry itself: none there and git agrees = not a repository, pass
+// in silence; an entry there that git cannot read, or any other failure = `git_failed`, one line
+// on stderr, and still pass: a broken gate must never trap the user in a turn (cli.ts).
+type GitRun = { out: string; error: null } | { out: null; error: string };
+
+function git(repo: string, args: string[]): GitRun {
   try {
     // Hardcoded argv, no shell; the only variable parts are paths and a commit hash git itself printed.
-    return execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim();
-  } catch {
-    return null;
+    const out = execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }).trim();
+    return { out, error: null };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stderr?: string };
+    if (e.code === "ENOENT") return { out: null, error: "git could not start (ENOENT: git not installed, or the folder is gone)" };
+    const stderr = typeof e.stderr === "string" ? e.stderr.trim().split("\n")[0] : "";
+    return { out: null, error: stderr || (e.code ? String(e.code) : "") || e.message || "git failed" };
   }
 }
 
@@ -92,9 +107,9 @@ function docsBehind(repo: string): number | null {
   const ci = ".github/copilot-instructions.md";
   if (!existsSync(join(repo, ci))) return null;
   const last = git(repo, ["log", "-1", "--format=%H", "--", ci]);
-  if (!last) return null;
-  const n = git(repo, ["rev-list", "--count", `${last}..HEAD`, "--", "src"]);
-  return n === null ? null : Number(n) || 0;
+  if (last.error !== null || !last.out) return null;
+  const n = git(repo, ["rev-list", "--count", `${last.out}..HEAD`, "--", "src"]);
+  return n.error !== null ? null : Number(n.out) || 0;
 }
 
 function fmt(ts: number): string {
@@ -107,9 +122,21 @@ export function evaluateSessionGate(input: GateInput): GateResult {
   const sessionsDir = input.sessionsDir ?? join(process.env.CONTEXTENGINE_HOME || join(homedir(), ".contextengine"), "sessions");
   const base: Omit<GateResult, "block" | "reason" | "message"> = { sessionName: name, sessionTs: 0, commitTs: 0, docsBehind: null, sessionDoc: null };
   if (input.stopHookActive) return { ...base, block: false, reason: "loop_guard", message: "" };
-  if (!git(repo, ["rev-parse", "--git-dir"])) return { ...base, block: false, reason: "not_git", message: "" };
-  const commitRaw = git(repo, ["log", "-1", "--format=%ct"]);
-  const commitTs = commitRaw ? Number(commitRaw) || 0 : 0;
+  const couldNotCheck = (why: string): GateResult =>
+    ({ ...base, block: false, reason: "git_failed", message: `session gate could not check ${repo}: ${why}` });
+
+  const probe = git(repo, ["rev-parse", "--git-dir"]);
+  if (probe.error !== null) {
+    const saysNotARepo = /not a git repository/i.test(probe.error);
+    if (saysNotARepo && !existsSync(join(repo, ".git"))) return { ...base, block: false, reason: "not_git", message: "" };
+    return couldNotCheck(saysNotARepo ? `a .git entry is there but git cannot read it (${probe.error})` : probe.error);
+  }
+  const commit = git(repo, ["log", "-1", "--format=%ct"]);
+  if (commit.error !== null) {
+    if (/does not have any commits|bad default revision|unknown revision/i.test(commit.error)) return { ...base, block: false, reason: "no_commits", message: "" };
+    return couldNotCheck(commit.error);
+  }
+  const commitTs = Number(commit.out) || 0;
   if (commitTs === 0) return { ...base, block: false, reason: "no_commits", message: "" };
 
   let session: { name: string; ts: number };
@@ -155,7 +182,9 @@ export async function cliSessionGate(args: string[]): Promise<never> {
 Refuses to end a Claude Code turn (exit 2, reason on stderr) while the repo's CE session is
 older than the last commit. The repo is CLAUDE_PROJECT_DIR or the cwd; the session is the newest
 ~/.contextengine/sessions/*.json whose name starts with the repo's name. Passes (exit 0) when the
-session is newer, outside a git repo, before the first commit, or when stop_hook_active is set.`);
+session is newer, outside a git repo, before the first commit, or when stop_hook_active is set.
+When git cannot answer for the repo (a .git it cannot read, a corrupt gitfile, git missing), it
+passes too and says so in one line on stderr: a broken gate must never trap the turn.`);
     process.exit(0);
   }
   const payload = await readStdinJson();
@@ -165,5 +194,6 @@ session is newer, outside a git repo, before the first commit, or when stop_hook
     console.error(r.message);
     process.exit(2);
   }
+  if (r.reason === "git_failed") console.error(r.message); // seen, never a trap
   process.exit(0);
 }

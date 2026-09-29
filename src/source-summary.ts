@@ -16,24 +16,36 @@ import type { KnowledgeSource } from "./config.js";
 export const HEAD_BYTES = 4096;
 export const SUMMARY_MAX = 110;
 
-/** Read at most `bytes` from the start of a file. Empty string on any error. */
-export function readHead(path: string, bytes: number = HEAD_BYTES): string {
+export type Head = { text: string; error: null } | { text: null; error: string };
+
+/** Read at most `bytes` from the start of a file, or the error. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]:
+ *  "" for a file that could not be read gave the sources list no preview at all, the same as for an
+ *  empty file (2026-09-29, E2E_REVIEW_2026-09 C6-5). */
+export function readHeadOrError(path: string, bytes: number = HEAD_BYTES): Head {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
     const buf = Buffer.alloc(bytes);
     const n = readSync(fd, buf, 0, bytes, 0);
-    return buf.subarray(0, n).toString("utf-8");
-  } catch {
-    return "";
+    return { text: buf.subarray(0, n).toString("utf-8"), error: null };
+  } catch (err) {
+    return { text: null, error: err instanceof Error ? err.message : String(err) };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
 }
 
-/** Summary for a configured source; "" when the file is unreadable or says nothing. */
+/** Read at most `bytes` from the start of a file; null when it could not be read. */
+export function readHead(path: string, bytes: number = HEAD_BYTES): string | null {
+  return readHeadOrError(path, bytes).text;
+}
+
+/** Summary for a configured source: "" when the file says nothing or is not there (an absence, which
+ *  the sources list already shows), a "could not read" line when it is there but cannot be read. */
 export function summarizeSource(source: KnowledgeSource): string {
-  return summarizeText(readHead(source.path), source.type);
+  const head = readHeadOrError(source.path);
+  if (head.text === null) return /^ENOENT\b/.test(head.error) ? "" : `could not read this file: ${head.error}`;
+  return summarizeText(head.text, source.type);
 }
 
 export function summarizeText(text: string, type: "markdown" | "code"): string {

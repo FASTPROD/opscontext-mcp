@@ -4,6 +4,47 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.15.0] 2026-09-29: a check that cannot run says so
+
+Batch 2 of the end-to-end review (rows C6-1 to C6-7 and C1-3): eight places where a failure was read as
+"nothing there", each measured first with the real thing that fails, each with a test that fails on the code
+before it. The rule, LOCK `[EXEC-FAILURE-IS-NOT-EMPTY]`, now covers every read a check makes.
+
+- **The session gate says when it could not check.** A repository git cannot read (a `.git` at mode 000, a
+  corrupt gitfile, git missing) used to pass in silence, the same as a plain folder: the turn ended with the
+  session unsaved and nobody told. Now one line on stderr, "session gate could not check <repo>: <why>", and
+  the gate still passes: a broken gate must never trap a turn. git prints "not a git repository" for an
+  unreadable `.git` too, so the gate looks for the `.git` entry itself.
+- **The scorer marks what it could not read as unknown.** A `tests/` folder it could not list scored "1/8,
+  exists but empty"; a Dockerfile, a workflow or a `package.json` it could not read counted as a placeholder,
+  a stub or nothing. These now land in "Could Not Be Verified" with the error and 0 points against the same
+  100; a project folder it cannot list is one unknown worth the whole exam, grade "?".
+- **`drift_status` never says "All clear" about a log it could not read.** One `log_unreadable` warning
+  signal names the error instead; the watcher reports it once.
+- **The collectors say what could not run.** `collectPM2()` gave the same empty answer with pm2 absent,
+  failing or empty. Each collector now reports "pm2: not found", "docker: <what it said>", "package.json:
+  <parse error>", and the server prints "N collector(s) failed (...)" with its stats lines, the CLI once on
+  stderr; a real absence (no `.git`, no crontab for the user, no commit yet) stays silent.
+- **The Claude Code hook records MCP tool calls.** An MCP result is a list of content blocks; the hook's jq
+  failed on it and exited 0 with nothing sent, so no MCP call ever reached the audit log (0 of 93 in a day,
+  while every Bash call did). The jq now tolerates a list, a string or nothing, and the record carries
+  `input_chars`, the size of the whole tool input (no content). **Run `contextengine install-claude-hook`
+  once to replace the installed copy.** LOCK `[HOOK-TOLERATES-EVERY-RESULT-SHAPE]`.
+- **"Doubled hook events" was a false alarm.** Fleet health flagged parallel Edits of one file, recorded one
+  per call about 1 s apart, as a hook registered twice, because the record kept only the file path. The
+  comparison now includes `input_chars`, and the warning names the other reading (a hook older than this
+  release). LOCK `[DOUBLED-IS-THE-SAME-INPUT-TWICE]`.
+- **Twelve smaller sites, one line each.** The session list names a file it cannot parse instead of dropping
+  it; a failed daily backup of the learnings store is said and chained (`learning.backup_failed`) and fleet
+  health counts it; malformed bundled defaults are said; `end_session` lists a repository it could not check
+  as UNCHECKED and never says ALL CLEAR over it (`src/repo-status.ts`); fleet health reports a live log it
+  cannot read (`auditLog.readError`) instead of zero of everything; `agent_cost` names an unreadable
+  transcripts folder; `autostart-status` says "unknown" when lsof cannot run and the installer stops guessing
+  that the server "didn't bind"; `servers` says "build unknown (<error>)" for a build folder it cannot read;
+  a source preview says "could not read this file" (a missing file stays silent).
+- **The append refusal names the log it refused**, not a fixed `~/.contextengine/audit.log`: the torn-tail
+  tests used to print an alarm about the real log while refusing their scratch copy.
+
 ## [2.14.0] 2026-09-29: a diary that records what changed, a check that fits in memory
 
 - **The auto-import sweep writes one record per sweep, and one per source only when that source

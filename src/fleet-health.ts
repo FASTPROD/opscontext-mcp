@@ -47,13 +47,24 @@ export interface FleetHealth {
     /** Claude Code hook events (vscode.*) since local midnight. */
     hookEvents: number;
     /** Of those, records identical in event and payload to the previous hook event within
-     *  DOUBLED_WINDOW_MS: what a hook registered twice produces. */
+     *  DOUBLED_WINDOW_MS: what a hook registered twice produces.
+     *  [LOCKED] [DOUBLED-IS-THE-SAME-INPUT-TWICE] 2026-09-29
+     *  [NEVER] call two records doubled on the tool name and the file path alone.
+     *  WHY: on 2026-09-29 this counted 28 of 569 events and health said "a hook is registered twice
+     *       somewhere". Measured against the transcripts: 6 Edits on one file, 6 records, one per call.
+     *       Claude Code runs the hooks of parallel calls one after the other, about 1 s apart, and the
+     *       record kept only the file path, so distinct edits looked identical (E2E_REVIEW C6-6).
+     *  FIX: the hook records `input_chars`, the size of the whole tool input (no content), inside the
+     *       payload this comparison uses: two edits of one file differ, the same call recorded twice
+     *       does not. */
     doubledHookEvents: number;
     /** Pre-commit blocks (hook.block) since local midnight. */
     blocks: number;
     /** Store refusals (unreadable, shrink refused, growth refused) since local midnight. */
     refusals: number;
     learningsSaved: number;
+    /** learning.backup_failed records since local midnight: the daily copy of the store could not be written. */
+    backupFailures: number;
     /** Newest last: time, kind, one-line detail. */
     lastBlocks: Array<{ ts: string; kind: string; detail: string }>;
   };
@@ -72,7 +83,11 @@ export interface FleetHealth {
   } | null;
   /** Entries the audit log refused today (chained as audit.append_failed, or still pending), and
    *  records cut short today (audit.torn_tail). */
-  auditLog: { refusedToday: number; lastRefusal: string | null; tornToday: number; lastTornKept: string | null };
+  auditLog: {
+    refusedToday: number; lastRefusal: string | null; tornToday: number; lastTornKept: string | null;
+    /** Set when the live log is there but could not be read: every count above is then unknown, not zero. */
+    readError: string | null;
+  };
   /** The newest release for which verify-release passed on this machine, or null. */
   lastVerifiedRelease: string | null;
   /** Measured problems only. Empty means green. */
@@ -97,9 +112,11 @@ export function fleetHealthPath(): string {
   return join(ceHome(), "fleet-health.json");
 }
 
-/** The last `bytes` of a file as complete lines (the first partial line is dropped). */
-function tailLines(path: string, bytes: number): string[] {
-  if (!existsSync(path)) return [];
+/** The last `bytes` of a file as complete lines (the first partial line is dropped); `error` when the
+ *  file is there but could not be read. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: an unreadable log used to
+ *  count as zero events, blocks and refusals, and health stayed green (2026-09-29, C6-5). */
+function tailLines(path: string, bytes: number): { lines: string[]; error: string | null } {
+  if (!existsSync(path)) return { lines: [], error: null };
   let fd: number | null = null;
   try {
     fd = openSync(path, "r");
@@ -112,9 +129,9 @@ function tailLines(path: string, bytes: number): string[] {
       const nl = text.indexOf("\n");
       text = nl === -1 ? "" : text.slice(nl + 1);
     }
-    return text.split("\n").filter(Boolean);
-  } catch {
-    return [];
+    return { lines: text.split("\n").filter(Boolean), error: null };
+  } catch (err) {
+    return { lines: [], error: err instanceof Error ? err.message : String(err) };
   } finally {
     if (fd !== null) closeSync(fd);
   }
@@ -164,7 +181,8 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   const now = opts.now ?? new Date();
   const report = opts.report ?? listServers();
   const audit = opts.auditPath ?? join(ceHome(), "audit.log");
-  const records = parseRecords(tailLines(audit, TAIL_BYTES));
+  const tail = tailLines(audit, TAIL_BYTES);
+  const records = parseRecords(tail.lines);
   const midnight = localMidnight(now).getTime();
   const hourAgo = now.getTime() - 3_600_000;
 
@@ -172,7 +190,8 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   let lastHourWrites = 0, blocks = 0, refusals = 0, learningsSaved = 0, hookEvents = 0, doubledHookEvents = 0;
   const lastBlocks: FleetHealth["today"]["lastBlocks"] = [];
   let prevHook: { t: number; event: string; payload: string } | null = null;
-  let refusedToday = 0, tornToday = 0;
+  let refusedToday = 0, tornToday = 0, backupFailures = 0;
+  let lastBackupError: string | null = null;
   let lastRefusal: string | null = null, lastTornKept: string | null = null;
   for (const r of records) {
     const t = Date.parse(r.ts);
@@ -195,6 +214,7 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
       if (errs && Object.keys(errs).length > 0) lastRefusal = Object.keys(errs)[0];
     }
     if (r.event === "audit.torn_tail") { tornToday++; lastTornKept = String(r.payload?.kept ?? ""); }
+    if (r.event === "learning.backup_failed") { backupFailures++; lastBackupError = String(r.payload?.error ?? ""); }
     if (r.event === "hook.block") { blocks++; lastBlocks.push({ ts: r.ts, kind: "pre-commit", detail: blockDetail(r.payload) }); }
     else if (r.event === "learning.store_unreadable" || r.event === "learning.store_shrink_refused" || r.event === "learning.store_growth_refused") {
       refusals++;
@@ -223,8 +243,10 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     warnings.push(`agent lock on secrets files: MISSING (${secretsLock.missing} of ${secretsLock.total} deny rules absent from Claude Code's user settings): the agent can read the credentials and env files; run contextengine secrets-lock --apply in your own terminal`);
   }
   if (hookEvents >= DOUBLED_MIN_EVENTS && doubledHookEvents * 100 > hookEvents * DOUBLED_HOOK_EVENTS_WARN_PCT) {
-    warnings.push(`${doubledHookEvents} of ${hookEvents} Claude Code hook events today arrived twice within ${DOUBLED_WINDOW_MS / 1000} s: a hook is registered twice somewhere, run install-claude-hook`);
+    warnings.push(`${doubledHookEvents} of ${hookEvents} Claude Code hook events today arrived twice within ${DOUBLED_WINDOW_MS / 1000} s with the same input: a hook is registered twice somewhere, or the installed hook predates 2.15.0 (no input_chars); run install-claude-hook`);
   }
+  if (tail.error) warnings.push(`the live audit log could not be read (${tail.error}): today's counts are unknown, not zero`);
+  if (backupFailures > 0) warnings.push(`the daily learnings backup failed ${backupFailures} time(s) today${lastBackupError ? ` (${lastBackupError})` : ""}: the store has no fresh restore copy`);
   if (lastHourWrites > REINDEX_PER_HOUR_WARN) warnings.push(`${lastHourWrites} shared-index writes in the last hour (ceiling ${REINDEX_PER_HOUR_WARN}): something saves in a loop`);
   if (refusals > 0) warnings.push(`${refusals} learnings-store refusal(s) today: a write looked like a wipe or a runaway import`);
 
@@ -269,9 +291,9 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     reindex: { lastHourWrites, perCorpus, threshold: REINDEX_PER_HOUR_WARN },
     claudeHooks,
     secretsLock,
-    today: { hookEvents, doubledHookEvents, blocks, refusals, learningsSaved, lastBlocks: lastBlocks.slice(-3) },
+    today: { hookEvents, doubledHookEvents, blocks, refusals, learningsSaved, backupFailures, lastBlocks: lastBlocks.slice(-3) },
     chain,
-    auditLog: { refusedToday: refusedTotal, lastRefusal, tornToday, lastTornKept },
+    auditLog: { refusedToday: refusedTotal, lastRefusal, tornToday, lastTornKept, readError: tail.error },
     lastVerifiedRelease: lastVerifiedRelease(),
     warnings,
   };
@@ -292,7 +314,7 @@ export function formatFleetHealth(h: FleetHealth): string {
   lines.push(`health: ${h.warnings.length === 0 ? "green" : `${h.warnings.length} measured problem(s)`}  (v${h.version}, last verified release ${h.lastVerifiedRelease ?? "none"}, ${h.generatedAt.slice(11, 19)}Z)`);
   lines.push(`  servers ${h.servers.total}: ${h.servers.indexers} indexing, ${h.servers.readers} reading, ${h.servers.stale.length} on an old build`);
   lines.push(`  shared-index writes last hour: ${h.reindex.lastHourWrites} (ceiling ${h.reindex.threshold})`);
-  lines.push(`  today: ${h.today.blocks} block(s) prevented, ${h.today.refusals} store refusal(s), ${h.today.learningsSaved} learning(s) saved`);
+  lines.push(`  today: ${h.today.blocks} block(s) prevented, ${h.today.refusals} store refusal(s), ${h.today.learningsSaved} learning(s) saved${h.today.backupFailures ? `, ${h.today.backupFailures} backup failure(s)` : ""}`);
   lines.push(h.chain
     ? `  audit chain: ${h.chain.ok ? "verified" : "FAILED"} ${h.chain.ageHours} h ago, ${h.chain.unique} record(s)${h.chain.duplicates ? `, ${h.chain.duplicates} copies counted once` : ""}; ${h.auditLog?.refusedToday ?? 0} entr(ies) refused today`
     : `  audit chain: not checked on this machine yet (the indexing server runs a full check daily; or run contextengine audit-verify)`);

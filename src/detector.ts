@@ -35,7 +35,9 @@ export type DriftKind =
   | "stale_doc_signal"
   | "silent_failure"
   | "context_burn"
-  | "fanout_without_canary";
+  | "fanout_without_canary"
+  // The detector could not read the live log at all (2026-09-29). [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]
+  | "log_unreadable";
 
 export type Severity = "info" | "warn" | "critical";
 
@@ -61,24 +63,53 @@ export interface DetectorOptions {
 
 // ─── Window scan ───────────────────────────────────────────────────────────
 
-export function scanRecentEvents(
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] (src/agents.ts), widened to the detector on 2026-09-29.
+// scanRecentEvents() returned [] when the live log could not be read, the same answer as an empty
+// window, and drift_status said "All clear" about a window it never saw (E2E_REVIEW_2026-09 C6-3).
+// A log that cannot be read is a signal of its own (`log_unreadable`), never silence.
+export type RecentEvents = { events: AuditRecord[]; error: null } | { events: null; error: string };
+
+export function readRecentEvents(
   windowSeconds: number = 300,
   now: number = Date.now(),
-): AuditRecord[] {
+): RecentEvents {
   let all: AuditRecord[];
   try {
     // Live log only. The window is minutes; archived segments are days old by
     // construction (see [ROTATION-MUST-NOT-ORPHAN-THE-CHAIN], MIN_LIVE_RECORDS floor),
     // so reading them here would add the whole history to a hot path for zero hits.
     all = readAuditLog({ includeArchives: false });
-  } catch {
-    return [];
+  } catch (err) {
+    return { events: null, error: err instanceof Error ? err.message : String(err) };
   }
   const cutoff = now - windowSeconds * 1000;
-  return all.filter((r) => {
-    const ts = Date.parse(r.ts);
-    return Number.isFinite(ts) && ts >= cutoff;
-  });
+  return {
+    events: all.filter((r) => {
+      const ts = Date.parse(r.ts);
+      return Number.isFinite(ts) && ts >= cutoff;
+    }),
+    error: null,
+  };
+}
+
+/** The recent window, or null when the live log could not be read (readRecentEvents says why). */
+export function scanRecentEvents(
+  windowSeconds: number = 300,
+  now: number = Date.now(),
+): AuditRecord[] | null {
+  return readRecentEvents(windowSeconds, now).events;
+}
+
+/** What the detector reports when it could not see the window at all. */
+export function logUnreadableSignal(error: string, now: number = Date.now()): DriftSignal {
+  return {
+    kind: "log_unreadable",
+    severity: "warn",
+    reason: `the live log could not be read: ${error}`,
+    evidence: [],
+    payload: { error },
+    detectedAt: now,
+  };
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -356,8 +387,10 @@ export function runHeuristics(
 /** Convenience for callers: scan recent events and run heuristics in one call. */
 export function detect(opts: DetectorOptions = {}): DriftSignal[] {
   const now = opts.now ?? Date.now();
-  const events = opts.events ?? scanRecentEvents(opts.windowSeconds ?? 300, now);
-  return runHeuristics(events, { now, cwd: opts.cwd });
+  if (opts.events) return runHeuristics(opts.events, { now, cwd: opts.cwd });
+  const recent = readRecentEvents(opts.windowSeconds ?? 300, now);
+  if (recent.events === null) return [logUnreadableSignal(recent.error, now)];
+  return runHeuristics(recent.events, { now, cwd: opts.cwd });
 }
 
 // ─── Live watcher (CLI + MCP) ──────────────────────────────────────────────
@@ -404,8 +437,9 @@ export function watchAuditLog(
   }
 
   function tick() {
-    const events = scanRecentEvents(opts.windowSeconds ?? 300);
-    const signals = runHeuristics(events);
+    const recent = readRecentEvents(opts.windowSeconds ?? 300);
+    if (recent.events === null) { maybeFire(logUnreadableSignal(recent.error)); return; }
+    const signals = runHeuristics(recent.events);
     for (const s of signals) maybeFire(s);
   }
 

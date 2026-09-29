@@ -81,7 +81,26 @@ describe("readHead and summarizeSource", () => {
   });
 
   it("returns empty for a missing file instead of throwing", () => {
-    expect(readHead("/nonexistent/for/sure.md")).toBe("");
+    expect(readHead("/nonexistent/for/sure.md")).toBeNull();
     expect(summarizeSource({ name: "gone", path: "/nonexistent/for/sure.md", type: "markdown" })).toBe("");
+  });
+});
+
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] at the source preview. E2E_REVIEW_2026-09 C6-5: readHead() returned
+// "" for a file it could not read, and the sources list showed no preview at all, as for an empty file.
+import { chmodSync } from "fs";
+describe("a source file that cannot be read", () => {
+  const notRoot = (process.getuid?.() ?? 1) !== 0;
+  it.skipIf(!notRoot)("previews as 'could not read this file', not as nothing", () => {
+    const d = mkdtempSync(join(tmpdir(), "ce-summary-locked-"));
+    const p = join(d, "a.md");
+    writeFileSync(p, "# Title\n\nA body line.");
+    chmodSync(p, 0o000);
+    try {
+      expect(readHead(p)).toBeNull();
+      expect(summarizeSource({ name: "a", path: p, type: "markdown" } as never)).toMatch(/^could not read this file: EACCES/);
+    } finally {
+      chmodSync(p, 0o644);
+    }
   });
 });

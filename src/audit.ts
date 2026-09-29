@@ -198,6 +198,8 @@ export type AuditEvent =
   | "learning.store_unreadable"
   | "learning.store_shrink_refused"
   | "learning.store_growth_refused"
+  // The daily copy of the learnings store could not be written (2026-09-29). [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]
+  | "learning.backup_failed"
   | "server.start"
   // One indexer, many readers (2.6.0): which role a server took and each shared-index write
   | "server.role"
@@ -313,7 +315,7 @@ function readLastHash(): string {
     // Tail window held no complete record — fall back to the full read.
     return readLastHashFullScan();
   }
-  return parseHeadOrThrow(lines[lines.length - 1]);
+  return parseHeadOrThrow(lines[lines.length - 1], path);
 }
 
 /**
@@ -332,15 +334,18 @@ function readLastHash(): string {
  *      for good: it is set aside and noted on the chain first. [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED]
  *      This throw remains for a complete last line that is not a record, and for a log that holds
  *      no complete record at all; neither ever chains onto genesis.
+ * 2026-09-29: the message names the log it is about (`path`, which follows CONTEXTENGINE_HOME),
+ *      not a fixed ~/.contextengine/audit.log: the torn-tail tests printed it about their scratch
+ *      copy and it read as an alarm about the real log (E2E_REVIEW_2026-09 C6-7).
  */
-function parseHeadOrThrow(line: string): string {
+function parseHeadOrThrow(line: string, path: string): string {
   let rec: AuditRecord;
   try {
     rec = JSON.parse(line) as AuditRecord;
   } catch {
     throw new Error(
       "Audit log tail is not valid JSON, refusing to append onto an unknown head. " +
-        "The last line of ~/.contextengine/audit.log is complete but is not a record (a record cut " +
+        `The last line of ${path} is complete but is not a record (a record cut ` +
         "short is set aside automatically); inspect it, and 'contextengine audit-verify' says where it is.",
     );
   }
@@ -383,7 +388,7 @@ function readLastHashFullScan(): string {
   const lines = data.split("\n").filter(Boolean);
   if (lines.length === 0) return GENESIS_HASH;
   // [LOCK] [UNREADABLE-HEAD-IS-NOT-GENESIS] — same rule as the tail reader.
-  return parseHeadOrThrow(lines[lines.length - 1]);
+  return parseHeadOrThrow(lines[lines.length - 1], path);
 }
 
 function computeHash(

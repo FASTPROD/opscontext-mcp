@@ -337,3 +337,29 @@ describe("[DEFAULT-RATES-SHIP-WITH-THE-PACKAGE]", () => {
     expect(pricingStatus(c)).toBe("priced");
   });
 });
+
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] at the transcript walk. E2E_REVIEW_2026-09 C6-5: a transcripts
+// folder that could not be listed read as "no agent runs".
+import { chmodSync } from "fs";
+describe("a transcripts folder that cannot be read", () => {
+  const notRoot = (process.getuid?.() ?? 1) !== 0;
+  it.skipIf(!notRoot)("is named to the caller instead of counting as no runs", () => {
+    const root = mkdtempSync(join(tmpdir(), "ce-transcripts-locked-"));
+    mkdirSync(join(root, "-Users-x-proj"));
+    chmodSync(root, 0o000);
+    const unreadable: string[] = [];
+    try {
+      expect(collectRuns({ root, onUnreadable: (d, error) => { unreadable.push(`${d}: ${error}`); } })).toEqual([]);
+    } finally {
+      chmodSync(root, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(unreadable).toHaveLength(1);
+    expect(unreadable[0]).toMatch(/EACCES/);
+  });
+  it("a missing root, and a session with no workflows folder, are silent", () => {
+    const unreadable: string[] = [];
+    expect(collectRuns({ root: join(tmpdir(), "ce-no-such-root-4711"), onUnreadable: (d, e) => { unreadable.push(d + e); } })).toEqual([]);
+    expect(unreadable).toEqual([]);
+  });
+});

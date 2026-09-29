@@ -176,19 +176,27 @@ function userId(): number {
   return process.getuid?.() ?? 501;
 }
 
-function portIsOurs(): boolean {
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: "lsof found nothing" and "lsof could not run" are different
+// answers; the second used to read as "not listening", and the installer then waited 30 s to report a
+// server that "didn't bind" without ever having been able to look (2026-09-29, C6-5).
+/** true: something listens on PORT; false: nothing does; null: lsof could not tell (missing, or failed). */
+function portIsOurs(): boolean | null {
   try {
-    execFileSync("lsof", ["-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN"], { stdio: "ignore" });
+    execFileSync("lsof", ["-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN"], { stdio: ["ignore", "ignore", "pipe"] });
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { status?: number | null; stderr?: string | Buffer };
+    if (e.code === "ENOENT") return null; // lsof is not installed
+    const said = e.stderr ? String(e.stderr).trim() : "";
+    return e.status === 1 && !said ? false : null; // exit 1 with nothing said: no such listener
   }
 }
 
-function waitForPort(timeoutSec: number = 30): boolean {
+function waitForPort(timeoutSec: number = 30): boolean | null {
   const start = Date.now();
   while (Date.now() - start < timeoutSec * 1000) {
-    if (portIsOurs()) return true;
+    const up = portIsOurs();
+    if (up !== false) return up; // true, or null when lsof cannot tell
     execFileSync("sleep", ["1"]);
   }
   return false;
@@ -279,7 +287,7 @@ To view server logs:        tail -f ~/.contextengine/logs/mcp-stderr.log
 
   // Stop any currently-running unmanaged opscontext server on the port —
   // it would race with launchd for port 7842.
-  if (portIsOurs()) {
+  if (portIsOurs() === true) {
     console.log(`   detected existing process on :${PORT} — relying on launchctl bootout to clean it.`);
   }
 
@@ -307,7 +315,11 @@ To view server logs:        tail -f ~/.contextengine/logs/mcp-stderr.log
   }
 
   console.log(`   waiting for the server to bind port ${PORT}...`);
-  if (waitForPort(30)) {
+  const bound = waitForPort(30);
+  if (bound === null) {
+    console.error(`⚠️ Loaded, but this machine has no working lsof, so whether the server bound port ${PORT} could not be checked.`);
+    console.error(`   Check by hand: curl -s http://127.0.0.1:${PORT}/health | jq .`);
+  } else if (bound) {
     console.log(`✅ OpsContext is now running as a LaunchAgent (started at every login).`);
     console.log(``);
     console.log(`Verify:      curl -s http://127.0.0.1:${PORT}/health | jq .`);
@@ -394,9 +406,9 @@ running entrypoint.`);
   console.log(`─────────────────────────────`);
   console.log(`  plist:       ${plistExists ? "✅ " + PLIST_FILE : "❌ not installed (run: opscontext install-autostart)"}`);
   console.log(`  launchctl:   ${launchctlState}`);
-  console.log(`  port ${PORT}:   ${portUp ? "✅ listening" : "❌ not listening"}`);
+  console.log(`  port ${PORT}:   ${portUp === true ? "✅ listening" : portUp === false ? "❌ not listening" : "❔ unknown (lsof is not available here)"}`);
 
-  if (portUp) {
+  if (portUp === true) {
     try {
       const health = execFileSync("curl", ["-sf", `http://127.0.0.1:${PORT}/health`], { encoding: "utf-8", timeout: 2000 });
       console.log(`  health:      ${health.trim()}`);

@@ -45,27 +45,36 @@ case "$EVENT_KIND" in
     }' 2>/dev/null)
     ;;
   PostToolUse)
+    # [LOCKED] [HOOK-TOLERATES-EVERY-RESULT-SHAPE] - 2026-09-29
+    # [NEVER] index .tool_response or .tool_input as if it were always an object.
+    # WHY: Claude Code hands a Bash result as an object, an MCP result as a LIST of content
+    #      blocks, and some results as a plain string. `.tool_response.is_error` on a list is a
+    #      jq error, the script exited 0 with nothing sent, and no MCP tool call ever reached the
+    #      audit log: 0 of 93 in one day, while every Bash call did (E2E_REVIEW_2026-09 C1-3).
+    # FIX: `objects` keeps only the object case and `//` supplies the default for every other
+    #      shape, so each call yields a record; only an object can carry is_error, error or
+    #      interrupt. tests/claude-code-hook.test.ts drives the real script on each shape.
+    #      input_chars is the size of the whole tool input, no content: it tells two Edits of one file
+    #      apart in fleet health ([DOUBLED-IS-THE-SAME-INPUT-TWICE], src/fleet-health.ts).
     PAYLOAD=$(printf '%s' "$INPUT" | jq -c --arg ts "$NOW" '{
       v: 1, ts: $ts, event: "vscode.tool_call", actor: "claude-code",
       payload: ({
         surface: "claude-code",
         tool: (.tool_name // ""),
+        input_chars: ((.tool_input // "") | tostring | length),
         args_preview: (
-          (.tool_input.command
-            // .tool_input.file_path
-            // .tool_input.pattern
-            // (.tool_input | tostring)
-            // ""
+          ((.tool_input | objects | (.command // .file_path // .pattern // tostring))
+            // ((.tool_input // "") | tostring)
           )[:200]
         ),
         session: (.session_id // ""),
         cwd: (.cwd // "")
       } + (
-        if (.tool_response.is_error == true)
-            or ((.tool_response.error // "") != "")
-            or ((.tool_response.interrupt // false) == true)
-        then { error: ((.tool_response.error
-                        // (.tool_response.content | tostring)
+        if (((.tool_response | objects | .is_error) // false) == true)
+            or (((.tool_response | objects | .error) // "") != "")
+            or (((.tool_response | objects | .interrupt) // false) == true)
+        then { error: (((.tool_response | objects | .error)
+                        // ((.tool_response | objects | (.content // empty)) | tostring)
                         // "tool reported error")[:500]) }
         else {}
         end

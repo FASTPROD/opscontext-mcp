@@ -18,6 +18,7 @@ import {
   VectorSearchResult,
 } from "./embeddings.js";
 import { collectProjectOps, collectSystemOps } from "./collectors.js";
+import { repoStatus, type RepoStatus } from "./repo-status.js";
 import { loadEmbeddingStore, compactEmbeddingStore } from "./embedding-store.js";
 import {
   sharedIndexEnabled,
@@ -75,7 +76,7 @@ import {
 import { readFileSync, existsSync, watch, statSync, writeFileSync, mkdirSync } from "fs";
 import { basename, join, dirname } from "path";
 import { homedir } from "os";
-import { execSync, spawn } from "child_process";
+import { spawn } from "child_process";
 import { setPriority } from "os";
 import { scanCodeDir } from "./code-chunker.js";
 import { fileURLToPath } from "url";
@@ -160,10 +161,13 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
   const projectDirs = loadProjectDirs();
   activeProjectNames = projectDirs.map((d) => d.name);
   firewall.setProjectDirs(projectDirs);
+  // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a collector that could not run is counted here, never read as "nothing there".
+  const collectorFailures: string[] = [];
+  const onCollectorFailure = (collector: string, reason: string) => { collectorFailures.push(`${collector}: ${reason}`); };
   if (config.collectOps !== false) {
     let opsChunks = 0;
     for (const dir of projectDirs) {
-      const ops = collectProjectOps(dir.path, dir.name);
+      const ops = collectProjectOps(dir.path, dir.name, onCollectorFailure);
       chunks.push(...ops);
       opsChunks += ops.length;
     }
@@ -176,13 +180,16 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
 
   // Collect system-wide operational data
   if (config.collectSystemOps !== false) {
-    const sysOps = collectSystemOps();
+    const sysOps = collectSystemOps(onCollectorFailure);
     if (sysOps.length > 0) {
       chunks.push(...sysOps);
       console.error(
         `[ContextEngine] 🖥 Collected ${sysOps.length} system operational chunks`
       );
     }
+  }
+  if (collectorFailures.length > 0) {
+    console.error(`[ContextEngine] ⚠ ${collectorFailures.length} collector(s) failed (${collectorFailures.join("; ")})`);
   }
 
   // Scan code files if configured
@@ -1219,43 +1226,33 @@ server.tool(
     checks.push("## 1. Uncommitted Changes\n");
     const reposChecked = new Set<string>();
 
-    for (const dir of projectDirs) {
-      try {
-        // Find the git root for this project
-        const gitRoot = execSync("git rev-parse --show-toplevel", {
-          cwd: dir.path,
-          encoding: "utf-8",
-          timeout: 5000,
-        }).trim();
-
-        if (reposChecked.has(gitRoot)) continue;
-        reposChecked.add(gitRoot);
-
-        const status = execSync("git status --porcelain", {
-          cwd: gitRoot,
-          encoding: "utf-8",
-          timeout: 5000,
-        }).trim();
-
-        const repoName = basename(gitRoot);
-        if (status) {
-          const fileCount = status.split("\n").length;
-          checks.push(`- ❌ **FAIL** — \`${repoName}\` has ${fileCount} uncommitted file(s)`);
-          // Show first 5 files
-          const files = status.split("\n").slice(0, 5);
-          for (const f of files) {
-            checks.push(`  - \`${f.trim()}\``);
-          }
-          if (fileCount > 5) checks.push(`  - ... and ${fileCount - 5} more`);
-          failCount++;
-        } else {
-          checks.push(`- ✅ **PASS** — \`${repoName}\` is clean`);
-          passCount++;
-        }
-      } catch {
-        // Not a git repo or git not available
+    // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a repository git could not check is listed as UNCHECKED,
+    // neither clean nor dirty, and the summary is never ALL CLEAR over it (2026-09-29, C6-5).
+    let uncheckedCount = 0;
+    const report = (name: string, st: RepoStatus) => {
+      if (st.state === "not_git") return; // a plain folder: nothing to check
+      if (st.state === "failed") {
+        checks.push(`- ❔ **UNCHECKED** — \`${name}\` could not be checked: ${st.error}`);
+        uncheckedCount++;
+        return;
       }
-    }
+      if (reposChecked.has(st.root)) return;
+      reposChecked.add(st.root);
+      const repoName = basename(st.root);
+      if (st.state === "dirty") {
+        checks.push(`- ❌ **FAIL** — \`${repoName}\` has ${st.files.length} uncommitted file(s)`);
+        // Show first 5 files
+        for (const f of st.files.slice(0, 5)) {
+          checks.push(`  - \`${f.trim()}\``);
+        }
+        if (st.files.length > 5) checks.push(`  - ... and ${st.files.length - 5} more`);
+        failCount++;
+      } else {
+        checks.push(`- ✅ **PASS** — \`${repoName}\` is clean`);
+        passCount++;
+      }
+    };
+    for (const dir of projectDirs) report(dir.name, repoStatus(dir.path));
 
     // Also check common doc repos that might not be in projectDirs
     const extraRepoPaths = [
@@ -1263,34 +1260,7 @@ server.tool(
     ];
     for (const repoPath of extraRepoPaths) {
       if (!existsSync(repoPath) || reposChecked.has(repoPath)) continue;
-      try {
-        const gitRoot = execSync("git rev-parse --show-toplevel", {
-          cwd: repoPath,
-          encoding: "utf-8",
-          timeout: 5000,
-        }).trim();
-
-        if (reposChecked.has(gitRoot)) continue;
-        reposChecked.add(gitRoot);
-
-        const status = execSync("git status --porcelain", {
-          cwd: gitRoot,
-          encoding: "utf-8",
-          timeout: 5000,
-        }).trim();
-
-        const repoName = basename(gitRoot);
-        if (status) {
-          const fileCount = status.split("\n").length;
-          checks.push(`- ❌ **FAIL** — \`${repoName}\` has ${fileCount} uncommitted file(s)`);
-          failCount++;
-        } else {
-          checks.push(`- ✅ **PASS** — \`${repoName}\` is clean`);
-          passCount++;
-        }
-      } catch {
-        // Not a git repo
-      }
+      report(basename(repoPath), repoStatus(repoPath));
     }
 
     checks.push("");
@@ -1375,8 +1345,10 @@ server.tool(
 
     // --- Summary ---
     checks.push("## Summary\n");
-    const total = passCount + failCount;
-    if (failCount === 0) {
+    const total = passCount + failCount + uncheckedCount;
+    if (failCount === 0 && uncheckedCount > 0) {
+      checks.push(`❔ **${uncheckedCount} check(s) could not run** — ${passCount}/${total} passed, nothing failed, but not every repo was seen (see UNCHECKED above).`);
+    } else if (failCount === 0) {
       checks.push(`✅ **ALL CLEAR** — ${passCount}/${total} checks passed. Safe to end session.`);
     } else {
       checks.push(`⚠️ **${failCount} item(s) need attention** — ${passCount}/${total} passed.`);
@@ -1724,7 +1696,7 @@ async function main() {
   registerResources();
 
   // 2b. Auto-inject recent session context into search index
-  const recentSessions = listSessions();
+  const recentSessions = listSessions().filter((s) => !s.error); // an unreadable file is listed by list_sessions, never injected
   if (recentSessions.length > 0) {
     // Sort by updated desc, take the most recent
     recentSessions.sort((a, b) => new Date(b.updated).getTime() - new Date(a.updated).getTime());

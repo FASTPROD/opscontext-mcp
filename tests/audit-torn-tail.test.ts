@@ -110,3 +110,17 @@ describe("a refused append is counted and put on the chain", () => {
     expect(verifyChain().ok).toBe(true);
   });
 });
+
+// [LOCK] [UNREADABLE-HEAD-IS-NOT-GENESIS]: the refusal names the log it is about. E2E_REVIEW_2026-09
+// C6-7: the message said ~/.contextengine/audit.log whatever the home was, so these very tests printed
+// an alarm about the real log while refusing their scratch copy.
+describe("a complete last line that is not a record", () => {
+  it("is refused with the real path of the log, never a fixed ~/.contextengine", () => {
+    seed(2);
+    appendFileSync(log(), "this is a complete line but not a record\n");
+    let message = "";
+    try { appendAudit("learning.save", { id: "after" }); } catch (e) { message = (e as Error).message; }
+    expect(message).toContain(`The last line of ${log()} is complete but is not a record`);
+    expect(message).not.toContain("~/.contextengine");
+  });
+});

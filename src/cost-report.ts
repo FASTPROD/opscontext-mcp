@@ -99,15 +99,21 @@ export function buildCostReport(opts: CostReportOptions = {}, cwd: string = proc
 
   const { t, source } = loadCostThresholds(cwd);
 
+  // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a transcripts folder that could not be read is said, never "no runs".
+  const unreadable: string[] = [];
   const runs = collectRuns({
     session: opts.session,
     project: opts.project,
     run: opts.run,
     since,
+    onUnreadable: (dir, error) => { unreadable.push(`${dir}: ${error}`); },
   });
 
+  if (unreadable.length) {
+    line(`${unreadable.length} transcript folder(s) could not be read (${unreadable[0]}${unreadable.length > 1 ? `, and ${unreadable.length - 1} more` : ""}): the numbers below miss them`);
+  }
   if (!runs.length) {
-    line("No multi-agent runs found in " + transcriptRoot());
+    line((unreadable.length ? "No multi-agent runs could be read in " : "No multi-agent runs found in ") + transcriptRoot());
     line("(fan-outs only: parent sessions are not counted — this measures delegation)");
     return { text: out.join("\n"), json: null, runs: 0 };
   }

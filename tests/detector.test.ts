@@ -145,3 +145,44 @@ describe("detector — integration", () => {
     }
   });
 });
+
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] at the detector. E2E_REVIEW_2026-09 C6-3: a live log at mode 000
+// gave the same "no signals" as an empty window, and drift_status said "All clear".
+import { beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { scanRecentEvents } from "../src/detector.js";
+
+describe("a live log the detector cannot read", () => {
+  const notRoot = (process.getuid?.() ?? 1) !== 0;
+  let home: string;
+  let prev: string | undefined;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "ce-detector-log-"));
+    prev = process.env.CONTEXTENGINE_HOME;
+    process.env.CONTEXTENGINE_HOME = home;
+  });
+  afterEach(() => {
+    try { chmodSync(join(home, "audit.log"), 0o644); } catch { /* not created */ }
+    if (prev === undefined) delete process.env.CONTEXTENGINE_HOME; else process.env.CONTEXTENGINE_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  });
+  const record = () => JSON.stringify({ v: 1, ts: new Date().toISOString(), event: "session.save", actor: "t", payload: {}, prev_hash: "0", hash: "0" });
+
+  it("a readable window is a list, and one quiet record raises no signal", () => {
+    writeFileSync(join(home, "audit.log"), record() + "\n");
+    expect(scanRecentEvents(300)).toHaveLength(1);
+    expect(detect({ windowSeconds: 300 })).toEqual([]);
+  });
+
+  it.skipIf(!notRoot)("is a warn signal that names the error, never 'no signals'", () => {
+    writeFileSync(join(home, "audit.log"), record() + "\n");
+    chmodSync(join(home, "audit.log"), 0o000);
+    expect(scanRecentEvents(300)).toBeNull();
+    const signals = detect({ windowSeconds: 300 });
+    expect(signals).toHaveLength(1);
+    expect(signals[0].kind).toBe("log_unreadable");
+    expect(signals[0].severity).toBe("warn");
+    expect(signals[0].reason).toMatch(/^the live log could not be read: EACCES/);
+  });
+});

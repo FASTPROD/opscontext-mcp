@@ -417,20 +417,28 @@ export function isReported(s: AgentStatus): boolean {
 
 // ─── Discovery ─────────────────────────────────────────────────────────────
 
-function safeDirs(dir: string): string[] {
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY]: a transcripts folder that cannot be listed used to read as "no
+// agent runs"; the caller is told which folder and why. A folder that is not there stays silent
+// (2026-09-29, E2E_REVIEW_2026-09 C6-5).
+type OnUnreadable = ((dir: string, error: string) => void) | undefined;
+const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+function safeDirs(dir: string, onUnreadable?: OnUnreadable): string[] {
+  if (!existsSync(dir)) return [];
   try {
     return readdirSync(dir).filter((e) => {
       try { return statSync(join(dir, e)).isDirectory(); } catch { return false; }
     });
-  } catch { return []; }
+  } catch (err) { onUnreadable?.(dir, errText(err)); return []; }
 }
 
-function safeFiles(dir: string, prefix: string): string[] {
+function safeFiles(dir: string, prefix: string, onUnreadable?: OnUnreadable): string[] {
+  if (!existsSync(dir)) return [];
   try {
     return readdirSync(dir)
       .filter((e) => e.startsWith(prefix) && e.endsWith(".jsonl"))
       .map((e) => join(dir, e));
-  } catch { return []; }
+  } catch (err) { onUnreadable?.(dir, errText(err)); return []; }
 }
 
 export interface CollectOptions {
@@ -443,6 +451,8 @@ export interface CollectOptions {
   /** Ignore runs that ended before this epoch-ms. */
   since?: number;
   root?: string;
+  /** Called for a folder under the transcript root that could not be listed (which one, and why). */
+  onUnreadable?: (dir: string, error: string) => void;
 }
 
 function finishRun(
@@ -478,24 +488,24 @@ export function collectRuns(opts: CollectOptions = {}): RunUsage[] {
   if (!existsSync(root)) return [];
   const runs: RunUsage[] = [];
 
-  for (const project of safeDirs(root)) {
+  for (const project of safeDirs(root, opts.onUnreadable)) {
     if (opts.project && !project.toLowerCase().includes(opts.project.toLowerCase())) continue;
     const projDir = join(root, project);
 
-    for (const sessionId of safeDirs(projDir)) {
+    for (const sessionId of safeDirs(projDir, opts.onUnreadable)) {
       if (opts.session && sessionId !== opts.session) continue;
       const subagents = join(projDir, sessionId, "subagents");
       if (!existsSync(subagents)) continue;
 
-      const loose = safeFiles(subagents, "agent-");
+      const loose = safeFiles(subagents, "agent-", opts.onUnreadable);
       if (loose.length && (!opts.run || opts.run === sessionId)) {
         runs.push(finishRun(sessionId, "agents", project, sessionId, loose.map(parseAgentTranscript)));
       }
 
       const wfRoot = join(subagents, "workflows");
-      for (const wf of safeDirs(wfRoot)) {
+      for (const wf of safeDirs(wfRoot, opts.onUnreadable)) {
         if (opts.run && wf !== opts.run) continue;
-        const files = safeFiles(join(wfRoot, wf), "agent-");
+        const files = safeFiles(join(wfRoot, wf), "agent-", opts.onUnreadable);
         if (!files.length) continue;
         runs.push(finishRun(wf, "workflow", project, sessionId, files.map(parseAgentTranscript)));
       }

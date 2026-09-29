@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, chmodSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { scoreProject, runScoreCanary } from "../src/agents.js";
@@ -432,5 +432,87 @@ describe("scoreProject — doc path resolution, continued", () => {
     expect(c.points).toBe(2);
     expect(c.status).toBe("partial");
     expect(c.detail).toContain("Symlink");
+  });
+});
+
+// [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY], widened to every read the scorer makes. E2E_REVIEW_2026-09 C6-2:
+// a tests/ folder at mode 000 scored "1/8 partial, exists but empty" and cost 4 points; a Dockerfile,
+// a workflow or a package.json the scorer could not read was skipped as if it were absent or a stub.
+describe("a folder or file the scorer cannot read is unknown, never empty, absent or a stub", () => {
+  const notRoot = (process.getuid?.() ?? 1) !== 0;
+  const unlock = (p: string) => { try { chmodSync(p, 0o755); } catch { /* already gone */ } };
+
+  it.skipIf(!notRoot)("tests/ at mode 000: the Tests check is unknown with the error, not 'exists but empty'", () => {
+    mkdirSync(join(tempRepo, "tests"));
+    writeFileSync(join(tempRepo, "tests", "a.test.ts"), "");
+    writeFileSync(join(tempRepo, "tests", "b.test.ts"), "");
+    const readable = scoreProject({ name: "fixture", path: tempRepo } as never);
+    const before = readable.checks.find(c => c.name === "Tests")!;
+    expect(before.status).toBe("partial");
+    expect(before.points).toBe(5);
+    chmodSync(join(tempRepo, "tests"), 0o000);
+    try {
+      const locked = scoreProject({ name: "fixture", path: tempRepo } as never);
+      const after = locked.checks.find(c => c.name === "Tests")!;
+      expect(after.status).toBe("unknown");
+      expect(after.points).toBe(0);
+      expect(after.detail).toMatch(/tests\/ could not be read \(EACCES/);
+      expect(after.detail).not.toMatch(/empty/);
+      expect(locked.maxScore).toBe(100);
+      // an unknown check earns nothing, against the same 100: the report says why, the number does not lie
+      expect(locked.score).toBe(readable.score - 5);
+    } finally {
+      unlock(join(tempRepo, "tests"));
+    }
+  });
+
+  it.skipIf(!notRoot)("a Dockerfile it cannot read: Docker is unknown, not a placeholder", () => {
+    writeFileSync(join(tempRepo, "Dockerfile"), "FROM node\nRUN npm ci\nCMD node .\n");
+    chmodSync(join(tempRepo, "Dockerfile"), 0o000);
+    try {
+      const c = check("Docker", tempRepo);
+      expect(c.status).toBe("unknown");
+      expect(c.points).toBe(0);
+      expect(c.detail).toMatch(/Dockerfile.*EACCES/);
+    } finally {
+      unlock(join(tempRepo, "Dockerfile"));
+    }
+  });
+
+  it.skipIf(!notRoot)("workflows it cannot read: CI/CD is unknown, not 'may be stubs'", () => {
+    mkdirSync(join(tempRepo, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(tempRepo, ".github", "workflows", "ci.yml"), "jobs:\n  t:\n    steps:\n      - run: npm test\n");
+    chmodSync(join(tempRepo, ".github", "workflows"), 0o000);
+    try {
+      const c = check("CI/CD", tempRepo);
+      expect(c.status).toBe("unknown");
+      expect(c.points).toBe(0);
+      expect(c.detail).toMatch(/workflows.*EACCES/);
+    } finally {
+      unlock(join(tempRepo, ".github", "workflows"));
+    }
+  });
+
+  it("a package.json that is not JSON: npm scripts is unknown, not silently absent", () => {
+    writeFileSync(join(tempRepo, "package.json"), "{ not json");
+    const c = check("npm scripts", tempRepo);
+    expect(c.status).toBe("unknown");
+    expect(c.points).toBe(0);
+    expect(c.detail).toMatch(/package\.json .*read or parsed/);
+  });
+
+  it.skipIf(!notRoot)("a project folder it cannot list is one unknown worth the whole exam, grade '?'", () => {
+    chmodSync(tempRepo, 0o000);
+    try {
+      const s = scoreProject({ name: "fixture", path: tempRepo } as never);
+      expect(s.checks).toHaveLength(1);
+      expect(s.checks[0].status).toBe("unknown");
+      expect(s.checks[0].maxPoints).toBe(100);
+      expect(s.checks[0].detail).toMatch(/could not be read \(EACCES/);
+      expect(s.maxScore).toBe(100);
+      expect(s.grade).toBe("?");
+    } finally {
+      unlock(tempRepo);
+    }
   });
 });
