@@ -47,9 +47,10 @@ import {
   formatSession,
   formatSessionList,
 } from "./sessions.js";
-import { verifyChain, readAuditLog, filterByRange, autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
+import { verifyChain, autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
 import { registerServer, listServers, formatServers, liveDaemonPid } from "./server-registry.js";
 import { secureCeHome } from "./ce-home.js";
+import { trimDaemonLog } from "./daemon-log.js";
 import { QUOTED_TEXT_NOTE } from "./framing.js";
 import { computeFleetHealth, writeFleetHealth } from "./fleet-health.js";
 import { startEventIngestServer } from "./http-server.js";
@@ -1111,11 +1112,8 @@ server.tool(
     until: z.string().optional().describe("ISO date — restrict counters to records on/before this timestamp"),
   },
   async ({ since, until }) => {
-    const report = verifyChain();
-    const records = (() => {
-      try { return readAuditLog(); } catch { return []; }
-    })();
-    const filtered = filterByRange(records, since, until);
+    // One streaming pass: the range count rides the verification. [LOCK] [VERIFY-STREAMS-THE-HISTORY]
+    const report = verifyChain(since || until ? { countRange: { since, until } } : {});
     const summary: string[] = [];
     summary.push(`Audit chain: ${report.ok ? "✅ INTACT" : "❌ BROKEN"}`);
     summary.push(`Total records: ${report.total}`);
@@ -1123,7 +1121,7 @@ server.tool(
       summary.push(`Redacted and acknowledged on the chain: ${report.redactedIndices!.length} record(s), not counted as altered`);
     }
     if (since || until) {
-      summary.push(`Range filter: ${since ?? "start"} → ${until ?? "now"}  (${filtered.length} record(s) in range)`);
+      summary.push(`Range filter: ${since ?? "start"} → ${until ?? "now"}  (${report.inRange ?? 0} record(s) in range)`);
     }
     if (!report.ok) {
       summary.push(`Break at index: ${report.breakAtIndex}`);
@@ -1673,6 +1671,16 @@ async function main() {
   // [LOCK] [CE-HOME-IS-PRIVATE]: the folder is 0700 before the registry, the index or the log write
   // into it.
   secureCeHome();
+  // The launchd agent keeps its own log readable: above 50 MB, the last 5 MB are kept as
+  // mcp-stderr.1.log and the open file is truncated in place. [LOCK] [DAEMON-LOG-TRIMS-ITSELF]
+  if (process.env.OPSCONTEXT_DAEMON === "1") {
+    const trim = trimDaemonLog();
+    if (trim.trimmed) {
+      console.error(
+        `[ContextEngine] 🧹 daemon log trimmed: ${(trim.bytes / 1048576).toFixed(0)} MB, the last ${((trim.kept ?? 0) / 1048576).toFixed(1)} MB kept as ${trim.keptTo}`
+      );
+    }
+  }
   // 0. Inventory this server FIRST, before indexing takes minutes: a server exists the moment it
   //    starts. [LOCK] [SERVERS-ARE-INVENTORIED]. With the shared index on, the registry is also
   //    the electorate: the record carries the corpus and the role. [LOCK] [ONE-INDEXER-MANY-READERS]

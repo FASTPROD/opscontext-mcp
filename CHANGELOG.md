@@ -4,6 +4,35 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.14.0] 2026-09-29: a diary that records what changed, a check that fits in memory
+
+- **The auto-import sweep writes one record per sweep, and one per source only when that source
+  imported, updated or failed.** Every sweep (each doc change, each server start: 41 a day on the
+  author's Mac) used to write one `learning.import` record per source, about 896, whatever it found:
+  3,743,405 of the 4,963,143 records in the history said "imported 0, updated 0", 75 % of the records
+  and 1.63 GB of the 2.06 GB (E2E review C3-1). A source whose size, mtime and trust list are as in
+  the last sweep of the process is not parsed again, and "updated" now means changed: a rule already
+  in the store, with the same context, is nothing, where it used to count as updated at every sweep.
+  New event `learning.sweep` (sources, scanned, unchanged, imported, updated, ignored, errors,
+  untrusted, ms). "imported" means created by this import: a rule already in the store under another
+  category (the category of an "other" rule is inferred) used to count as imported, 50 of them on the first
+  sweep of this build, none written. LOCK `[SWEEP-RECORDS-ONLY-WHAT-CHANGED]`.
+- **`audit-verify` streams the history instead of loading it.** The full check held every record in
+  memory: 2.9 GB of heap for 5 million records, in a scheduled child that runs with Node's default
+  4.1 GB ceiling, so it would have died of memory in about two months (E2E review C4-1). It now reads
+  the files once, 4 MB at a time, and keeps only the hashes (32 bytes each in a typed-array set): the
+  same report, field for field, at 147 MB. Lines are split on "\n" only, as the shipped reader does;
+  a readline-based draft also split on U+2028, which eight real records hold raw inside a prompt
+  text. The `audit_verify` tool counts a date range in the same pass instead of reading the history a
+  second time. LOCK `[VERIFY-STREAMS-THE-HISTORY]`.
+- **The launchd agent's log trims itself, and the index build prints one line instead of one per
+  file.** launchd never rotates the agent's standard error: on 2026-09-29 `~/.contextengine/logs/mcp-stderr.log`
+  was 266.8 MB and 2.18 million lines, 95 % of them the "Indexed: ..." line printed for each of 880
+  files at every build (E2E review C5-1). At daemon start, above 50 MB, the last 5 MB are kept as
+  `mcp-stderr.1.log` and the open file is truncated in place (launchd opens it for append, so writes
+  continue at the new end); only when standard error really is that file. `ingestSources()` now prints
+  "Total: N chunks from M of K sources" once. LOCK `[DAEMON-LOG-TRIMS-ITSELF]`.
+
 ## [2.13.0] 2026-09-29: the secrets lock
 
 - **`contextengine secrets-lock`: is the agent locked out of the secrets files?** On 2026-09-27 a

@@ -181,6 +181,7 @@ export function ingestSources(sources: KnowledgeSource[]): Chunk[] {
   const allChunks: Chunk[] = [];
   const seenHashes = new Set<string>();
   let dupCount = 0;
+  let indexed = 0;
 
   for (const source of sources) {
     if (!existsSync(source.path)) {
@@ -197,9 +198,9 @@ export function ingestSources(sources: KnowledgeSource[]): Chunk[] {
       if (chunk.contentHash) seenHashes.add(chunk.contentHash);
       allChunks.push(chunk);
     }
-    console.error(
-      `[ContextEngine] ✅ Indexed: ${source.name} (${chunks.length} chunks)`
-    );
+    // No line per source: one "Indexed:" line per file at every build filled the daemon log with
+    // 2 million lines for 880 files. [LOCK] [DAEMON-LOG-TRIMS-ITSELF] (src/daemon-log.ts)
+    indexed++;
   }
 
   if (dupCount > 0) {
@@ -209,7 +210,7 @@ export function ingestSources(sources: KnowledgeSource[]): Chunk[] {
   }
 
   console.error(
-    `[ContextEngine] 📦 Total: ${allChunks.length} chunks from ${sources.length} sources`
+    `[ContextEngine] 📦 Total: ${allChunks.length} chunks from ${indexed} of ${sources.length} sources`
   );
   return allChunks;
 }

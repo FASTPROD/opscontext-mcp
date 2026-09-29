@@ -70,6 +70,8 @@ import {
 import { basename, join } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
+import { StringDecoder } from "string_decoder";
+import { HashSet } from "./hash-set.js";
 
 const GENESIS_HASH = "0".repeat(64);
 
@@ -201,6 +203,9 @@ export type AuditEvent =
   | "server.role"
   | "index.write"
   | "learning.import"
+  // One record per auto-import sweep; a learning.import record only names a source that imported,
+  // updated or failed (added 2026-09-29). [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED] (src/learnings.ts)
+  | "learning.sweep"
   | "learning.export"
   | "session.save"
   | "session.delete"
@@ -1421,6 +1426,8 @@ export interface IntegrityReport {
   /** Records whose hash already appeared earlier in the history: a second copy of a record,
    *  counted once and never relinked. Not tampering, not a fork. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER] */
   duplicateIndices?: number[];
+  /** Records whose `ts` falls in the range asked for (`countRange`), counted in the same pass. */
+  inRange?: number;
   /** The acknowledgements that turned altered records into redacted ones: who said so, when, why.
    *  An acknowledgement is a statement by whoever ran it, so the verifier shows every one it used.
    *  [LOCK] [REDACTION-IS-A-CHAINED-RECORD] */
@@ -1462,99 +1469,198 @@ export interface IntegrityReport {
  *      every copy: 190,011 records "verified" for 120,011 real ones after an interrupted rotation
  *      (E2E_REVIEW_2026-09 B2-1, B2-2). A copy's content is still checked against its own hash.
  */
-export function verifyChain(): IntegrityReport {
-  let records: AuditRecord[];
-  const unreadable: UnreadableLine[] = [];
+export interface VerifyOptions {
+  /** Count, in the same pass, the records whose `ts` falls in the range (both ends inclusive, the
+   *  comparison filterByRange() makes); the count comes back as `inRange`. */
+  countRange?: { since?: string; until?: string };
+}
+
+/**
+ * Every line of one history file, split on "\n" only, read in 4 MB pieces. Yields the 1-based
+ * line number as `split("\n")` would count it and the text; empty lines are yielded too and the
+ * caller skips them, so numbering matches parseLines(). [LOCK] [VERIFY-STREAMS-THE-HISTORY]
+ */
+function* fileLines(path: string): Generator<[number, string]> {
+  const fd = openSync(path, "r");
   try {
-    records = readHistory(true, unreadable); // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]
-  } catch (e) {
-    return {
-      ok: false,
-      total: 0,
-      breakAtIndex: null,
-      breakReason: e instanceof Error ? e.message : String(e),
-    };
+    const decoder = new StringDecoder("utf8");
+    const buf = Buffer.allocUnsafe(4 << 20);
+    let rest = "";
+    let n = 0;
+    for (;;) {
+      const got = readSync(fd, buf, 0, buf.length, null);
+      if (got === 0) break;
+      const parts = (rest + decoder.write(buf.subarray(0, got))).split("\n");
+      rest = parts.pop() as string;
+      for (const line of parts) yield [++n, line];
+    }
+    rest += decoder.end();
+    yield [++n, rest];
+  } finally {
+    closeSync(fd);
   }
-  const tampered: number[] = [];
+}
+
+/**
+ * [LOCKED] [VERIFY-STREAMS-THE-HISTORY] - 2026-09-29
+ * [NEVER] load the whole history into an array to verify it, and [NEVER] split its lines with
+ *         readline or any splitter that breaks on more than "\n".
+ * WHY: verifyChain() read every record into memory: 2,902 MB of heap and 3,286 MB of RSS for the
+ *      5,014,345 records on the author's Mac (607 bytes a record), while the daily check runs in a
+ *      child with Node's default ceiling (4,144 MB under Node 20). At the observed growth it would
+ *      have died of memory in about two months, silently (E2E_REVIEW_2026-09 C4-1). A first
+ *      streaming draft used readline, which also breaks on U+2028: eight real records hold that
+ *      character raw inside a prompt text (JSON allows it), so that draft reported 20 unreadable
+ *      lines and 10 missing records.
+ * FIX: one pass over the files in chain order, lines split on "\n" exactly as parseLines() does,
+ *      every hash kept as 32 bytes in a HashSet (53 bytes a record all in), and only the records a
+ *      verdict needs kept as objects: unreadable lines, altered records, acknowledgements. The
+ *      report is field for field the one the in-memory pass produced (measured on the real
+ *      history: 11 of 11 fields identical). readAuditLog() still returns arrays for the callers
+ *      that need records.
+ */
+export function verifyChain(opts: VerifyOptions = {}): IntegrityReport {
+  const unreadable: UnreadableLine[] = [];
+  const tampered: Array<{ index: number; hash: string; contentHash: string }> = [];
   const orphans: number[] = [];
   const forks: number[] = [];
   const duplicates: number[] = [];
+  const acks = new Map<string, { contentHash: string; ackIndex: number }>();
+  const ackMeta = new Map<number, { ts: string; actor: string; reason: string }>();
+  const range = opts.countRange;
+  let inRange = 0;
+
+  const failed = (e: unknown): IntegrityReport => ({
+    ok: false,
+    total: 0,
+    breakAtIndex: null,
+    breakReason: e instanceof Error ? e.message : String(e),
+  });
+
+  let files: Array<{ path: string; label: string; live: boolean }>;
+  let expected = 1024;
+  try {
+    files = listSegments().map((f) => ({ path: join(archiveDir(), f), label: f, live: false }));
+    files.push({ path: auditPath(), label: "audit.log", live: true });
+    files = files.filter((f) => existsSync(f.path));
+    let bytes = 0;
+    for (const f of files) bytes += statSync(f.path).size;
+    expected = Math.ceil(bytes / 350);
+  } catch (e) {
+    return failed(e);
+  }
 
   // Every hash observed so far, so a fork (parent = a known earlier head) can be told
   // apart from an orphan (parent never existed in this log).
-  const seen = new Set<string>([GENESIS_HASH]);
+  const seen = new HashSet(expected);
+  seen.add(GENESIS_HASH);
   let prev = GENESIS_HASH;
+  let index = 0;
+  let lastSegmentHashes = new Set<string>();
 
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
+  try {
+    for (const f of files) {
+      const fileBase = index;
+      let parsedInFile = 0;
+      // Seam de-dup, as readHistory(): a crash after the segment was placed but before the live
+      // log was cut leaves the segment's records at the head of the live log; only that leading
+      // run is dropped. [LOCK] [ROTATE-ARCHIVE-BEFORE-TRUNCATE]
+      let skipping = f.live;
+      let start = 0;
+      const liveUnreadable: UnreadableLine[] = [];
+      const thisSegmentHashes = f.live ? null : new Set<string>();
+      for (const [lineNo, line] of fileLines(f.path)) {
+        if (!line) continue;
+        let r: AuditRecord;
+        try {
+          r = JSON.parse(line) as AuditRecord;
+        } catch {
+          // [LOCK] [VERIFY-READS-PAST-AN-UNREADABLE-LINE]
+          const u = { file: f.label, line: lineNo, beforeIndex: fileBase + parsedInFile };
+          unreadable.push(u);
+          if (f.live) liveUnreadable.push(u);
+          continue;
+        }
+        parsedInFile++;
+        if (thisSegmentHashes) thisSegmentHashes.add(r.hash);
+        if (skipping) {
+          if (lastSegmentHashes.has(r.hash)) {
+            start++;
+            continue;
+          }
+          skipping = false;
+        }
+        const i = index++;
+        if (range && inRangeTs(r.ts, range.since, range.until)) inRange++;
 
-    // 1. Content integrity — the only check that can prove tampering. Computed against
-    //    the record's OWN prev_hash, so a fork does not cascade into false tamper reports
-    //    for every record after it.
-    const expected = computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload);
-    if (r.hash !== expected) tampered.push(i);
+        // 1. Content integrity — the only check that can prove tampering. Computed against
+        //    the record's OWN prev_hash, so a fork does not cascade into false tamper reports
+        //    for every record after it.
+        const expectedHash = computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload);
+        const isTampered = r.hash !== expectedHash;
+        if (isTampered) tampered.push({ index: i, hash: r.hash, contentHash: expectedHash });
 
-    // 1b. A second copy of a record already in the history: counted once, never relinked, so
-    //     the record after a copied block still links to the original. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER]
-    if (seen.has(r.hash)) {
-      duplicates.push(i);
-      continue;
+        // Acknowledged redactions are resolved after the pass. [LOCK] [REDACTION-IS-A-CHAINED-RECORD]
+        //    An `audit.redact` record that is itself intact binds (original hash -> hash of the
+        //    redacted content). A tampered record matching such a binding is "redacted", not
+        //    "altered". Binding to the current content means a second edit after the
+        //    acknowledgement makes it tampered again.
+        if (r.event === "audit.redact") {
+          const payload = (r.payload ?? {}) as { reason?: unknown; redacted?: Array<{ hash?: unknown; content_hash?: unknown }> };
+          ackMeta.set(i, { ts: r.ts, actor: r.actor, reason: String(payload.reason ?? "") });
+          if (!isTampered && Array.isArray(payload.redacted)) {
+            for (const e of payload.redacted) {
+              if (typeof e.hash === "string" && typeof e.content_hash === "string") acks.set(e.hash, { contentHash: e.content_hash, ackIndex: i });
+            }
+          }
+        }
+
+        // 1b. A second copy of a record already in the history: counted once, never relinked, so
+        //     the record after a copied block still links to the original. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER]
+        if (seen.has(r.hash)) {
+          duplicates.push(i);
+          continue;
+        }
+
+        // 2. Linkage — fork vs orphan.
+        if (r.prev_hash !== prev) {
+          if (seen.has(r.prev_hash)) forks.push(i);
+          else orphans.push(i);
+        }
+
+        seen.add(r.hash);
+        prev = r.hash;
+      }
+      if (thisSegmentHashes) lastSegmentHashes = thisSegmentHashes;
+      if (f.live && start > 0) for (const u of liveUnreadable) u.beforeIndex = Math.max(fileBase, u.beforeIndex - start);
     }
-
-    // 2. Linkage — fork vs orphan.
-    if (r.prev_hash !== prev) {
-      if (seen.has(r.prev_hash)) forks.push(i);
-      else orphans.push(i);
-    }
-
-    seen.add(r.hash);
-    prev = r.hash;
+  } catch (e) {
+    return failed(e);
   }
 
-  // 3. Acknowledged redactions. [LOCK] [REDACTION-IS-A-CHAINED-RECORD]
-  //    An `audit.redact` record that is itself intact binds (original hash -> hash of the
-  //    redacted content). A tampered record matching such a binding is "redacted", not
-  //    "altered". Binding to the current content means a second edit after the acknowledgement
-  //    makes it tampered again.
-  const tamperedSet = new Set(tampered);
-  const acks = new Map<string, { contentHash: string; ackIndex: number }>();
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
-    if (r.event !== "audit.redact" || tamperedSet.has(i)) continue;
-    const list = (r.payload as { redacted?: Array<{ hash?: unknown; content_hash?: unknown }> }).redacted;
-    if (!Array.isArray(list)) continue;
-    for (const e of list) {
-      if (typeof e.hash === "string" && typeof e.content_hash === "string") acks.set(e.hash, { contentHash: e.content_hash, ackIndex: i });
-    }
-  }
+  // 3. Acknowledged redactions, resolved now that every acknowledgement has been read.
   const redacted: number[] = [];
   const stillTampered: number[] = [];
   const usedAcks = new Map<number, number>(); // ack record index -> records it covers here
-  for (const i of tampered) {
-    const r = records[i];
-    const bound = acks.get(r.hash);
-    if (bound && bound.contentHash === computeHash(r.prev_hash, r.ts, r.event, r.actor, r.payload)) {
-      redacted.push(i);
+  for (const t of tampered) {
+    const bound = acks.get(t.hash);
+    if (bound && bound.contentHash === t.contentHash) {
+      redacted.push(t.index);
       usedAcks.set(bound.ackIndex, (usedAcks.get(bound.ackIndex) ?? 0) + 1);
-    } else stillTampered.push(i);
+    } else stillTampered.push(t.index);
   }
-  const acknowledgements = [...usedAcks.entries()].sort((a, b) => a[0] - b[0]).map(([index, n]) => ({
-    index,
-    ts: records[index].ts,
-    actor: records[index].actor,
-    reason: String((records[index].payload as { reason?: unknown }).reason ?? ""),
-    records: n,
-  }));
-  tampered.length = 0;
-  tampered.push(...stillTampered);
+  const acknowledgements = [...usedAcks.entries()].sort((a, b) => a[0] - b[0]).map(([ackIndex, n]) => {
+    const meta = ackMeta.get(ackIndex)!;
+    return { index: ackIndex, ts: meta.ts, actor: meta.actor, reason: meta.reason, records: n };
+  });
 
-  const ok = tampered.length === 0 && orphans.length === 0 && unreadable.length === 0;
+  const ok = stillTampered.length === 0 && orphans.length === 0 && unreadable.length === 0;
   const firstProblem =
-    tampered.length > 0 ? tampered[0] : unreadable.length > 0 ? unreadable[0].beforeIndex : orphans.length > 0 ? orphans[0] : null;
+    stillTampered.length > 0 ? stillTampered[0] : unreadable.length > 0 ? unreadable[0].beforeIndex : orphans.length > 0 ? orphans[0] : null;
 
   let reason: string | null = null;
-  if (tampered.length > 0) {
-    reason = `${tampered.length} record(s) with altered content — first at index ${tampered[0]}`;
+  if (stillTampered.length > 0) {
+    reason = `${stillTampered.length} record(s) with altered content — first at index ${stillTampered[0]}`;
   } else if (unreadable.length > 0) {
     reason = `${unreadable.length} line(s) that are not records, first at ${unreadable[0].file} line ${unreadable[0].line}; every other record was checked, and the record after such a line cannot be linked`;
   } else if (orphans.length > 0) {
@@ -1563,17 +1669,24 @@ export function verifyChain(): IntegrityReport {
 
   return {
     ok,
-    total: records.length,
+    total: index,
     breakAtIndex: firstProblem,
     breakReason: reason,
-    tamperedIndices: tampered,
+    tamperedIndices: stillTampered,
     orphanIndices: orphans,
     forkIndices: forks,
     duplicateIndices: duplicates,
     acknowledgements,
     unreadable,
     redactedIndices: redacted,
+    ...(range ? { inRange } : {}),
   };
+}
+
+function inRangeTs(ts: string, since?: string, until?: string): boolean {
+  if (since && ts < since) return false;
+  if (until && ts > until) return false;
+  return true;
 }
 
 /**

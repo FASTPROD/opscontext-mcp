@@ -661,6 +661,9 @@ export interface ImportResult {
 export interface ImportOptions {
   /** Import every heading, bold bullet and table row as a rule, the pre-2026-09-05 behaviour. */
   permissive?: boolean;
+  /** Write the per-file learning.import record (default). The sweep passes false and writes its
+   *  own records. [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED] */
+  record?: boolean;
 }
 
 // [LOCKED] [AUTO-IMPORT-ONLY-MARKED-LEARNINGS] 2026-09-05
@@ -709,22 +712,25 @@ export function importLearningsFromFile(
   // Aggregate event correlating the individual learning.save records emitted
   // inside the loop. Useful for compliance attribution: "this batch came from
   // file X".
-  safeAppend("learning.import", {
-    source: filePath,
-    format: ext === "json" ? "json" : "markdown",
-    project: defaultProject,
-    imported: result.imported,
-    updated: result.updated,
-    skipped: result.skipped,
-    ignored: result.ignored,
-    errors: result.errors.length,
-  });
+  if (opts.record !== false) {
+    safeAppend("learning.import", {
+      source: filePath,
+      format: ext === "json" ? "json" : "markdown",
+      project: defaultProject,
+      imported: result.imported,
+      updated: result.updated,
+      skipped: result.skipped,
+      ignored: result.ignored,
+      errors: result.errors.length,
+    });
+  }
 
   return result;
 }
 
 function importFromJson(content: string, defaultProject?: string, source?: string): ImportResult {
   const result: ImportResult = { imported: 0, updated: 0, skipped: 0, ignored: 0, errors: [] };
+  const startedAt = Date.now();
 
   try {
     const data = JSON.parse(content);
@@ -745,17 +751,15 @@ function importFromJson(content: string, defaultProject?: string, source?: strin
         continue;
       }
       const cat = LEARNING_CATEGORIES.includes(item.category) ? item.category : "other";
-      const store = loadStore();
-      const existing = store.learnings.find(
-        (l) => l.category === cat && typeof l.rule === "string" && l.rule.toLowerCase().trim() === item.rule.toLowerCase().trim()
-      );
       try {
-        saveLearning(cat, item.rule, item.context || "", item.project || defaultProject, source);
-        if (existing) {
-          result.updated++;
-        } else {
-          result.imported++;
-        }
+        // "imported" means created by this call and "updated" means changed by it: the record
+        // saveLearning() returns says so through its created and updated instants. A lookup by the
+        // rule's own category cannot tell: saveLearning() infers the category of an "other" rule and
+        // finds it there (50 such rules counted as imported on one sweep, 0 written).
+        // [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED]
+        const saved = saveLearning(cat, item.rule, item.context || "", item.project || defaultProject, source);
+        if (Date.parse(saved.created) >= startedAt) result.imported++;
+        else if (Date.parse(saved.updated) >= startedAt) result.updated++;
       } catch {
         result.skipped++;
       }
@@ -774,6 +778,7 @@ function importFromMarkdown(
   opts: { permissive: boolean; source?: string } = { permissive: false },
 ): ImportResult {
   const result: ImportResult = { imported: 0, updated: 0, skipped: 0, ignored: 0, errors: [] };
+  const startedAt = Date.now();
   const lines = content.split("\n");
 
   let currentCategory = defaultCategory;
@@ -802,17 +807,12 @@ function importFromMarkdown(
     }
     const cat = normalizeCategory(currentCategory);
     const ctx = currentContext.join(" ").trim() || `Imported from file`;
-    const store = loadStore();
-    const existing = store.learnings.find(
-      (l) => l.category === cat && typeof l.rule === "string" && l.rule.toLowerCase().trim() === currentRule.toLowerCase().trim()
-    );
     try {
-      saveLearning(cat, currentRule, ctx, defaultProject, opts.source);
-      if (existing) {
-        result.updated++;
-      } else {
-        result.imported++;
-      }
+      // "imported" is created by this call, "updated" is changed by it, see importFromJson().
+      // [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED]
+      const saved = saveLearning(cat, currentRule, ctx, defaultProject, opts.source);
+      if (Date.parse(saved.created) >= startedAt) result.imported++;
+      else if (Date.parse(saved.updated) >= startedAt) result.updated++;
     } catch {
       result.skipped++;
     }
@@ -1167,6 +1167,42 @@ export function learningsToChunks(projects?: string[]): Chunk[] {
   }));
 }
 
+/** What the last sweep of this process saw of a source; unchanged, and under the same trust list, it is skipped. */
+const sweepMemo = new Map<string, { mtimeMs: number; size: number; trustKey: string }>();
+
+export interface SweepResult {
+  /** Sources that imported or updated at least one learning. */
+  total: number;
+  imported: number;
+  updated: number;
+  ignored: number;
+  refused?: string;
+  untrusted: string[];
+  /** Markdown sources that exist. */
+  sources: number;
+  /** Sources read and parsed in this sweep. */
+  scanned: number;
+  /** Sources skipped: size, mtime and trust list as in the last sweep of this process. */
+  unchanged: number;
+  errors: number;
+}
+
+// [LOCKED] [SWEEP-RECORDS-ONLY-WHAT-CHANGED] - 2026-09-29
+// [NEVER] write a learning.import record for a source that imported, updated or failed nothing,
+//         and [NEVER] parse a source again while its size, mtime and the trust list are as in the
+//         last sweep of this process.
+// WHY: every sweep (each doc change, each start: 41 a day on the author's Mac) wrote one record per
+//      source, about 896, whatever it found. Measured 2026-09-29 (E2E_REVIEW_2026-09 C3-1):
+//      3,743,405 of the 4,963,143 records in the history said imported 0, updated 0: 75 % of the
+//      records, 1.63 GB of the 2.06 GB, a rotation every 1.8 hours on busy days, and most of the
+//      memory the daily chain check needed. "updated" also counted a rule that was already there,
+//      so eleven files counted as updated at every sweep without changing.
+// FIX: one learning.sweep record per sweep (sources, scanned, unchanged, imported, updated, ignored,
+//      errors, untrusted, ms), a learning.import record only for a source that imported, updated or
+//      failed, and a per-process memo (size, mtime, trust list) so an unchanged source is not
+//      parsed again. A source that fails is not memoized, so it is tried again; a change of the
+//      trust list re-reads everything once; a new process reads everything once.
+
 /**
  * Auto-import learnings from discovered knowledge source files.
  *
@@ -1179,16 +1215,25 @@ export function learningsToChunks(projects?: string[]): Chunk[] {
  */
 export function autoImportFromSources(
   sources: Array<{ path: string; name: string }>,
-): { total: number; imported: number; updated: number; ignored: number; refused?: string; untrusted: string[] } {
+): SweepResult {
+  const t0 = Date.now();
   let totalImported = 0;
   let totalUpdated = 0;
   let totalIgnored = 0;
+  let totalSkipped = 0;
+  let totalErrors = 0;
   let processed = 0;
+  let seen = 0;
+  let scanned = 0;
+  let unchanged = 0;
   let refused: string | undefined;
   // [LOCK] [AUTO-IMPORT-ONLY-FROM-TRUSTED-PROJECTS] (src/trusted-projects.ts): seeded, the first
   // time, with every project that already has learnings in the store.
   const trusted = trustedProjects(() => [...new Set(loadStore().learnings.map((l) => l.project).filter((p): p is string => !!p))]);
+  const trustKey = [...trusted].sort().join("\n");
   const untrusted = new Set<string>();
+  const perSource: Array<Record<string, unknown>> = [];
+  const memoUpdates = new Map<string, { mtimeMs: number; size: number; trustKey: string }>();
 
   // One load and one save for the whole sweep (~880 files), instead of one full-file
   // rewrite per rule per file. [LOCK] [STORE-NEVER-STARTS-FRESH-OVER-DATA]
@@ -1197,7 +1242,20 @@ export function autoImportFromSources(
   for (const source of sources) {
     // Only process markdown files
     if (!source.path.endsWith(".md")) continue;
-    if (!existsSync(source.path)) continue;
+    let st: { mtimeMs: number; size: number; isFile(): boolean };
+    try {
+      st = statSync(source.path);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    seen++;
+    const memo = sweepMemo.get(source.path);
+    if (memo && memo.mtimeMs === st.mtimeMs && memo.size === st.size && memo.trustKey === trustKey) {
+      unchanged++;
+      continue;
+    }
+    scanned++;
 
     // Extract project name from source name (e.g., "ContextEngine — copilot-instructions.md")
     const project = source.name.split(" — ")[0]?.trim() || undefined;
@@ -1207,18 +1265,34 @@ export function autoImportFromSources(
     if (project && !trusted.has(project.toLowerCase())) {
       try {
         if (looksLikeMarkedLearnings(readFileSync(source.path, "utf-8"))) untrusted.add(project);
+        memoUpdates.set(source.path, { mtimeMs: st.mtimeMs, size: st.size, trustKey });
       } catch {
-        /* unreadable: nothing to import anyway */
+        /* unreadable: nothing to import anyway, and no memo, so it is tried again */
       }
       continue;
     }
 
     // Strict by construction: only marked learnings. [LOCK] [AUTO-IMPORT-ONLY-MARKED-LEARNINGS]
-    const result = importLearningsFromFile(source.path, "other", project);
+    const result = importLearningsFromFile(source.path, "other", project, { record: false });
     totalImported += result.imported;
     totalUpdated += result.updated;
     totalIgnored += result.ignored;
+    totalSkipped += result.skipped;
+    totalErrors += result.errors.length;
     if (result.imported > 0 || result.updated > 0) processed++;
+    if (result.imported > 0 || result.updated > 0 || result.errors.length > 0) {
+      perSource.push({
+        source: source.path,
+        format: "markdown",
+        project,
+        imported: result.imported,
+        updated: result.updated,
+        skipped: result.skipped,
+        ignored: result.ignored,
+        errors: result.errors.length,
+      });
+    }
+    if (result.errors.length === 0) memoUpdates.set(source.path, { mtimeMs: st.mtimeMs, size: st.size, trustKey });
   }
   });
   } catch (e: any) {
@@ -1228,9 +1302,39 @@ export function autoImportFromSources(
     totalImported = 0;
     totalUpdated = 0;
     processed = 0;
+    perSource.length = 0;
+    memoUpdates.clear();
   }
 
-  return { total: processed, imported: totalImported, updated: totalUpdated, ignored: totalIgnored, refused, untrusted: [...untrusted] };
+  for (const [path, memo] of memoUpdates) sweepMemo.set(path, memo);
+  // The records: per source only where something happened, then one for the sweep itself.
+  for (const rec of perSource) safeAppend("learning.import", rec);
+  safeAppend("learning.sweep", {
+    sources: seen,
+    scanned,
+    unchanged,
+    imported: totalImported,
+    updated: totalUpdated,
+    ignored: totalIgnored,
+    skipped: totalSkipped,
+    errors: totalErrors,
+    untrusted: untrusted.size,
+    ...(refused ? { refused } : {}),
+    ms: Date.now() - t0,
+  });
+
+  return {
+    total: processed,
+    imported: totalImported,
+    updated: totalUpdated,
+    ignored: totalIgnored,
+    refused,
+    untrusted: [...untrusted],
+    sources: seen,
+    scanned,
+    unchanged,
+    errors: totalErrors,
+  };
 }
 
 /**
