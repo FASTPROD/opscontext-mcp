@@ -8,3 +8,5 @@ import { tmpdir } from "node:os";
 const home = mkdtempSync(join(tmpdir(), "ce-test-home-"));
 process.env.HOME = home;
 process.env.CONTEXTENGINE_HOME = join(home, ".contextengine");
+// No managed Claude Code settings reach a fixture (secrets-lock reads that root-owned file by default).
+process.env.CONTEXTENGINE_MANAGED_SETTINGS = "";

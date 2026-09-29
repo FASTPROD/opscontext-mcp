@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import type { ProjectDirectory } from "./config.js";
 import { RUBRIC } from "./rubric.js";
+import { projectSecretsLock } from "./secrets-lock.js";
 
 // Read version from package.json at module load
 const __agents_dirname = dirname(fileURLToPath(import.meta.url));
@@ -1770,12 +1771,12 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   if (existsSync(gitignorePath)) {
     const gitignore = readFileSync(gitignorePath, "utf-8");
     if (gitignore.includes(".env")) {
-      checks.push({ name: ".env in .gitignore", category: "Security", points: 10, maxPoints: 10, status: "pass", detail: ".env is gitignored" });
+      checks.push({ name: ".env in .gitignore", category: "Security", points: 7, maxPoints: 7, status: "pass", detail: ".env is gitignored" });
     } else {
-      checks.push({ name: ".env in .gitignore", category: "Security", points: 0, maxPoints: 10, status: "fail", disqualifying: true, detail: ".env NOT in .gitignore — secrets at risk! Caps this project's grade at C" });
+      checks.push({ name: ".env in .gitignore", category: "Security", points: 0, maxPoints: 7, status: "fail", disqualifying: true, detail: ".env NOT in .gitignore — secrets at risk! Caps this project's grade at C" });
     }
   } else {
-    checks.push({ name: ".env in .gitignore", category: "Security", points: 0, maxPoints: 10, status: "fail", detail: "No .gitignore at all" });
+    checks.push({ name: ".env in .gitignore", category: "Security", points: 0, maxPoints: 7, status: "fail", detail: "No .gitignore at all" });
   }
 
   // No secrets in tracked files (6 pts)
@@ -1818,6 +1819,18 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
     } else {
       checks.push({ name: "Deps gitignored", category: "Security", points: 0, maxPoints: 5, status: "fail", detail: "node_modules/vendor not in .gitignore" });
     }
+  }
+
+  // Agent lock on secrets files (3 pts): does Claude Code itself deny the agent this project's
+  // credentials and env files? User or project scope counts; read from the settings files only
+  // ([LOCK] [SECRETS-LOCK-NEVER-READS-A-SECRET], src/secrets-lock.ts).
+  const lock = projectSecretsLock(p);
+  if (lock.present === lock.total) {
+    checks.push({ name: "Agent secrets lock", category: "Security", points: 3, maxPoints: 3, status: "pass", detail: `Claude Code denies the agent this project's secrets files (${lock.scopes.join(", ")} settings)` });
+  } else if (lock.present > 0) {
+    checks.push({ name: "Agent secrets lock", category: "Security", points: 1, maxPoints: 3, status: "partial", detail: `${lock.present} of ${lock.total} deny rules in place on this machine; run contextengine secrets-lock --apply in your own terminal` });
+  } else {
+    checks.push({ name: "Agent secrets lock", category: "Security", points: 0, maxPoints: 3, status: "fail", detail: "No Claude Code deny rule keeps the agent out of the credentials and env files on this machine; run contextengine secrets-lock --apply in your own terminal" });
   }
 
   // --- Calculate totals ---

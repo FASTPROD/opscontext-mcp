@@ -4,6 +4,38 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.13.0] 2026-09-29: the secrets lock
+
+- **`contextengine secrets-lock`: is the agent locked out of the secrets files?** On 2026-09-27 a
+  password reached a chat log without anyone printing it: the owner pasted it into a gitignored
+  credentials file while a chat that had opened the file was running, and the harness attached the
+  file's diff to his next message. Written rules cannot stop that; Claude Code's own `permissions.deny`
+  rules can. The check (default) reads the settings files Claude Code reads and prints one PASS / FAIL /
+  WARN line per item: the 28 deny rules (the credentials file in both spellings, env files by name,
+  `secrets/` folders, `*.p12`, and the self-lock on the agent's own settings, hooks, bin folder and MCP
+  list), the sandbox, the extra writable folders, and the installed Claude Code builds against the
+  documented minimums. It never opens a secrets file and prints no value from a settings file.
+  `--apply` installs the rules in user scope with a dated backup, keeps every existing entry, is
+  idempotent, and refuses to run inside an agent session: the owner runs it in his own terminal.
+  LOCKs `[SECRETS-LOCK-NEVER-READS-A-SECRET]`, `[SECRETS-LOCK-APPLY-IS-OWNER-RUN]`.
+- **Fleet health says whether the lock is in place.** `contextengine servers` and `end-session` print
+  "agent lock on secrets files: in place / MISSING", with a warning (the status bar turns) while it is
+  missing. `contextengine init` prints a hint.
+- **The score has a Security check for it**, "Agent secrets lock"; user or project scope counts. Its
+  weight came out of the `.env in .gitignore` check; the category weights are unchanged.
+- **What it does not stop, measured on fake files the same day:** commands the agent runs in Bash.
+  The Read, Edit and Write tools were refused on every fake file, the editor selection sent nothing,
+  and no "file changed on disk" note came; but `cat` on a file under `secrets/` printed it and a grep
+  of the folder read all three files. The help, the test card and the README say so, and only the
+  sandbox (reported as "part C") closes Bash. LOCK `[SECRETS-LOCK-CLAIMS-ARE-MEASURED]`.
+- **Env files are denied by name, not as `.env.*`:** `.env`, `.env.local`, `.env.*.local`,
+  `.env.production`, `.env.bak*`, `.env.backup*`. The broad glob also matched the `.env.example`
+  templates git keeps (28 on the author's Mac): the agent could not update one, and under the sandbox
+  git printed "Operation not permitted" for each. A `.env.*` rule already in your settings still
+  counts; the check says so and `--apply` adds the exact names beside it, for you to remove the broad
+  rule by hand. LOCK `[SECRETS-LOCK-ENV-BY-NAME]`.
+- Tests: 780 (27 new), `tests/secrets-lock.test.ts`.
+
 ## [2.12.0] 2026-09-27: phase B, second half (liveness, the learnings store, two decisions)
 
 ### Servers and locks

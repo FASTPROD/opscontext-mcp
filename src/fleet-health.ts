@@ -15,6 +15,7 @@ import { homedir } from "os";
 import { listServers, type ServerReport } from "./server-registry.js";
 import { readVerifyState, pendingRefusals } from "./audit.js";
 import { claudeHookRegistrations } from "./install-claude-hook.js";
+import { secretsLockHealth, type SecretsLockHealth } from "./secrets-lock.js";
 
 export interface FleetHealth {
   generatedAt: string;
@@ -39,6 +40,9 @@ export interface FleetHealth {
    *  installer counts them (paths expanded). null: no readable settings.json. A correct install
    *  has 1 for every event; the 2026-09-06 doubling would have shown 2 here within a minute. */
   claudeHooks: Record<string, number> | null;
+  /** Whether Claude Code's user (or managed) settings deny the agent the secrets files, read the
+   *  way `contextengine secrets-lock` reads them. null: no settings file on this machine. */
+  secretsLock: SecretsLockHealth | null;
   today: {
     /** Claude Code hook events (vscode.*) since local midnight. */
     hookEvents: number;
@@ -203,6 +207,7 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   const indexers = report.servers.filter((s) => s.role !== "reader").length;
 
   const claudeHooks = claudeHookRegistrations(opts.settingsPath);
+  const secretsLock = secretsLockHealth({ userSettingsPath: opts.settingsPath });
 
   const warnings: string[] = [];
   if (stale.length > 0) warnings.push(`${stale.length} server(s) on an old build (pid ${stale.map((s) => s.pid).join(", ")}): reload their windows`);
@@ -212,6 +217,10 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     const core = ["UserPromptSubmit", "PostToolUse", "SessionStart", "Stop"];
     const present = core.filter((ev) => (claudeHooks[ev] ?? 0) >= 1);
     if (present.length > 0 && present.length < core.length) warnings.push(`OpsContext hooks installed for ${present.join(", ")} but not ${core.filter((ev) => !present.includes(ev)).join(", ")}: run install-claude-hook`);
+  }
+  // [LOCK] [SECRETS-LOCK-NEVER-READS-A-SECRET]: read from the settings file only; red until every rule is there.
+  if (secretsLock && !secretsLock.inPlace) {
+    warnings.push(`agent lock on secrets files: MISSING (${secretsLock.missing} of ${secretsLock.total} deny rules absent from Claude Code's user settings): the agent can read the credentials and env files; run contextengine secrets-lock --apply in your own terminal`);
   }
   if (hookEvents >= DOUBLED_MIN_EVENTS && doubledHookEvents * 100 > hookEvents * DOUBLED_HOOK_EVENTS_WARN_PCT) {
     warnings.push(`${doubledHookEvents} of ${hookEvents} Claude Code hook events today arrived twice within ${DOUBLED_WINDOW_MS / 1000} s: a hook is registered twice somewhere, run install-claude-hook`);
@@ -259,6 +268,7 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     servers: { total: report.servers.length, indexers, readers: report.servers.length - indexers, stale, diskBuild },
     reindex: { lastHourWrites, perCorpus, threshold: REINDEX_PER_HOUR_WARN },
     claudeHooks,
+    secretsLock,
     today: { hookEvents, doubledHookEvents, blocks, refusals, learningsSaved, lastBlocks: lastBlocks.slice(-3) },
     chain,
     auditLog: { refusedToday: refusedTotal, lastRefusal, tornToday, lastTornKept },
@@ -287,6 +297,7 @@ export function formatFleetHealth(h: FleetHealth): string {
     ? `  audit chain: ${h.chain.ok ? "verified" : "FAILED"} ${h.chain.ageHours} h ago, ${h.chain.unique} record(s)${h.chain.duplicates ? `, ${h.chain.duplicates} copies counted once` : ""}; ${h.auditLog?.refusedToday ?? 0} entr(ies) refused today`
     : `  audit chain: not checked on this machine yet (the indexing server runs a full check daily; or run contextengine audit-verify)`);
   lines.push(`  claude code: ${h.today.hookEvents} hook event(s) today, ${h.today.doubledHookEvents} doubled; registrations ${h.claudeHooks ? Object.entries(h.claudeHooks).map(([ev, n]) => `${ev}=${n}`).join(" ") : "no settings.json"}`);
+  lines.push(`  agent lock on secrets files: ${h.secretsLock ? (h.secretsLock.inPlace ? "in place" : `MISSING (${h.secretsLock.missing} of ${h.secretsLock.total} rules)`) : "no Claude Code settings on this machine"}`);
   for (const b of h.today.lastBlocks) lines.push(`    ${b.ts.slice(11, 19)}Z ${b.kind}: ${b.detail}`);
   for (const w of h.warnings) lines.push(`  ⚠ ${w}`);
   return lines.join("\n");

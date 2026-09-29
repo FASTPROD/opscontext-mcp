@@ -174,6 +174,15 @@ Verify:
 npx @compr/opscontext-mcp watch --once       # → tails recent events; should show claude_code_* kinds after one prompt
 ```
 
+**3d. Lock the agent out of your secrets files**
+
+```bash
+opscontext secrets-lock            # check only: one PASS / FAIL line per item, writes nothing
+opscontext secrets-lock --apply    # in your own terminal, never from inside a chat
+```
+
+Outcome: Claude Code's own file tools (Read, Edit, Write) refuse the agent your credentials file, `.env` files, `secrets/` folders and `.p12` certificates, in every repo on the machine, and the agent cannot loosen its own settings. A secret you paste into one of those files while a chat is open no longer lands in the chat log. Commands the agent runs in Bash are not covered until Claude Code's sandbox is on: tested on fake files, a `cat` of a file under `secrets/` still printed it. The check reports the sandbox as "part C". `opscontext servers` and the project score say whether the lock is in place; the check also tells you whether the sandbox is on and whether your Claude Code builds are new enough.
+
 ### 4. Pin your config (recommended)
 
 If you have a `contextengine.json` with custom sources, add this to your shell profile (`~/.zshrc` or `~/.bashrc`):

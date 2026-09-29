@@ -3,6 +3,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { SECRETS_LOCK_RULES } from "./secrets-lock.js";
 
 let H: typeof import("./fleet-health.js");
 const home = () => process.env.CONTEXTENGINE_HOME as string;
@@ -67,7 +68,7 @@ describe("computeFleetHealth", () => {
     const HOME = process.env.HOME as string;
     const emit = `${HOME}/.claude/hooks/opscontext-emit.sh`;
     const hook = (command: string) => ({ type: "command", command, timeout: 5 });
-    writeFileSync(settings, JSON.stringify({ hooks: {
+    writeFileSync(settings, JSON.stringify({ permissions: { deny: [...SECRETS_LOCK_RULES] }, hooks: {
       UserPromptSubmit: [{ hooks: [hook(`$HOME/.claude/hooks/opscontext-emit.sh UserPromptSubmit`)] }, { hooks: [hook(`${emit} UserPromptSubmit`)] }],
       PostToolUse: [{ matcher: ".*", hooks: [hook(`${emit} PostToolUse`)] }, { matcher: "Edit|Write|MultiEdit", hooks: [hook(`${HOME}/.claude/hooks/opscontext-simplicity-gate.py`)] }],
       SessionStart: [{ hooks: [hook(`${emit} SessionStart`)] }],
@@ -81,7 +82,7 @@ describe("computeFleetHealth", () => {
     expect(H.formatFleetHealth(h)).toMatch(/registrations UserPromptSubmit=2 PostToolUse=1/);
 
     const partial = join(home(), "settings-partial.json");
-    writeFileSync(partial, JSON.stringify({ hooks: { Stop: [{ hooks: [hook(`${HOME}/.claude/hooks/opscontext-session-gate.sh`)] }] } }));
+    writeFileSync(partial, JSON.stringify({ permissions: { deny: [...SECRETS_LOCK_RULES] }, hooks: { Stop: [{ hooks: [hook(`${HOME}/.claude/hooks/opscontext-session-gate.sh`)] }] } }));
     const p = H.computeFleetHealth({ now, auditPath: missing, report: rep, settingsPath: partial });
     expect(p.warnings).toEqual([expect.stringMatching(/installed for Stop but not UserPromptSubmit, PostToolUse, SessionStart/)]);
 
@@ -90,7 +91,8 @@ describe("computeFleetHealth", () => {
     expect(none.warnings).toEqual([]);
     const empty = join(home(), "settings-empty.json");
     writeFileSync(empty, JSON.stringify({ model: "x" }));
-    expect(H.computeFleetHealth({ now, auditPath: missing, report: rep, settingsPath: empty }).warnings).toEqual([]); // not installed is not a problem
+    // hooks not installed is not a problem; a settings file without the secrets lock is (tests/secrets-lock.test.ts)
+    expect(H.computeFleetHealth({ now, auditPath: missing, report: rep, settingsPath: empty }).warnings).toEqual([expect.stringMatching(/^agent lock on secrets files: MISSING \(28 of 28 deny rules absent/)]);
   });
   it("counts today's Claude Code hook events and the ones that arrived twice, and warns above the share", () => {
     const audit = join(home(), "audit-doubled.log");

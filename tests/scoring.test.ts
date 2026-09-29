@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { scoreProject, runScoreCanary } from "../src/agents.js";
+import { SECRETS_FILE_RULES } from "../src/secrets-lock.js";
 
 let tempRepo: string;
 
@@ -276,6 +277,27 @@ describe("scoreProject — the 2026-08-14 rubric rework", () => {
     expect(byCat["Infrastructure"]).toBe(25);
     expect(byCat["Code Quality"]).toBe(20);
     expect(byCat["Security"]).toBe(30);
+  });
+
+  it("scores the agent lock on secrets files from the Claude Code settings this machine and this project hold", () => {
+    writeFileSync(join(tempRepo, ".gitignore"), ".env\nnode_modules\ndist\n", "utf-8");
+    const find = () => scoreProject({ name: "fixture", path: tempRepo } as never).checks.find(c => c.name === "Agent secrets lock")!;
+    const missing = find();
+    expect(missing.status).toBe("fail"); // the throwaway HOME of test-setup holds no Claude Code settings
+    expect(missing.maxPoints).toBe(3);
+    expect(missing.detail).toContain("secrets-lock --apply");
+
+    mkdirSync(join(tempRepo, ".claude"), { recursive: true });
+    writeFileSync(join(tempRepo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: SECRETS_FILE_RULES.slice(0, 6) } }), "utf-8");
+    const half = find();
+    expect(half.status).toBe("partial");
+    expect(half.detail).toContain("6 of 20");
+
+    writeFileSync(join(tempRepo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [...SECRETS_FILE_RULES] } }), "utf-8");
+    const locked = find();
+    expect(locked.status).toBe("pass");
+    expect(locked.points).toBe(3);
+    expect(locked.detail).toContain("project settings");
   });
 });
 

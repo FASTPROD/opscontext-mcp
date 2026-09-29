@@ -32,6 +32,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "audit-verify",
   "servers",
   "session-gate",
+  "secrets-lock",
   "autostart-status",
   "cost",
   "deactivate",

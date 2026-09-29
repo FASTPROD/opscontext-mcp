@@ -661,6 +661,12 @@ async function runInit(): Promise<void> {
       console.log("  💡 Next: run `opscontext init-extension-secret` to enable browser capture from Claude.ai and ChatGPT.");
       console.log("");
     }
+    // The agent lock on secrets files: a hint, never a gate ([LOCK] [SECRETS-LOCK-NEVER-READS-A-SECRET]).
+    const lock = secretsLockHealth();
+    if (!lock || !lock.inPlace) {
+      console.log(`  🔐 Agent lock on secrets files: ${lock ? `MISSING (${lock.missing} of ${lock.total} deny rules absent)` : "not set up on this machine"}. In your own terminal: contextengine secrets-lock --apply`);
+      console.log("");
+    }
   } finally {
     rl.close();
   }
@@ -772,6 +778,7 @@ import { QUOTED_TEXT_NOTE } from "./framing.js";
 import { trustProjects, untrustProjects, listTrusted } from "./trusted-projects.js";
 import { listServers, formatServers } from "./server-registry.js";
 import { computeFleetHealth, formatFleetHealth } from "./fleet-health.js";
+import { secretsLockHealth } from "./secrets-lock.js";
 import { ciStatusForHead, formatCiStatus } from "./ci-status.js";
 import {
   installSkill,
@@ -2911,6 +2918,8 @@ Usage:
                                        Install macOS LaunchAgent so MCP server auto-starts at login
                                        (uninstall-autostart / autostart-status — companion commands)
   contextengine install-claude-hook    Wire Claude Code terminal sessions into the OpsContext audit log, plus the Stop session gate
+  contextengine secrets-lock [--apply] Check (default, writes nothing) or install the Claude Code deny rules that keep the agent
+                                       out of the credentials and env files, secrets/ folders and *.p12; --apply is for your own terminal
   contextengine session-gate           Claude Code Stop hook body: exit 2 while the repo's CE session is older than HEAD
                                        (UserPromptSubmit + PostToolUse + SessionStart hook entries)
   contextengine watch [--json] [--severity info|warn|critical] [--once] [--window SECONDS]
@@ -3166,6 +3175,11 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
   import("./install-claude-hook.js").then((m) =>
     m.cliInstallClaudeHook(process.argv.slice(3)),
   ).catch((err) => {
+    console.error("Error:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+} else if (command === "secrets-lock") {
+  import("./secrets-lock.js").then((m) => m.cliSecretsLock(process.argv.slice(3))).catch((err) => {
     console.error("Error:", err instanceof Error ? err.message : err);
     process.exit(1);
   });
