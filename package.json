@@ -81,7 +81,7 @@
     "@huggingface/transformers": "^4.3.0"
   },
   "devDependencies": {
-    "@types/node": "^25.2.3",
+    "@types/node": "^26.6.3",
     "eslint": "^10.0.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.0",
