@@ -51,8 +51,8 @@ export interface ExtensionConfig {
   popupQueueCap: number;
 }
 
-// 🔒 LOCKED [CAPTURE-OPT-IN] — 2026-06-23
-// ⛔ NEVER flip captureClaudeAi or captureChatGptCom default to `true`.
+// [LOCKED] [CAPTURE-OPT-IN], 2026-06-23
+// [NEVER] flip captureClaudeAi or captureChatGptCom default to `true`.
 // WHY: Audit FRESH_USER_AUDIT_2026-06-23.md finding H1 (CWS deceptive-
 //   description + privacy surprise). The Web Store listing says "opt-in
 //   per-domain capture" — that promise requires both toggles default OFF.

@@ -289,8 +289,8 @@ export function loadProjectDirs(): ProjectDirectory[] {
   }
 
   /**
-   * 🔒 LOCKED [ENV-WORKSPACES-WINS] — 2026-08-16
-   * ⛔ NEVER demote CONTEXTENGINE_WORKSPACES back to a fallback that only applies when the
+   * [LOCKED] [ENV-WORKSPACES-WINS], 2026-08-16
+   * [NEVER] demote CONTEXTENGINE_WORKSPACES back to a fallback that only applies when the
    *    config file happens not to define `workspaces`.
    * WHY: it WAS such a fallback (`if (workspaceDirs.length === 0)`), so on any machine with a
    *      contextengine.json defining workspaces — which is the documented setup — the env var
@@ -360,8 +360,8 @@ export function looksLikePath(token: string): boolean {
 }
 
 /**
- * 🔒 LOCKED [SCORE-ACCEPTS-PATH] — 2026-08-16
- * ⛔ NEVER narrow this back to `dirs.find(d => d.name === token)` alone.
+ * [LOCKED] [SCORE-ACCEPTS-PATH], 2026-08-16
+ * [NEVER] narrow this back to `dirs.find(d => d.name === token)` alone.
  * WHY: `contextengine score /Users/yan/Projects/PLANK.io` failed with
  *      "Project not found: /Users/yan/Projects/PLANK.io" while listing PLANK.io
  *      among the available projects. A path is the natural first guess for a
@@ -374,8 +374,8 @@ export function looksLikePath(token: string): boolean {
  *      project, whether or not it sits under a configured workspace — that is what makes
  *      the tool usable outside `~/Projects`.
  *
- * 🔒 LOCKED [RESOLVE-PATH-MUST-BE-A-PROJECT] — 2026-08-16
- * ⛔ NEVER accept "it is a directory that exists" as proof that a path is a project, and
+ * [LOCKED] [RESOLVE-PATH-MUST-BE-A-PROJECT], 2026-08-16
+ * [NEVER] accept "it is a directory that exists" as proof that a path is a project, and
  *    NEVER let a bare name that missed the index fall through to path resolution.
  * WHY: the first cut did both, and an adversarial review reproduced three consequences.
  *      1. `cd ~/Projects && score .` wrote `~/Projects/SCORE.md` — "Projects: 27/100 (F),
@@ -434,8 +434,8 @@ export function resolveProjectDir(
 }
 
 /**
- * 🔒 LOCKED [SCORE-CWD-MUST-BE-A-PROJECT] — 2026-08-16
- * ⛔ NEVER fall back to returning `start` when no project marker is found. A directory
+ * [LOCKED] [SCORE-CWD-MUST-BE-A-PROJECT], 2026-08-16
+ * [NEVER] fall back to returning `start` when no project marker is found. A directory
  *    that is not a project must produce null, and the caller must refuse to score it.
  * WHY: the first cut of this returned `start` on failure, reasoning that "an un-versioned
  *      directory is still scoreable — it just scores badly." That is exactly the
@@ -449,8 +449,8 @@ export function resolveProjectDir(
  *      instead (cd into a project, name one, or --all). Found by an adversarial review
  *      agent that ran the real CLI from `/` and `~/Projects`.
  *
- * 🔒 LOCKED [GIT-ROOT-IS-THE-PROJECT-BOUNDARY] — 2026-08-16
- * ⛔ NEVER return the nearest `package.json` directory without first checking whether a
+ * [LOCKED] [GIT-ROOT-IS-THE-PROJECT-BOUNDARY], 2026-08-16
+ * [NEVER] return the nearest `package.json` directory without first checking whether a
  *    `.git` sits above it.
  * WHY: stopping at the nearest marker meant `cd ContextEngine/server && score` reported
  *      **"Scoring current project: server ... 32% (F) — Not a git repo, No CI pipeline,

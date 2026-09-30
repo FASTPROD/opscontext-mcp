@@ -1,9 +1,9 @@
-// 🔒 LOCKED [AUDIT-CHAIN] — 2026-06-10
-// ⛔ NEVER change the canonical serialization in computeHash() — key order,
+// [LOCKED] [AUDIT-CHAIN], 2026-06-10
+// [NEVER] change the canonical serialization in computeHash(), key order,
 //    field names, JSON.stringify behavior, or genesis hash value. Any change
 //    breaks verification of every audit log written by an older client.
-// ⛔ NEVER swap SHA-256 for a different hash without a migration path.
-// ⛔ NEVER catch errors inside appendAudit() — silent failures defeat the
+// [NEVER] swap SHA-256 for a different hash without a migration path.
+// [NEVER] catch errors inside appendAudit(), silent failures defeat the
 //    entire compliance story. Use safeAppend() at call sites if you need
 //    failure isolation; appendAudit() must surface problems loudly.
 // WHY: This is the bedrock for evidence aligned with SOC 2 CC7.2 (change
@@ -19,13 +19,13 @@
 //    (add a "v":2 field) and keep verifyChain() backward-compatible by
 //    dispatching on the v field. Don't mutate the v=1 contract.
 //
-// 🔒 LOCKED [AUDIT-001-WRITE-RACE-FIX] — 2026-06-24
-// ⛔ NEVER remove the file-lock acquisition in appendAudit(). The chain
+// [LOCKED] [AUDIT-001-WRITE-RACE-FIX], 2026-06-24
+// [NEVER] remove the file-lock acquisition in appendAudit(). The chain
 //    was broken at index 2826 (Sessions 11-13) by concurrent writers
 //    (activation server + main MCP) reading the same prev_hash before
 //    either had flushed. The lock serializes the read-then-write
 //    window across processes.
-// ⛔ NEVER reintroduce an in-process head cache. STRENGTHENED 2026-08-17:
+// [NEVER] reintroduce an in-process head cache. STRENGTHENED 2026-08-17:
 //    the cache is GONE, not merely guarded. See [AUDIT-HEAD-FROM-DISK].
 // WHY: audit-001-write-race documented in Session 11 SCORE.md. The
 //    in-process chain cache was a perf optimization, NOT a correctness
@@ -105,7 +105,6 @@ function acquireLockSync(): () => void {
       // O_EXCL fails atomically if the file already exists.
       const fd = openSync(
         path,
-        // eslint-disable-next-line no-bitwise
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
         0o600,
       );
@@ -268,8 +267,8 @@ function ensureDir(): void {
 }
 
 /**
- * 🔒 LOCKED [AUDIT-TAIL-READ-IS-O1] — 2026-08-17
- * ⛔ NEVER go back to readFileSync(whole log) + split("\n") to find the head.
+ * [LOCKED] [AUDIT-TAIL-READ-IS-O1], 2026-08-17
+ * [NEVER] go back to readFileSync(whole log) + split("\n") to find the head.
  * WHY: this ran INSIDE the append lock, so its cost was lock hold time. On the author's
  *      319k-record / 120 MB log it measured **215 ms per append**, and it grows without
  *      bound. `acquireLockSync` force-breaks any lock older than STALE_LOCK_MS (10 s) to
@@ -319,8 +318,8 @@ function readLastHash(): string {
 }
 
 /**
- * 🔒 LOCKED [UNREADABLE-HEAD-IS-NOT-GENESIS] — 2026-08-20
- * ⛔ NEVER return GENESIS_HASH because the last line failed to parse.
+ * [LOCKED] [UNREADABLE-HEAD-IS-NOT-GENESIS], 2026-08-20
+ * [NEVER] return GENESIS_HASH because the last line failed to parse.
  * WHY: both head readers ended in `catch { return GENESIS_HASH }`. A truncated or corrupt
  *      final record — a partial write, a full disk, a killed process — therefore made the
  *      next append chain onto genesis instead of onto the real head. verifyChain() reports
@@ -404,11 +403,6 @@ function computeHash(
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-let cachedLastHash: string | null = null;
-/** File size at our last successful write. If statSync(path).size differs
- *  on the next call, another process wrote in between → invalidate cache. */
-let cachedSize = 0;
-
 export function appendAudit(
   event: AuditEvent,
   payload: Record<string, unknown>,
@@ -456,8 +450,8 @@ function settleTail(path: string): void {
 }
 
 function writeRecord(path: string, event: AuditEvent, payload: Record<string, unknown>, actor: string): AuditRecord {
-  // 🔒 LOCKED [AUDIT-HEAD-FROM-DISK] — 2026-08-17
-  // ⛔ NEVER derive the head hash from an in-process cache again.
+  // [LOCKED] [AUDIT-HEAD-FROM-DISK], 2026-08-17
+  // [NEVER] derive the head hash from an in-process cache again.
   // WHY: the previous code trusted `cachedLastHash` whenever `statSync().size` matched
   //      a locally-tracked `cachedSize` that was ARITHMETIC (`cachedSize += byteLength`),
   //      not observed. Any divergence between bytes-we-think-we-wrote and bytes-on-disk
@@ -633,8 +627,8 @@ function takeRefusals(): { summary: Record<string, unknown>; done: () => void; p
 }
 
 /**
- * 🔒 LOCKED [ROTATION-MUST-NOT-ORPHAN-THE-CHAIN] — 2026-08-20
- * ⛔ NEVER rotate by truncating, moving or deleting audit.log. NEVER let a rotated log
+ * [LOCKED] [ROTATION-MUST-NOT-ORPHAN-THE-CHAIN], 2026-08-20
+ * [NEVER] rotate by truncating, moving or deleting audit.log. NEVER let a rotated log
  *    read as "history was deleted".
  * WHY: verifyChain() classifies a record whose prev_hash names a hash absent from the log
  *      as an ORPHAN, which is a hard failure meaning deleted or truncated history — the
@@ -648,8 +642,8 @@ function takeRefusals(): { summary: Record<string, unknown>; done: () => void; p
  *      that concatenation by default, so the chain stays linear and verification is
  *      unchanged. Segments are append-only and never rewritten.
  *
- * 🔒 LOCKED [ROTATE-ARCHIVE-BEFORE-TRUNCATE] — 2026-08-20
- * ⛔ NEVER truncate the live log before the segment file is durably renamed into place.
+ * [LOCKED] [ROTATE-ARCHIVE-BEFORE-TRUNCATE], 2026-08-20
+ * [NEVER] truncate the live log before the segment file is durably renamed into place.
  * WHY: the reverse order loses records permanently on a crash between the two steps.
  *      This order can only ever produce a DUPLICATE (records in both the segment and the
  *      live log), which the seam de-dup below removes and which loses nothing.
@@ -799,8 +793,8 @@ function readHistory(includeArchives: boolean, unreadable?: UnreadableLine[]): A
   let lastSegmentHashes = new Set<string>();
   for (const f of segments) {
     const recs = parseLines(readFileSync(join(archiveDir(), f), "utf-8"), f, unreadable, history.length);
-    // 🔒 LOCKED [NO-SPREAD-OVER-A-SEGMENT] — 2026-08-20
-    // ⛔ NEVER use push(...records) on a segment. Found on the first real rotation:
+    // [LOCKED] [NO-SPREAD-OVER-A-SEGMENT], 2026-08-20
+    // [NEVER] use push(...records) on a segment. Found on the first real rotation:
     //    a 494,152-record segment threw "Maximum call stack size exceeded" because the
     //    spread passes every element as a separate argument. Every unit test passed —
     //    they used chains of a few thousand. Push in a loop, whatever the size.
@@ -858,8 +852,8 @@ export interface RotateOptions {
   /**
    * Hard ceiling on how many records stay in the live log, whatever the dates say.
    *
-   * 🔒 LOCKED [DATE-RETENTION-DOES-NOT-BOUND-SIZE] — 2026-08-20
-   * ⛔ NEVER ship rotation with a date rule alone.
+   * [LOCKED] [DATE-RETENTION-DOES-NOT-BOUND-SIZE], 2026-08-20
+   * [NEVER] ship rotation with a date rule alone.
    * WHY: measured on the real log before shipping this — at 80,000 records/day, a 30-day
    *      window left 390,445 records live and even a 3-day window left 205,422. Date
    *      retention bounds AGE, not SIZE, so on a busy machine it rotates and changes
@@ -1447,8 +1441,8 @@ export interface IntegrityReport {
 }
 
 /**
- * 🔒 LOCKED [VERIFY-FORK-IS-NOT-TAMPER] — 2026-08-17
- * ⛔ NEVER report a forked chain as "the log was edited", and never stop at the first
+ * [LOCKED] [VERIFY-FORK-IS-NOT-TAMPER], 2026-08-17
+ * [NEVER] report a forked chain as "the log was edited", and never stop at the first
  *    linkage mismatch without first checking whether any record's CONTENT is altered.
  * WHY: the previous verifier returned on the first `prev_hash !== prev` and told the user
  *      the log "was either edited after the fact, or a record was partially written during
@@ -2206,12 +2200,6 @@ export function toCsv(records: AuditRecord[]): string {
     return `${r.ts},${r.event},${r.actor},"${payload}",${r.prev_hash},${r.hash}`;
   });
   return [header, ...rows].join("\n");
-}
-
-// Test-only — flush in-memory chain cache so a fresh path is re-read.
-export function resetCacheForTest(): void {
-  cachedLastHash = null;
-  cachedSize = 0;
 }
 
 // Safe wrapper that never throws into hot paths. Use this from production

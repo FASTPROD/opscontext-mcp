@@ -111,8 +111,8 @@ export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (e: any) {
-    return e?.code === "EPERM"; // exists, not ours
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "EPERM"; // exists, not ours
   }
 }
 

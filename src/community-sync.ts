@@ -519,8 +519,8 @@ export async function syncTierB(
     return { fetched: 0, cached: true };
   }
 
-  // 🔒 LOCKED [COMMUNITY-SYNC-REPLAY-GUARD] — 2026-06-25
-  // ⛔ NEVER trust a valid signature alone — also bind it to THIS request.
+  // [LOCKED] [COMMUNITY-SYNC-REPLAY-GUARD], 2026-06-25
+  // [NEVER] trust a valid signature alone, also bind it to THIS request.
   //   The signed payload must reference OUR license token + OUR machine_id +
   //   a fresh timestamp. Without these checks, a Tier B response captured
   //   by any past PRO subscriber could be replayed against any other
@@ -591,54 +591,6 @@ export async function syncTierB(
   saveCommunityStore(merged);
   safeAppend("community.sync_ok", { tier: "B", fetched: fresh.length });
   return { fetched: fresh.length, cached: false };
-}
-
-// ---------------------------------------------------------------------------
-// Combined sync
-// ---------------------------------------------------------------------------
-
-export interface SyncAllResult {
-  tierA: SyncResult;
-  tierB: SyncResult | null;
-}
-
-/**
- * Resolve a license token from the activation store. Returns null if the
- * user has no license loaded (free user). We deliberately avoid throwing
- * here so the caller can skip Tier B gracefully.
- */
-function resolveLicenseToken(): string | null {
-  try {
-    // Lazy import — keeps community-sync.ts importable in tests without
-    // dragging the full activation surface.
-    const licenseFile = join(homedir(), ".contextengine", "license.json");
-    if (!existsSync(licenseFile)) return null;
-    const data = JSON.parse(readFileSync(licenseFile, "utf-8"));
-    return typeof data.key === "string" && data.key.length > 0
-      ? data.key
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function syncAll(
-  opts: { force?: boolean } = {},
-): Promise<SyncAllResult> {
-  const tierA = await syncTierA(opts);
-
-  const token = resolveLicenseToken();
-  if (!token) {
-    process.stderr.write(
-      `[community-sync] Tier B skipped: no license loaded (free tier). ` +
-        `Activate Pro to receive curated community rules: ` +
-        `https://api.compr.ch/contextengine/pricing\n`,
-    );
-    return { tierA, tierB: null };
-  }
-
-  const tierB = await syncTierB(token, opts);
-  return { tierA, tierB };
 }
 
 // ---------------------------------------------------------------------------

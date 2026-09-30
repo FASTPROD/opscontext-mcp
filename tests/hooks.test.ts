@@ -13,7 +13,6 @@ import {
   stripBypassBranchFromPattern,
   formatCommitMessageViolations,
   formatCommitMessageViolationsJson,
-  hashDocSection,
   formatSecretViolations,
   formatDocCoverageViolations,
   formatSecretViolationsJson,
@@ -259,47 +258,6 @@ describe("runDocCoverage", () => {
     expect(v).toHaveLength(2);
     expect(v.find((x) => x.severity === "block")).toBeDefined();
     expect(v.find((x) => x.severity === "warn")).toBeDefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// hashDocSection
-// ---------------------------------------------------------------------------
-
-describe("hashDocSection", () => {
-  it("returns null when the file doesn't exist", () => {
-    expect(hashDocSection(join(tempRepo, "nope.md"), "section")).toBeNull();
-  });
-
-  it("hashes the lines under the matching anchor up to the next sibling", () => {
-    writeFileSync(
-      join(tempRepo, "DOC.md"),
-      `# intro\n\n## section-a\nfirst line\nsecond line\n\n## section-b\nother\n`,
-    );
-    const h = hashDocSection(join(tempRepo, "DOC.md"), "section-a");
-    expect(h).not.toBeNull();
-    expect(h).toHaveLength(64);
-
-    // Mutating the section content changes the hash
-    writeFileSync(
-      join(tempRepo, "DOC.md"),
-      `# intro\n\n## section-a\nfirst line MUTATED\nsecond line\n\n## section-b\nother\n`,
-    );
-    const h2 = hashDocSection(join(tempRepo, "DOC.md"), "section-a");
-    expect(h2).not.toBe(h);
-
-    // Mutating a DIFFERENT section leaves section-a's hash stable
-    writeFileSync(
-      join(tempRepo, "DOC.md"),
-      `# intro\n\n## section-a\nfirst line\nsecond line\n\n## section-b\nOTHER MUTATED\n`,
-    );
-    const h3 = hashDocSection(join(tempRepo, "DOC.md"), "section-a");
-    expect(h3).toBe(h);
-  });
-
-  it("returns null for an anchor that doesn't exist in the doc", () => {
-    writeFileSync(join(tempRepo, "DOC.md"), "# only-this");
-    expect(hashDocSection(join(tempRepo, "DOC.md"), "missing-anchor")).toBeNull();
   });
 });
 

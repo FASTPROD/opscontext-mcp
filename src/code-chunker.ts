@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, basename, relative } from "path";
 import type { Chunk } from "./ingest.js";
 import { hasLockMarker } from "./ingest.js";

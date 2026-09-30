@@ -87,6 +87,18 @@ describe("[TRANSCRIPT-DEDUP-BY-MESSAGE-ID]", () => {
   });
 });
 
+describe("a transcript line that is JSON but not an object", () => {
+  it("is skipped, and the rest of the file still counts", () => {
+    const f = join(dir, "agent-not-an-object.jsonl");
+    writeFileSync(f, "null\n42\n\"text\"\n" +
+      asst("msg_9", "claude-opus-5", usage(10, 0, 0, 5), [{ type: "text", text: "done" }], "2026-09-29T10:00:00Z"));
+    const a = parseAgentTranscript(f);
+    expect(a.tokens.input).toBe(10);
+    expect(a.tokens.output).toBe(5);
+    expect(a.turns).toBe(1);
+  });
+});
+
 describe("[PRICE-PER-MESSAGE-MODEL-NOT-PER-AGENT]", () => {
   const f = () => join(dir, "-Users-x-proj", "sess-1", "subagents", "workflows", "wf_test", "agent-bbb.jsonl");
 

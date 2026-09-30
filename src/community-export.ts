@@ -1,5 +1,5 @@
-// 🔒 LOCKED [COMMUNITY-EXPORT-SAFETY] — 2026-06-24
-// ⛔ NEVER weaken, narrow, comment-out, or "optimize" the redaction patterns
+// [LOCKED] [COMMUNITY-EXPORT-SAFETY], 2026-06-24
+// [NEVER] weaken, narrow, comment-out, or "optimize" the redaction patterns
 //   in PATTERNS, PII_PATTERNS, or PERSONAL_IDENTIFIERS. Do not shorten the
 //   project brand list. Do not remove the "empty after redaction → reject"
 //   guard. Do not turn `salt='opscontext-public-v1'` into a runtime config

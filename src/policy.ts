@@ -1,8 +1,8 @@
-// 🔒 LOCKED [POLICY-CONTRACT] — 2026-06-10
-// ⛔ NEVER bump `version: 1` without a migration path that keeps v1
+// [LOCKED] [POLICY-CONTRACT], 2026-06-10
+// [NEVER] bump `version: 1` without a migration path that keeps v1
 //    policies loadable. Org policy URLs in the wild will pin a version;
 //    breaking the loader silently breaks remote policy distribution.
-// ⛔ NEVER add NEW required fields to existing schemas — only optional
+// [NEVER] add NEW required fields to existing schemas, only optional
 //    fields with defaults. Old policies must still validate.
 // WHY: This is the contract that hooks, CI templates, and the future
 //    signed-policy-distribution layer will all consume. Schema breakage
@@ -53,7 +53,6 @@ export const DocCoverageSchema = z.object({
   severity: z.enum(["block", "warn"]).default("block"),
   description: z.string().optional(),
 });
-export type DocCoverage = z.infer<typeof DocCoverageSchema>;
 
 /**
  * A production host that requires a verification probe within N seconds of
@@ -65,7 +64,6 @@ export const DeployVerifyHostSchema = z.object({
   within_seconds: z.number().int().positive().default(60),
   description: z.string().optional(),
 });
-export type DeployVerifyHost = z.infer<typeof DeployVerifyHostSchema>;
 
 /**
  * A staged-path → required-commit-message-pattern rule. Fires when a
@@ -101,7 +99,6 @@ export const CommitMessageRequiredSchema = z.object({
   severity: z.enum(["block", "warn"]).default("block"),
   description: z.string().optional(),
 });
-export type CommitMessageRequired = z.infer<typeof CommitMessageRequiredSchema>;
 
 /**
  * A documented escape hatch for the hook. Beats undocumented `touch` /
@@ -114,14 +111,13 @@ export const BypassTokenSchema = z.object({
   requires_reason_min_length: z.number().int().min(0).default(20),
   description: z.string().optional(),
 });
-export type BypassToken = z.infer<typeof BypassTokenSchema>;
 
 /**
  * The full policy document — schema version 1.
  */
 /**
- * 🔒 LOCKED [RULE-PARITY-IS-DOC-TO-DOC] — 2026-08-19
- * ⛔ NEVER fold this into doc_coverage. They answer different questions.
+ * [LOCKED] [RULE-PARITY-IS-DOC-TO-DOC], 2026-08-19
+ * [NEVER] fold this into doc_coverage. They answer different questions.
  * WHY: doc_coverage maps SOURCE → DOC ("you changed src/audit.ts, update SKILLS.md").
  *      It cannot see the failure that motivated this: a rule that existed in
  *      ~/.claude/CLAUDE.md and AGENT_USAGE.md but NOT in .github/copilot-instructions.md
@@ -151,8 +147,8 @@ export const RuleParitySchema = z.object({
 /**
  * Model pricing, in dollars per million tokens.
  *
- * 🔒 LOCKED [PRICING-LIVES-IN-POLICY] — 2026-08-19
- * ⛔ NEVER hardcode a rate in the collector, the detector or the CLI.
+ * [LOCKED] [PRICING-LIVES-IN-POLICY], 2026-08-19
+ * [NEVER] hardcode a rate in the collector, the detector or the CLI.
  * WHY: rates change, and the collector must be able to value runs for models
  *    it has never heard of. A rate baked into a compiled `dist/` is a rate
  *    nobody can correct without a release.
@@ -168,13 +164,12 @@ export const ModelPricingSchema = z.object({
   cache_write_5m_per_mtok: z.number().nonnegative(),
   cache_write_1h_per_mtok: z.number().nonnegative().optional(),
 });
-export type ModelPricingRule = z.infer<typeof ModelPricingSchema>;
 
 /**
  * Thresholds for the context_burn and fanout_without_canary detectors.
  *
- * 🔒 LOCKED [BURN-IS-COST-WEIGHTED-NOT-VOLUME] — 2026-08-19
- * ⛔ NEVER fire context_burn on a low output/volume ratio alone.
+ * [LOCKED] [BURN-IS-COST-WEIGHTED-NOT-VOLUME], 2026-08-19
+ * [NEVER] fire context_burn on a low output/volume ratio alone.
  * WHY: a healthy 30-agent workflow measures 1.8% output by volume. That looks
  *    alarming and is not: cache_read is billed at 0.1x input, so those same
  *    tokens are 28% of cost, and the run cost $35 against $120 without cache.
@@ -206,7 +201,6 @@ export const AgentCostSchema = z.object({
   max_failed_share: z.number().min(0).max(1).default(0.05),
   description: z.string().optional(),
 });
-export type AgentCost = z.infer<typeof AgentCostSchema>;
 
 export const PolicySchema = z.object({
   version: z.literal(1).describe("Policy schema version. Pin to 1 — bumps require a migration path."),

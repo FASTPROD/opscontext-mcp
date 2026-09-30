@@ -7,7 +7,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { createHash } from "crypto";
 import { spawn } from "child_process";
-import { verifyChain, rotateAuditLog, resetCacheForTest, type AuditRecord } from "../src/audit.js";
+import { verifyChain, rotateAuditLog, type AuditRecord } from "../src/audit.js";
 
 let home: string;
 let original: string | undefined;
@@ -16,7 +16,6 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ce-dup-test-"));
   original = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = home;
-  resetCacheForTest();
 });
 
 afterEach(() => {

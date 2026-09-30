@@ -8,7 +8,6 @@ import {
   verifyChain,
   filterByRange,
   toCsv,
-  resetCacheForTest,
 } from "../src/audit.js";
 
 let tempHome: string;
@@ -18,13 +17,11 @@ beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), "ce-audit-test-"));
   originalHome = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = tempHome;
-  resetCacheForTest();
 });
 
 afterEach(() => {
   if (originalHome === undefined) delete process.env.CONTEXTENGINE_HOME;
   else process.env.CONTEXTENGINE_HOME = originalHome;
-  resetCacheForTest();
   rmSync(tempHome, { recursive: true, force: true });
 });
 
@@ -243,7 +240,6 @@ describe("genesis hash + canonical serialization", () => {
 
     // Reset and replay
     rmSync(join(tempHome, "audit.log"));
-    resetCacheForTest();
     const replay = appendAudit("learning.save", { id: "X" });
 
     // Genesis prev_hash must match (deterministic)
@@ -265,9 +261,8 @@ describe("concurrent-writer race (audit-001-write-race fix)", () => {
     const { writeFileSync: write } = await import("node:fs");
 
     const workerScript = `
-import { appendAudit, resetCacheForTest } from "${process.cwd()}/dist/audit.js";
+import { appendAudit } from "${process.cwd()}/dist/audit.js";
 process.env.CONTEXTENGINE_HOME = "${tempHome}";
-resetCacheForTest();
 const label = process.argv[2];
 for (let i = 0; i < 20; i++) {
   appendAudit("learning.save", { id: label + "-" + i });
@@ -297,7 +292,6 @@ for (let i = 0; i < 20; i++) {
     ]);
 
     // Chain must verify clean — no prev_hash mismatch, no hash tampering.
-    resetCacheForTest();
     const report = verifyChain();
     expect(report.ok).toBe(true);
     expect(report.breakAtIndex).toBeNull();

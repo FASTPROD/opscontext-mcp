@@ -1,8 +1,8 @@
 /**
  * Built-in model rates, in dollars per million tokens.
  *
- * 🔒 LOCKED [DEFAULT-RATES-SHIP-WITH-THE-PACKAGE] — 2026-08-20
- * ⛔ NEVER ship an empty default pricing table again.
+ * [LOCKED] [DEFAULT-RATES-SHIP-WITH-THE-PACKAGE], 2026-08-20
+ * [NEVER] ship an empty default pricing table again.
  * WHY: `[PRICING-LIVES-IN-POLICY]` was read as "ship no rates at all", so
  *    2.5.0 shipped `pricing: []` as the default. Every user without an
  *    `agent_cost` block in their own policy.json got a VALUED COST panel

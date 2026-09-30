@@ -93,10 +93,6 @@ function bm25Score(
   return score;
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 export interface SearchResult {
   chunk: Chunk;
   score: number;

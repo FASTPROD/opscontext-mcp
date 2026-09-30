@@ -13,7 +13,6 @@ import {
   readAuditLog,
   filterByRange,
   acknowledgeRedaction,
-  resetCacheForTest,
   type AuditRecord,
   type IntegrityReport,
   type UnreadableLine,
@@ -26,7 +25,6 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ce-stream-test-"));
   original = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = home;
-  resetCacheForTest();
   mkdirSync(join(home, "audit-archive"), { recursive: true });
 });
 

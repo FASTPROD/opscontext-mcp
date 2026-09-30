@@ -14,7 +14,6 @@ import {
   autoRotateAuditLog,
   restoreSegment,
   scrubAuditLog,
-  resetCacheForTest,
   type AuditRecord,
 } from "../src/audit.js";
 import { redactPayload } from "../src/secret-shapes.js";
@@ -27,7 +26,6 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ce-interrupted-"));
   original = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = home;
-  resetCacheForTest();
   writeFileSync(
     join(home, "kill-at.cjs"),
     `const fs = require("fs"); const { syncBuiltinESMExports } = require("module");

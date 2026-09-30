@@ -1,8 +1,8 @@
-// 🔒 LOCKED [HOOK-CHECKERS] — 2026-06-10
-// ⛔ NEVER print the matched secret value in violation output. Print pattern
+// [LOCKED] [HOOK-CHECKERS], 2026-06-10
+// [NEVER] print the matched secret value in violation output. Print pattern
 //    id + file + line + redaction only. Leaking secrets via "helpful" error
 //    messages was a classic regression in v1.x of similar tools.
-// ⛔ NEVER swallow git errors silently — if git isn't available, surface the
+// [NEVER] swallow git errors silently, if git isn't available, surface the
 //    failure so the user knows the gate is not actually running.
 // WHY: This is the production enforcement path. A check that silently
 //    passes when broken is worse than no check — it ships false
@@ -46,7 +46,6 @@
 
 import { execFileSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
-import { createHash } from "crypto";
 import { join } from "path";
 import type { Policy } from "./policy.js";
 
@@ -295,49 +294,6 @@ export function runDocCoverage(
   }
 
   return violations;
-}
-
-// ---------------------------------------------------------------------------
-// Doc section hash (foundation for future v2 staged-section-change check)
-// ---------------------------------------------------------------------------
-
-/**
- * Compute a stable SHA-256 of the section content under a markdown anchor.
- * "Section" = lines from `## Anchor` (or `### Anchor` etc.) up to the next
- * heading at the same or higher level. Used by the next-iteration v2 check.
- *
- * Exposed now so the CLI can surface a stable hash for compliance evidence
- * (e.g., "as of this commit, the firewall section is hash X").
- */
-export function hashDocSection(filePath: string, anchor: string): string | null {
-  if (!existsSync(filePath)) return null;
-  const lines = readFileSync(filePath, "utf-8").split("\n");
-  const slug = (s: string) =>
-    s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
-  let inSection = false;
-  let sectionLevel = -1;
-  const section: string[] = [];
-
-  for (const line of lines) {
-    const heading = line.match(/^(#+)\s+(.+?)\s*$/);
-    if (heading) {
-      const level = heading[1].length;
-      const headSlug = slug(heading[2]);
-      if (!inSection && headSlug === slug(anchor)) {
-        inSection = true;
-        sectionLevel = level;
-        continue;
-      }
-      if (inSection && level <= sectionLevel) {
-        // Hit a sibling or higher heading — section ended
-        break;
-      }
-    }
-    if (inSection) section.push(line);
-  }
-
-  if (!inSection) return null;
-  return createHash("sha256").update(section.join("\n")).digest("hex");
 }
 
 // ---------------------------------------------------------------------------
@@ -674,8 +630,8 @@ export interface RuleParityViolation {
 }
 
 /**
- * 🔒 LOCKED [RULE-PARITY-IS-DIFF-AWARE] — 2026-08-19
- * ⛔ NEVER make this fire on commits that touch none of the rule's files.
+ * [LOCKED] [RULE-PARITY-IS-DIFF-AWARE], 2026-08-19
+ * [NEVER] make this fire on commits that touch none of the rule's files.
  * WHY: parity is a property of the whole repo, so the naive implementation checks the
  *      working tree on every commit — which means one pre-existing drift blocks every
  *      unrelated commit until someone fixes it. That is how a useful gate becomes a gate
@@ -686,8 +642,8 @@ export interface RuleParityViolation {
  *      exactly the moment the author has the context to fix it. `--all` (see cliHookRuleParity)
  *      audits the whole repo on demand, for CI or a deliberate sweep.
  *
- * 🔒 LOCKED [RULE-PARITY-READS-THE-INDEX] — 2026-08-19
- * ⛔ NEVER evaluate marker presence from the working tree during a pre-commit check.
+ * [LOCKED] [RULE-PARITY-READS-THE-INDEX], 2026-08-19
+ * [NEVER] evaluate marker presence from the working tree during a pre-commit check.
  * WHY: the first cut did, with the rationalisation that "for a normal `git commit` the
  *      working tree IS the post-commit state". That is false whenever staging is partial,
  *      which is the normal case for anyone using `git add -p`. Demonstrated: stage the

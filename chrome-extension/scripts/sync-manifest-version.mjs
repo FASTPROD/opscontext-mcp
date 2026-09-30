@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// 🔒 LOCKED [MANIFEST-VERSION-SYNC] — 2026-06-23
-// ⛔ NEVER let chrome-extension/src/manifest.json drift from package.json's
+// [LOCKED] [MANIFEST-VERSION-SYNC], 2026-06-23
+// [NEVER] let chrome-extension/src/manifest.json drift from package.json's
 //    version. Chrome reads ONLY the manifest version for the extension card,
 //    so a mismatch makes "did the user reload after the bump?" undebuggable.
 // WHY: The 0.1.3 dedupe-fix release shipped with manifest at 0.1.0 because

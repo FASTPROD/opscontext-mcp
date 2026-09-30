@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, utimesSync, 
 import { join, dirname } from "path";
 import { tmpdir } from "os";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
-import { appendAudit, rotateAuditLog, readAuditLog, resetCacheForTest } from "../src/audit.js";
+import { appendAudit, rotateAuditLog, readAuditLog } from "../src/audit.js";
 import { listServers, liveDaemonPid } from "../src/server-registry.js";
 
 let home: string;
@@ -17,7 +17,6 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ce-liveness-"));
   original = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = home;
-  resetCacheForTest();
 });
 
 afterEach(() => {

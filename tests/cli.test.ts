@@ -13,7 +13,7 @@ function run(args: string, timeout = 15000): string {
       cwd: join(__dirname, ".."),
     }).trim();
   } catch (e: any) {
-    // 🔒 [EXEC-FAILURE-IS-NOT-EMPTY] — a timeout or crash must NOT masquerade as empty output.
+    // [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY], a timeout or crash must NOT masquerade as empty output.
     // This previously returned "" for a killed process, so a 15s timeout under parallel suite load
     // surfaced as the useless assertion "expected 0 to be greater than 0" instead of "SIGTERM".
     // Some commands exit non-zero intentionally, so non-empty output is still a valid result.

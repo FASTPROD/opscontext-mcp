@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { appendAudit, verifyChain, acknowledgeRedaction, rotateAuditLog, resetCacheForTest } from "../src/audit.js";
+import { appendAudit, verifyChain, acknowledgeRedaction, rotateAuditLog } from "../src/audit.js";
 
 let tempHome: string;
 let originalHome: string | undefined;
@@ -10,12 +10,10 @@ beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), "ce-redact-"));
   originalHome = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = tempHome;
-  resetCacheForTest();
 });
 afterEach(() => {
   if (originalHome === undefined) delete process.env.CONTEXTENGINE_HOME;
   else process.env.CONTEXTENGINE_HOME = originalHome;
-  resetCacheForTest();
   rmSync(tempHome, { recursive: true, force: true });
 });
 

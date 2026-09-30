@@ -4,6 +4,7 @@
 // LEARNINGS_PATH is computed at import time.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { trustProjects } from "./trusted-projects.js";
+import type { LearningsStore } from "./learnings.js";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -22,7 +23,7 @@ function writeStore(n: number, prefix = "seed"): void {
   }));
   writeFileSync(storePath, JSON.stringify({ version: 1, count: n, learnings }));
 }
-function readStore(): any { return JSON.parse(readFileSync(storePath, "utf-8")); }
+function readStore(): LearningsStore { return JSON.parse(readFileSync(storePath, "utf-8")); }
 // First load merges the bundled defaults into a fresh file, so counts are relative to this baseline.
 function seed(n: number, prefix = "seed"): number { writeStore(n, prefix); L.listLearnings(); return readStore().learnings.length; }
 function tmpFiles(): string[] { return readdirSync(dir).filter((f) => f.startsWith("learnings.json.tmp-")); }
@@ -121,8 +122,8 @@ describe("imports are one batch", () => {
     const result = L.importLearningsFromFile(md, "other", "TestProj");
     const after = readStore();
     expect(result.imported).toBeGreaterThanOrEqual(40);
-    expect(after.learnings.find((l: any) => l.id === "keep1")).toBeTruthy();
-    expect(after.learnings.find((l: any) => l.id === "keep1").created).toBe(before.learnings[1].created);
+    expect(after.learnings.find((l) => l.id === "keep1")).toBeTruthy();
+    expect(after.learnings.find((l) => l.id === "keep1")!.created).toBe(before.learnings[1].created);
     expect(tmpFiles()).toEqual([]);
     expect(existsSync(lockDir)).toBe(false);
   });
@@ -226,6 +227,6 @@ describe("[LEARNING-FIELDS-ARE-OPTIONAL-ON-READ]", () => {
     writeFileSync(storePath, JSON.stringify(store));
     const hits = L.searchLearnings("firebase security rules");
     expect(hits.map((h) => h.id)).toContain("s78_no_tags");
-    expect(readStore().learnings.find((l: any) => l.id === "s78_no_tags").tags).toBeUndefined(); // the record is not rewritten
+    expect(readStore().learnings.find((l) => l.id === "s78_no_tags")!.tags).toBeUndefined(); // the record is not rewritten
   });
 });

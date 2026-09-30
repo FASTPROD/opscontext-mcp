@@ -1,14 +1,14 @@
-// 🔒 LOCKED [HTTP-EVENT-INGEST] — 2026-06-23
-// ⛔ NEVER bind to 0.0.0.0 — only 127.0.0.1. The threat model is "browser
+// [LOCKED] [HTTP-EVENT-INGEST], 2026-06-23
+// [NEVER] bind to 0.0.0.0, only 127.0.0.1. The threat model is "browser
 //    extension running on the same machine"; a network-reachable port would
 //    let any device on the LAN inject audit events.
-// ⛔ NEVER compare the secret with `===` — use timingSafeEqual. String compare
+// [NEVER] compare the secret with `===`, use timingSafeEqual. String compare
 //    leaks timing info that lets a remote attacker brute-force the secret
 //    one byte at a time.
-// ⛔ NEVER auto-generate the secret on first request. The CLI must create it
+// [NEVER] auto-generate the secret on first request. The CLI must create it
 //    explicitly (so a stray client can't bootstrap itself into the audit log).
 //    Refuse with 401 if ~/.contextengine/extension-secret is missing.
-// ⛔ NEVER write events before validating shape — a malformed event in the
+// [NEVER] write events before validating shape, a malformed event in the
 //    audit log corrupts the chain verifier and ruins compliance evidence.
 // WHY: This is the only network surface OpsContext exposes locally. Every
 //    decision here is about keeping it auth-required, scope-bound, and shape-

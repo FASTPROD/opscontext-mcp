@@ -38,7 +38,7 @@ function check(name: string, path: string) {
   return found;
 }
 
-// 🔒 [DOC-PATH-DUAL] — these tests exist to stop a regression to `.github/`-only
+// [LOCK] [DOC-PATH-DUAL], these tests exist to stop a regression to `.github/`-only
 // path resolution in scoreProject(). See the LOCK block on resolveDocPath in src/agents.ts.
 describe("scoreProject — agent docs resolve at .github/ OR repo root", () => {
   it("scores copilot-instructions.md in .github/", () => {
@@ -191,7 +191,7 @@ describe("scoreProject — absence is not a verdict", () => {
   });
 });
 
-// 🔒 [SCORE-CONTENT-NOT-LENGTH] + [SECURITY-IS-DISQUALIFYING] + [SCORE-DOC-FRESHNESS]
+// [LOCK] [SCORE-CONTENT-NOT-LENGTH] + [SECURITY-IS-DISQUALIFYING] + [SCORE-DOC-FRESHNESS]
 describe("scoreProject — the 2026-08-14 rubric rework", () => {
   it("a short doc covering every topic beats a long one covering none", () => {
     const short = mkdtempSync(join(tmpdir(), "ce-short-"));
@@ -301,7 +301,7 @@ describe("scoreProject — the 2026-08-14 rubric rework", () => {
   });
 });
 
-// 🔒 [SCORE-LANGUAGE-AWARE] — reported from the Odoo connector: a Python addon with 15 passing
+// [LOCK] [SCORE-LANGUAGE-AWARE], reported from the Odoo connector: a Python addon with 15 passing
 // tests scored "No test directory", "No tsconfig/jsconfig" and "No lint config".
 describe("scoreProject — nested tests and non-JS projects", () => {
   it("finds tests one level down, where Odoo addons and src-layouts keep them", () => {
@@ -363,7 +363,7 @@ describe("scoreProject — nested tests and non-JS projects", () => {
   });
 });
 
-// 🔒 [SCORE-LANGUAGE-AWARE] — reported from PLANK.io: a Flutter app with a Node backend.
+// [LOCK] [SCORE-LANGUAGE-AWARE], reported from PLANK.io: a Flutter app with a Node backend.
 describe("scoreProject — polyglot repos", () => {
   it("counts test files across EVERY test directory, not just the first", () => {
     mkdirSync(join(tempRepo, "backend", "__tests__"), { recursive: true });

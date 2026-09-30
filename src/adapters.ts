@@ -1,6 +1,4 @@
-import { readFileSync, existsSync } from "fs";
-import { resolve, join } from "path";
-import { homedir } from "os";
+import { resolve } from "path";
 import type { Chunk } from "./ingest.js";
 
 /**
@@ -80,12 +78,6 @@ export interface Adapter {
    */
   destroy?(): Promise<void> | void;
 }
-
-/**
- * Factory function signature — adapters can export this instead of a static object.
- * Allows per-instance configuration.
- */
-export type AdapterFactory = (config?: Record<string, unknown>) => Adapter | Promise<Adapter>;
 
 // ---------------------------------------------------------------------------
 // Adapter Registry

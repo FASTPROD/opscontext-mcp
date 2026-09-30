@@ -33,7 +33,7 @@ function writeAll(marked: string[]) {
   for (const f of FILES) put(f, marked.includes(f) ? "# doc\nMULTI-AGENT COST rule here\n" : "# doc\nnothing\n");
 }
 
-// 🔒 [RULE-PARITY-IS-DOC-TO-DOC] — the incident: a rule lived in CLAUDE.md and the global
+// [LOCK] [RULE-PARITY-IS-DOC-TO-DOC], the incident: a rule lived in CLAUDE.md and the global
 // config but never reached .github/copilot-instructions.md, so Cursor/Windsurf/Copilot —
 // which read only that file — never saw it. No source file changed, so doc_coverage
 // could never fire.
@@ -65,7 +65,7 @@ describe("runRuleParity", () => {
     expect(v[0].reason).toBe("marker-required-but-absent-everywhere");
   });
 
-  // 🔒 [RULE-PARITY-IS-DIFF-AWARE] — a gate that blocks unrelated commits gets disabled.
+  // [LOCK] [RULE-PARITY-IS-DIFF-AWARE], a gate that blocks unrelated commits gets disabled.
   it("does NOT fire on a commit that touches none of the governed docs", () => {
     writeAll(["CLAUDE.md"]); // drift exists...
     const v = runRuleParity(policy(), staged(["src/unrelated.ts"]), repo);
@@ -109,7 +109,7 @@ describe("runRuleParity", () => {
     expect(v[0].missingFrom).toEqual([".github/copilot-instructions.md"]);
   });
 
-  // 🔒 [RULE-PARITY-READS-THE-INDEX] — the first cut read the working tree, so staging the
+  // [LOCK] [RULE-PARITY-READS-THE-INDEX], the first cut read the working tree, so staging the
   // REMOVAL of a marker while the worktree still held it passed the gate, and the commit
   // that deleted the rule from the file agents read went through clean.
   it("reads the staged blob, so staging a removal is caught even if the worktree still has it", () => {

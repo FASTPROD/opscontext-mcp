@@ -77,9 +77,6 @@ const INJECT_MAX = 3;
 /** Maximum time between session saves before urgent reminder (10 minutes) */
 const SESSION_SAVE_MAX_MS = 10 * 60_000;
 
-/** Minimum score for a learning to be injected (from searchLearnings scoring) */
-const INJECT_MIN_SCORE_TOKENS = 2; // at least 2 keyword token matches
-
 /**
  * Callback type for searching learnings — avoids circular import.
  * Returns top matches with rule text + optional project scope.
@@ -500,7 +497,6 @@ export class ProtocolFirewall {
 
   private evaluate(): Obligation[] {
     const obs: Obligation[] = [];
-    const minutes = (Date.now() - this.startTime) / 60_000;
     const calls = this.toolCalls;
 
     // 1. Learnings — expect 1 per CALLS_PER_LEARNING calls

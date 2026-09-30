@@ -106,13 +106,13 @@ function attachPromptListeners() {
   }, true);
 }
 
-// 🔒 LOCKED [RESPONSE-DEDUPE-CHATGPT] — 2026-06-23
-// ⛔ NEVER put `text.length` back in the dedupe key (responses or tool calls).
+// [LOCKED] [RESPONSE-DEDUPE-CHATGPT], 2026-06-23
+// [NEVER] put `text.length` back in the dedupe key (responses or tool calls).
 //    Same root cause as the claude.ts streaming over-emit bug: length grows
 //    on every settle during streaming, length-in-key churns, dedupe Set
 //    misses, re-emit. Length stays OUT. See LOCK in claude.ts captureResponses
 //    for the full incident summary.
-// ⛔ NEVER emit tool_calls without a done-marker check. ChatGPT streams tool
+// [NEVER] emit tool_calls without a done-marker check. ChatGPT streams tool
 //    arguments token-by-token too — without a stream-done gate, each
 //    characterData mutation produces a new dedupe key. The audit during the
 //    workflow on 2026-06-23 flagged this as the SAME bug class as responses.

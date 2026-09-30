@@ -190,14 +190,14 @@ function saveLicense(license: LicenseInfo): void {
 // Activation flow
 // ---------------------------------------------------------------------------
 
-// 🔒 LOCKED [ACTIVATION-PAYLOAD-NO-USAGE-DATA] — 2026-06-24
-// ⛔ NEVER add fields to the activation POST body that reflect user
+// [LOCKED] [ACTIVATION-PAYLOAD-NO-USAGE-DATA], 2026-06-24
+// [NEVER] add fields to the activation POST body that reflect user
 //    USAGE — no project paths, no prompt text, no response text, no
 //    tool-call inventory, no file lists, no learning IDs, no audit-log
 //    sample, no anything that describes what the customer is doing with
 //    OpsContext. The activation server's job is license validation,
 //    nothing else.
-// ⛔ NEVER share this list with marketing tools (Stripe customer record
+// [NEVER] share this list with marketing tools (Stripe customer record
 //    is the ONLY place email lands; never join it to usage data).
 // WHY: This is the LOAD-BEARING commitment of docs/about.md §
 //    "Marketing-data isolation". Customers using OpsContext are NOT and

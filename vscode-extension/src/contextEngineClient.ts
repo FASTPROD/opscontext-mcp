@@ -93,8 +93,8 @@ export function resolveCLI(): string {
 }
 
 function buildCommand(): { cmd: string; baseArgs: string[] } {
-  // 🔒 LOCKED [OPSCONTEXT-CLI] — 2026-06-11
-  // ⛔ NEVER revert the npm package name to `@compr/contextengine-mcp`.
+  // [LOCKED] [OPSCONTEXT-CLI], 2026-06-11
+  // [NEVER] revert the npm package name to `@compr/contextengine-mcp`.
   // WHY: The npm package was renamed to `@compr/opscontext-mcp@2.0.1`
   //   on 2026-06-11; the old name was deprecated with a registry
   //   pointer at the new package. Calling the old name still

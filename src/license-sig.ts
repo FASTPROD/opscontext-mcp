@@ -1,10 +1,10 @@
-// 🔒 LOCKED [LICENSE-SIG] — 2026-06-10 (flag day reached 2026-06-11)
-// ⛔ NEVER change canonicalPayload()'s key order or field set without
+// [LOCKED] [LICENSE-SIG], 2026-06-10 (flag day reached 2026-06-11)
+// [NEVER] change canonicalPayload()'s key order or field set without
 //    bumping a new "sig_v":2 marker AND keeping v1 verification working
 //    forever. The byte output of this function is what the Ed25519
 //    signature covers; any change breaks every license issued before
 //    the change.
-// ⛔ NEVER ship the public key as a mutable variable. It's a constant
+// [NEVER] ship the public key as a mutable variable. It's a constant
 //    that pins the client to the production activation server.
 //    [NEVER] bring back an environment variable that replaces it (2026-09-25).
 //    Self-hosters build from source with their own key in LICENSE_PUBLIC_KEY_PEM.
@@ -13,7 +13,7 @@
 //    sign their own licence and unlock every Pro tool with one variable; proven in a sandbox
 //    (`score` ran on a self-signed licence). Tests swap the key in-process only, through
 //    __setLicensePublicKeyForTesting().
-// ⛔ Legacy SHA-256 signatures are NOW REJECTED (flag day reached
+// Legacy SHA-256 signatures are NOW REJECTED (flag day reached
 //    2026-06-11 — earlier than the originally scheduled 2026-08-15
 //    because the customer base is effectively empty and no one would
 //    be impacted). The 64-char hex shape returns ok:false with a
@@ -67,8 +67,6 @@ export function verifyDetachedSignature(bytes: Buffer, signatureB64: string): bo
 export const LICENSE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAnWMq7ITUPmC/8yx9XmpYktaWmQtXDOx6R2nqSdibq+Y=
 -----END PUBLIC KEY-----`;
-
-export const LICENSE_PUBKEY_FINGERPRINT = "12d0c34c917a47fbed99945d2b7fb439";
 
 export interface SignableLicensePayload {
   key: string;

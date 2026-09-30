@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # OpsContext — Claude Code hook emitter
 #
-# 🔒 LOCKED [OPSCONTEXT-CC-HOOK] — 2026-06-23
-# ⛔ NEVER block on success or fail loudly. Claude Code waits for hooks to
+# [LOCKED] [OPSCONTEXT-CC-HOOK], 2026-06-23
+# [NEVER] block on success or fail loudly. Claude Code waits for hooks to
 #    complete before continuing — any error must exit 0 + silent.
-# ⛔ NEVER emit on PreToolUse. PostToolUse alone — PreToolUse would double-
+# [NEVER] emit on PreToolUse. PostToolUse alone, PreToolUse would double-
 #    count vs PostToolUse for the `stuck` heuristic and skew `silent_failure`.
-# ⛔ NEVER print to stdout (would be interpreted as a hook decision message).
+# [NEVER] print to stdout (would be interpreted as a hook decision message).
 # WHY: This hook is the ONLY way Claude Code terminal sessions get into the
 #    OpsContext audit log. If it's slow or breaks, the user disables it and
 #    loses cross-surface drift visibility — the entire wedge collapses.

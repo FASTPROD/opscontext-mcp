@@ -766,8 +766,8 @@ function registerCommands(
   // contract of "setup at least informs you on Linux/Windows" while
   // letting Mac users (the target persona) get the full happy path.
   //
-  // 🔒 LOCKED [B2-SETUP-EXECFILE] — 2026-06-24
-  // ⛔ NEVER replace this with a terminal.sendText chain again — that
+  // [LOCKED] [B2-SETUP-EXECFILE], 2026-06-24
+  // [NEVER] replace this with a terminal.sendText chain again, that
   //     was the user-trust regression the 2026-06-23 audit flagged as
   //     blocker B2. cp.execFile + OutputChannel is the path.
   // WHY: terminal.sendText has no exit-code visibility, no per-step

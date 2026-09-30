@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, readd
 import { join } from "path";
 import { tmpdir } from "os";
 import { createHash } from "crypto";
-import { appendAudit, safeAppend, verifyChain, readAuditLog, resetCacheForTest } from "../src/audit.js";
+import { appendAudit, safeAppend, verifyChain, readAuditLog } from "../src/audit.js";
 
 let home: string;
 let original: string | undefined;
@@ -16,7 +16,6 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ce-torn-test-"));
   original = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = home;
-  resetCacheForTest();
 });
 
 afterEach(() => {

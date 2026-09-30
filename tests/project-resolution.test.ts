@@ -17,7 +17,7 @@ afterEach(() => {
   rmSync(tempRoot, { recursive: true, force: true });
 });
 
-// 🔒 [SCORE-ACCEPTS-PATH] — these tests exist to stop a regression to name-only
+// [LOCK] [SCORE-ACCEPTS-PATH], these tests exist to stop a regression to name-only
 // lookup. `score /Users/yan/Projects/PLANK.io` used to fail with "Project not
 // found" while listing PLANK.io among the available projects.
 describe("resolveProjectDir", () => {
@@ -81,7 +81,7 @@ describe("resolveProjectDir", () => {
   });
 });
 
-// 🔒 [SCORE-FLEET-IS-OPT-IN] — no-argument `score` resolves the enclosing
+// [LOCK] [SCORE-FLEET-IS-OPT-IN], no-argument `score` resolves the enclosing
 // project, so running it from src/ scores the project and not the subdirectory.
 describe("findProjectRoot", () => {
   it("walks up from a subdirectory to the directory holding .git", () => {
@@ -110,7 +110,7 @@ describe("findProjectRoot", () => {
     expect(findProjectRoot(proj)).toBe(proj);
   });
 
-  // 🔒 [SCORE-CWD-MUST-BE-A-PROJECT] — the caller refuses to score on null.
+  // [LOCK] [SCORE-CWD-MUST-BE-A-PROJECT], the caller refuses to score on null.
   it("returns null when no marker is found anywhere above — never falls back", () => {
     // A directory that is not a project must not be scored as one. Returning the
     // start directory here is what wrote a bogus `~/Projects/SCORE.md` claiming
@@ -138,7 +138,7 @@ describe("findProjectRoot", () => {
   });
 });
 
-// 🔒 [ENV-WORKSPACES-WINS] — the env var is the most specific statement of intent
+// [LOCK] [ENV-WORKSPACES-WINS], the env var is the most specific statement of intent
 // and must beat a config file. It was a fallback that only applied when the config
 // defined no workspaces, so on a configured machine it was silently ignored — which
 // let a "sandboxed" review agent write SCORE.md into 28 real repositories.
@@ -188,7 +188,7 @@ describe("CONTEXTENGINE_WORKSPACES precedence", () => {
   });
 });
 
-// 🔒 [RESOLVE-PATH-MUST-BE-A-PROJECT] — confirmed by adversarial review, 2026-08-16.
+// [LOCK] [RESOLVE-PATH-MUST-BE-A-PROJECT], confirmed by adversarial review, 2026-08-16.
 // `score .` from ~/Projects wrote ~/Projects/SCORE.md ("Projects: 27/100 F") into the
 // container of 37 repos, and `score dist` wrote dist/SCORE.md into the npm-published
 // artifact directory. Both because "it is a directory that exists" was treated as proof
@@ -252,7 +252,7 @@ describe("resolveProjectDir — a directory is not automatically a project", () 
   });
 });
 
-// 🔒 [GIT-ROOT-IS-THE-PROJECT-BOUNDARY] — `cd ContextEngine/server && score` reported
+// [LOCK] [GIT-ROOT-IS-THE-PROJECT-BOUNDARY], `cd ContextEngine/server && score` reported
 // "server ... Not a git repo, No CI pipeline, README.md Missing" and wrote
 // server/SCORE.md, all false about the project the user was standing in.
 describe("findProjectRoot — .git is the boundary, not the nearest build file", () => {

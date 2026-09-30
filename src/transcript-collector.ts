@@ -9,8 +9,8 @@
  *        agent-<agentId>.jsonl                                       Agent-tool subagent
  *        workflows/<wf_id>/agent-<agentId>.jsonl                     Workflow subagent
  *
- * 🔒 LOCKED [TRANSCRIPT-DEDUP-BY-MESSAGE-ID] — 2026-08-19
- * ⛔ NEVER sum `message.usage` per JSONL line. One assistant `message.id` is
+ * [LOCKED] [TRANSCRIPT-DEDUP-BY-MESSAGE-ID], 2026-08-19
+ * [NEVER] sum `message.usage` per JSONL line. One assistant `message.id` is
  *    written across SEVERAL lines (one per content block: thinking, text, each
  *    tool_use), and EVERY line repeats the SAME usage object.
  * WHY: measured on a real agent transcript, naive per-line summing reported
@@ -60,8 +60,8 @@ export interface AgentUsage {
   /**
    * Tokens attributed to the model that actually produced them.
    *
-   * 🔒 LOCKED [PRICE-PER-MESSAGE-MODEL-NOT-PER-AGENT] — 2026-08-19
-   * ⛔ NEVER price an agent's whole tally at one model taken from its last
+   * [LOCKED] [PRICE-PER-MESSAGE-MODEL-NOT-PER-AGENT], 2026-08-19
+   * [NEVER] price an agent's whole tally at one model taken from its last
    *    assistant message.
    * WHY: Claude Code writes client-side notices ("You're out of usage
    *    credits", "API Error: …") as assistant messages with model
@@ -132,7 +132,7 @@ export interface CostBreakdown {
  * Longest-prefix pricing lookup. `*` is the catch-all. Returns null when
  * nothing matches — the caller must report that, not assume free.
  *
- * 🔒 LOCK [ABSENCE-IS-NOT-A-VERDICT] — an unpriced model is "I don't know
+ * [LOCK] [ABSENCE-IS-NOT-A-VERDICT], an unpriced model is "I don't know
  *    what this cost", never "$0". Session 21's recurring bug shape.
  */
 export function pricingFor(model: string | null, table: ModelPricing[]): ModelPricing | null {
@@ -150,8 +150,8 @@ export function pricingFor(model: string | null, table: ModelPricing[]): ModelPr
 /**
  * Value a token tally at API list prices.
  *
- * 🔒 LOCKED [COST-IS-NOTIONAL-ON-SUBSCRIPTION] — 2026-08-19
- * ⛔ NEVER present this number as money spent, or gate anything on it alone,
+ * [LOCKED] [COST-IS-NOTIONAL-ON-SUBSCRIPTION], 2026-08-19
+ * [NEVER] present this number as money spent, or gate anything on it alone,
  *    without stating the billing mode.
  * WHY: this machine runs Claude Code on a Max subscription (verified:
  *    `subscriptionType: max`, no ANTHROPIC_API_KEY anywhere). No dollar here
@@ -186,8 +186,8 @@ export function costOf(t: TokenTally, p: ModelPricing | null): CostBreakdown {
 /**
  * Whether a cost figure can be presented as money at all.
  *
- * 🔒 LOCKED [NEVER-RENDER-AN-UNKNOWN-AS-A-NUMBER] — 2026-08-20
- * ⛔ NEVER print a $0.00 cost row, total, or "caching saved" figure while
+ * [LOCKED] [NEVER-RENDER-AN-UNKNOWN-AS-A-NUMBER], 2026-08-20
+ * [NEVER] print a $0.00 cost row, total, or "caching saved" figure while
  *    `unpricedTokens > 0`.
  * WHY: 2.5.0 rendered a full VALUED COST table of $0.00 over 1.08 billion
  *    unpriced tokens, including "caching saved $0.00 (0%)" — which reads as
@@ -244,6 +244,24 @@ export function cacheEfficiency(t: TokenTally): number {
 
 // ─── Parsing ───────────────────────────────────────────────────────────────
 
+/** One line of a Claude Code transcript, as far as this file reads it. Any field may be absent
+ *  or of another type; every read below checks before it trusts. */
+interface TranscriptLine {
+  type?: unknown;
+  timestamp?: unknown;
+  message?: { id?: unknown; model?: unknown; usage?: RawUsage; content?: unknown } | null;
+}
+
+/** One block of a transcript message's content. */
+interface ContentBlock {
+  type?: unknown;
+  id?: unknown;
+  name?: unknown;
+  tool_use_id?: unknown;
+  content?: unknown;
+  text?: unknown;
+}
+
 interface RawUsage {
   input_tokens?: number;
   cache_creation_input_tokens?: number;
@@ -291,8 +309,9 @@ export function parseAgentTranscript(file: string): AgentUsage {
   for (const line of raw.split("\n")) {
     const s = line.trim();
     if (!s) continue;
-    let d: any;
+    let d: TranscriptLine | null;
     try { d = JSON.parse(s); } catch { continue; }
+    if (!d || typeof d !== "object") continue;
 
     const ts = parseTs(d.timestamp);
     if (ts !== null) {
@@ -302,11 +321,11 @@ export function parseAgentTranscript(file: string): AgentUsage {
 
     const m = d.message;
     if (!m || typeof m !== "object") continue;
-    const content = Array.isArray(m.content) ? m.content : [];
+    const content: (ContentBlock | null)[] = Array.isArray(m.content) ? m.content : [];
 
     // Tool results resolve StructuredOutput calls (the workflow report path).
     for (const b of content) {
-      if (b?.type === "tool_result" && structuredIds.has(b.tool_use_id)) {
+      if (b?.type === "tool_result" && typeof b.tool_use_id === "string" && structuredIds.has(b.tool_use_id)) {
         if (String(b.content ?? "").toLowerCase().includes("success")) sawStructuredOutputOk = true;
       }
     }
@@ -335,11 +354,12 @@ export function parseAgentTranscript(file: string): AgentUsage {
     if (lastTextSeen) break;
     const s = line.trim();
     if (!s) continue;
-    let d: any;
+    let d: TranscriptLine | null;
     try { d = JSON.parse(s); } catch { continue; }
-    if (d.type !== "assistant") continue;
-    const content = Array.isArray(d.message?.content) ? d.message.content : [];
-    const texts = content.filter((b: any) => b?.type === "text").map((b: any) => String(b.text ?? ""));
+    if (!d || typeof d !== "object" || d.type !== "assistant") continue;
+    const blocks = d.message?.content;
+    const content: (ContentBlock | null)[] = Array.isArray(blocks) ? blocks : [];
+    const texts = content.filter((b) => b?.type === "text").map((b) => String(b?.text ?? ""));
     if (texts.length && texts.join("").trim()) { lastText = texts.join(""); lastTextSeen = true; }
   }
 
@@ -390,8 +410,8 @@ export function parseAgentTranscript(file: string): AgentUsage {
 /**
  * Terminal state of an agent, read from its own last words.
  *
- * 🔒 LOCKED [AGENT-REPORTED-IS-NOT-LAST-LINE] — 2026-08-19
- * ⛔ NEVER decide "this agent completed" from the last LINE of the transcript.
+ * [LOCKED] [AGENT-REPORTED-IS-NOT-LAST-LINE], 2026-08-19
+ * [NEVER] decide "this agent completed" from the last LINE of the transcript.
  * WHY: 2,090 of 2,310 real transcripts end on a `user` line — the tool_result
  *    for the agent's own final `StructuredOutput` call. Reading the last line
  *    classified 2,146 healthy agents as "other" and would have made

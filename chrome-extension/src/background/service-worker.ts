@@ -147,7 +147,7 @@ async function flush() {
 async function persistStatus(config: ExtensionConfig) {
   const queueLength = (await loadQueue()).length;
   const state: CaptureStatus["state"] = (() => {
-    // 🔒 LOCKED [H2-STATE-MACHINE] — 2026-06-24
+    // [LOCKED] [H2-STATE-MACHINE], 2026-06-24
     // Audit FRESH_USER_AUDIT_2026-06-23.md H2 caught the original dead
     // ternary `queueLength > 0 ? 'error' : 'error'`. State machine now:
     //   no secret               → "unauthenticated" (blue dot, info text)
@@ -178,8 +178,8 @@ async function persistStatus(config: ExtensionConfig) {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "opscontext.event" && msg.event) {
     (async () => {
-      // 🔒 LOCKED [DROP-PRE-CONSENT] — 2026-06-23
-      // ⛔ NEVER enqueue an event when config.secret is null. The pre-consent
+      // [LOCKED] [DROP-PRE-CONSENT], 2026-06-23
+      // [NEVER] enqueue an event when config.secret is null. The pre-consent
       //    queue would silently transmit weeks-old captures the moment the
       //    user pastes a secret — a privacy surprise + CWS User Data Policy
       //    violation. See FRESH_USER_AUDIT_2026-06-23.md finding H1.
@@ -227,8 +227,8 @@ chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(FLUSH_ALARM_NAME, {
     periodInMinutes: PROD_FLUSH_INTERVAL_MIN,
   });
-  // 🔒 LOCKED [FIRST-RUN-NUDGE] — 2026-06-23
-  // ⛔ NEVER drop the on-install Options-page open. Audit
+  // [LOCKED] [FIRST-RUN-NUDGE], 2026-06-23
+  // [NEVER] drop the on-install Options-page open. Audit
   //   FRESH_USER_AUDIT_2026-06-23.md H1 caught this regression: with
   //   capture defaulting to OFF, a brand-new user lands on claude.ai,
   //   types a prompt, sees nothing happen, and has no signpost to the
@@ -247,8 +247,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// 🔒 LOCKED [STARTUP-STATUS] — 2026-06-23
-// ⛔ NEVER skip the startup persistStatus call. With capture defaulting
+// [LOCKED] [STARTUP-STATUS], 2026-06-23
+// [NEVER] skip the startup persistStatus call. With capture defaulting
 //   to OFF (H1), content scripts no longer trigger the SW onMessage path
 //   for a fresh user, so the lastError fallback never sets a useful
 //   message. Without this startup write, the popup shows state=null →

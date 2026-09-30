@@ -4,6 +4,36 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.16.0] 2026-09-30: nothing ships that does nothing
+
+Batch 3 of the end-to-end review (rows C2-1, C2-2, C7-1, C7-2 and C7-4): what the package carried or ran
+for nothing, each item measured first and proven on the release build from outside the repository.
+
+- **The package is 46 files lighter.** The type declarations stay out of the tarball: nothing could import
+  them (no `types`, no `exports`, the VS Code extension runs the command line). 102 files to 56, 401 kB to
+  350 kB to download.
+- **A deleted source can no longer ship its old compiled file.** tsc never removes an output: `dist/cache.js`
+  shipped from 2.6.0 to 2.12.0 after its source was gone. `npm run build` now ends with `prune-dist.mjs`,
+  which asks TypeScript which files the build produces and removes every other compiled file in `dist/`
+  (never the whole folder, which running servers load from), and `npm publish` refuses a compiled file with
+  no source in what it is about to pack. LOCK `[DIST-HAS-NO-ORPHANS]`.
+- **Dead code removed.** Five exports nothing used, 29 unused names, a table of runtime end-of-life dates the
+  compliance audit never read (its comment claimed the check; it now says what it checks), a learning
+  threshold never applied, and the remains of the audit head cache removed on 2026-08-17.
+- **Lint at zero, and a new warning fails.** 108 warnings to 0; `npm run lint` now runs with
+  `--max-warnings 0`. The installers may print only inside their command-line functions: one of them loads
+  inside the MCP server, whose output is the protocol.
+- **One bad entry no longer sinks a JSON import.** A null entry or a rule that is a number used to refuse the
+  whole file as "JSON parse error", losing every good entry after it. Each entry is now checked on its own;
+  a bad one is skipped and named. LOCK `[IMPORT-SKIPS-A-BAD-ENTRY]`.
+- **`agent_cost` reads past a transcript line that is not an object.** A `null` line made the whole report
+  fail; it is now skipped like any unreadable line.
+- **LOCK markers in the code are ASCII** (`[LOCKED]`, `[NEVER]`, `[LOCK] [TAG]`), 201 comment lines; the
+  program is byte-identical without its comments. The banner search results show is unchanged.
+
+Nothing to do after upgrading. Optional: `contextengine install-claude-hook` refreshes the installed hook,
+whose only difference from the bundled one is its comment markers.
+
 ## [2.15.0] 2026-09-29: a check that cannot run says so
 
 Batch 2 of the end-to-end review (rows C6-1 to C6-7 and C1-3): eight places where a failure was read as

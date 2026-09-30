@@ -121,12 +121,12 @@ function capturePromptsFromDOM() {
 
 // ─── Response capture ───────────────────────────────────────────────────────
 
-// 🔒 LOCKED [RESPONSE-DEDUPE] — 2026-06-23
-// ⛔ NEVER put `text.length` back in the dedupe key. The streaming-growth
+// [LOCKED] [RESPONSE-DEDUPE], 2026-06-23
+// [NEVER] put `text.length` back in the dedupe key. The streaming-growth
 //    over-emit bug (a response firing ~6× as it grew, once per 750ms settle)
 //    was exactly this: each settle saw a longer text, length-in-key differed,
 //    Set check missed, re-emit. Length stays OUT.
-// ⛔ NEVER replace `isBlockDone` with a document-wide `anyDone` check. While
+// [NEVER] replace `isBlockDone` with a document-wide `anyDone` check. While
 //    turn N+1 is mid-stream, turn N still has its copy button, so doc-wide
 //    "any copy button anywhere" returns true throughout. The result: turn
 //    N+1 emits a partial under the prefix-only dedupe key, and the final
@@ -168,7 +168,7 @@ function isBlockDone(block: Element): boolean {
 
 function captureResponses() {
   if (!captureEnabled) return;
-  // 🔒 LOCK [RESPONSE-DEDUPE] (continued): we CANNOT use
+  // [LOCK] [RESPONSE-DEDUPE] (continued): we CANNOT use
   //   `querySelectorAll(primary + ", " + fallback)`
   // because Anthropic's DOM nests:
   //   <div class="font-claude-response">         ← primary match

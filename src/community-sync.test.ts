@@ -26,7 +26,6 @@ import {
   rmSync,
 } from "fs";
 import { join } from "path";
-import { tmpdir } from "os";
 import { generateKeyPairSync, sign } from "crypto";
 import { __setLicensePublicKeyForTesting } from "./license-sig.js";
 

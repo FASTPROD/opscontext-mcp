@@ -17,7 +17,7 @@
  *   contextengine help                Show this message
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, mkdtempSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, mkdtempSync } from "fs";
 import { join, basename, resolve } from "path";
 import { createInterface } from "readline";
 import { tmpdir, homedir } from "os";
@@ -210,12 +210,6 @@ function generateClaudeMd(det: ProjectDetection): string {
 // Template for .vscode/mcp.json
 // ---------------------------------------------------------------------------
 function generateMcpJson(): object {
-  // Detect absolute node path for nvm compatibility
-  let nodePath = "node";
-  try {
-    nodePath = execSync("which node", { encoding: "utf-8" }).trim();
-  } catch { /* fallback to bare node */ }
-
   // Detect npx path for the args
   let npxPath = "npx";
   try {
@@ -237,8 +231,8 @@ function generateMcpJson(): object {
 // Template for pre-commit hook (CE doc freshness + secret scanner)
 // ---------------------------------------------------------------------------
 /**
- * 🔒 LOCKED [SKIPPING-A-HOOK-MUST-NAME-WHAT-IS-UNENFORCED] — 2026-08-20
- * ⛔ NEVER print a bare "already exists, skipping" for a hook slot. NEVER overwrite or
+ * [LOCKED] [SKIPPING-A-HOOK-MUST-NAME-WHAT-IS-UNENFORCED], 2026-08-20
+ * [NEVER] print a bare "already exists, skipping" for a hook slot. NEVER overwrite or
  *    append to a foreign hook either.
  * WHY: `init` refuses to clobber an existing hook, which is right, but it said so with one
  *      grey line among a column of green ticks. The user reads "init done" and believes the
@@ -359,8 +353,8 @@ function generatePreCommitHook(): string {
  * Generate the commit-msg hook — the ONLY place `commit_message_required`
  * can run.
  *
- * 🔒 LOCKED [COMMIT-MSG-HOOK-MUST-BE-INSTALLED] — 2026-08-19
- * ⛔ NEVER ship a `commit_message_required` policy rule without generating
+ * [LOCKED] [COMMIT-MSG-HOOK-MUST-BE-INSTALLED], 2026-08-19
+ * [NEVER] ship a `commit_message_required` policy rule without generating
  *    this hook in the same `init`.
  * WHY: the rule type, its CLI subcommand, and its tests all existed and all
  *    passed, but `init` installed only pre-commit and post-commit. Proven by
@@ -676,7 +670,7 @@ async function runInit(): Promise<void> {
 // CLI Engine — shared initialization for all CLI subcommands
 // ---------------------------------------------------------------------------
 
-import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, findProjectRoot, hasProjectMarker, looksLikePath, type KnowledgeSource } from "./config.js";
+import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, findProjectRoot, looksLikePath, type KnowledgeSource } from "./config.js";
 import { ingestSources, type Chunk } from "./ingest.js";
 import { summarizeSource } from "./source-summary.js";
 import { searchChunks } from "./search.js";
@@ -686,10 +680,8 @@ import { repoStatus } from "./repo-status.js";
 import { scanCodeDir } from "./code-chunker.js";
 import {
   listProjects,
-  checkPorts,
   runComplianceAudit,
   formatProjectList,
-  formatPortMap,
   formatPlan,
   scoreProject,
   runScoreCanary,
@@ -727,7 +719,6 @@ import {
 import {
   syncTierA,
   syncTierB,
-  syncAll,
   loadCommunityStore,
   communityRulesToChunks,
   mergeWithDedup,
@@ -1001,8 +992,8 @@ async function cliDeleteLearning(id: string): Promise<void> {
 }
 
 /**
- * 🔒 LOCKED [SCORE-FLEET-IS-OPT-IN] — 2026-08-16
- * ⛔ NEVER make a bare `contextengine score` iterate the whole fleet again, and never
+ * [LOCKED] [SCORE-FLEET-IS-OPT-IN], 2026-08-16
+ * [NEVER] make a bare `contextengine score` iterate the whole fleet again, and never
  *    let the no-argument path write SCORE.md anywhere but the resolved project root.
  * WHY: `score` with no argument scored all 37 discovered projects AND wrote a SCORE.md
  *      into every one of them. Three separate agent sessions ran it expecting to score
@@ -1688,8 +1679,8 @@ tamper-evident audit log at ~/.contextengine/audit.log.`);
     console.error(`Error reading staged diff: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
-  // 🔒 LOCKED [RULE-PARITY-ALL-IGNORES-DIFF] — 2026-08-19
-  // ⛔ NEVER let the empty-staged-diff short-circuit swallow an --all audit.
+  // [LOCKED] [RULE-PARITY-ALL-IGNORES-DIFF], 2026-08-19
+  // [NEVER] let the empty-staged-diff short-circuit swallow an --all audit.
   // WHY: `hook rule-parity --all` is a whole-repo audit for CI and deliberate sweeps —
   //      it does not depend on the diff at all. This early return ran first, so on a
   //      clean tree the command printed NOTHING and exited 0. A compliance check that
@@ -2679,8 +2670,8 @@ async function cliImportLearnings(args: string[]): Promise<void> {
   let result;
   try {
     result = importLearningsFromFile(filePath, category, project, { permissive });
-  } catch (e: any) {
-    console.error(`⛔ Import refused: ${e?.message || e}`);
+  } catch (e) {
+    console.error(`⛔ Import refused: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
   console.log(`\n📥 Import Results:`);
@@ -3241,7 +3232,7 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
 } else if (command === "--version" || command === "-v" || command === "version") {
   console.log(readPackageVersion());
 } else {
-  // 🔒 [LOCK] [UNKNOWN-COMMAND-MUST-NOT-START-A-SERVER] — see src/cli-commands.ts
+  // [LOCK] [UNKNOWN-COMMAND-MUST-NOT-START-A-SERVER], see src/cli-commands.ts
   // An unrecognised token used to fall through to the MCP server, which then waited on
   // stdin forever: no error, no exit code, no output. Name it and fail instead.
   console.error(`Unknown command: ${command}`);

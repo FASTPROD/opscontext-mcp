@@ -4,7 +4,6 @@ import {
   canonicalPayload,
   verifyLicenseSignature,
   LICENSE_PUBLIC_KEY_PEM,
-  LICENSE_PUBKEY_FINGERPRINT,
   type SignableLicensePayload,
 } from "../src/license-sig.js";
 
@@ -54,10 +53,6 @@ describe("LICENSE_PUBLIC_KEY_PEM", () => {
   it("is a parseable PEM-encoded Ed25519 public key", () => {
     expect(LICENSE_PUBLIC_KEY_PEM).toMatch(/^-----BEGIN PUBLIC KEY-----/);
     expect(LICENSE_PUBLIC_KEY_PEM).toMatch(/-----END PUBLIC KEY-----$/m);
-  });
-
-  it("fingerprint is a 32-char lowercase hex string", () => {
-    expect(LICENSE_PUBKEY_FINGERPRINT).toMatch(/^[a-f0-9]{32}$/);
   });
 });
 

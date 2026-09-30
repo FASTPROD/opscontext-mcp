@@ -8,7 +8,6 @@ import {
   countLiveRecords,
   listSegments,
   verifyChain,
-  resetCacheForTest,
 } from "../src/audit.js";
 
 let tempHome: string;
@@ -21,7 +20,6 @@ beforeEach(() => {
   originalFlag = process.env.CONTEXTENGINE_AUTO_ROTATE;
   process.env.CONTEXTENGINE_HOME = tempHome;
   delete process.env.CONTEXTENGINE_AUTO_ROTATE;
-  resetCacheForTest();
 });
 
 afterEach(() => {
@@ -29,7 +27,6 @@ afterEach(() => {
   else process.env.CONTEXTENGINE_HOME = originalHome;
   if (originalFlag === undefined) delete process.env.CONTEXTENGINE_AUTO_ROTATE;
   else process.env.CONTEXTENGINE_AUTO_ROTATE = originalFlag;
-  resetCacheForTest();
   rmSync(tempHome, { recursive: true, force: true });
 });
 

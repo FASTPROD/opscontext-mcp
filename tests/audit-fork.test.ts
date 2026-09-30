@@ -36,7 +36,7 @@ async function verify() {
   return mod.verifyChain();
 }
 
-// 🔒 [VERIFY-FORK-IS-NOT-TAMPER] — the verifier used to return on the FIRST prev_hash
+// [LOCK] [VERIFY-FORK-IS-NOT-TAMPER], the verifier used to return on the FIRST prev_hash
 // mismatch and tell the user the log "was either edited after the fact, or partially
 // written during a crash". On the author's real log that declared 316,000 records
 // unverifiable — for a condition it had never tested. Measured truth: 0 altered records,
@@ -123,11 +123,10 @@ describe("verifyChain — tampering vs concurrency are different findings", () =
   });
 });
 
-// 🔒 [AUDIT-TAIL-READ-IS-O1] + [AUDIT-HEAD-FROM-DISK]
+// [LOCK] [AUDIT-TAIL-READ-IS-O1] + [AUDIT-HEAD-FROM-DISK]
 describe("appendAudit — head comes from disk, not from a cache", () => {
   it("chains onto a record written by a DIFFERENT process mid-run", async () => {
     const mod = await import("../src/audit.js");
-    mod.resetCacheForTest();
 
     const first = mod.appendAudit("learning.save", { i: 1 });
 
@@ -146,7 +145,6 @@ describe("appendAudit — head comes from disk, not from a cache", () => {
 
   it("reads the head correctly when the log exceeds the tail window", async () => {
     const mod = await import("../src/audit.js");
-    mod.resetCacheForTest();
     // A payload large enough that many records blow past the 64KB tail read.
     const big = "x".repeat(4096);
     let last = "";

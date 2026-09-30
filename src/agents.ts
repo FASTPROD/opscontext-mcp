@@ -1,7 +1,7 @@
 import { execSync } from "child_process";
 import { readFileSync, existsSync, readdirSync, statSync, lstatSync, readlinkSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "fs";
-import { resolve, join, basename, dirname } from "path";
-import { homedir, tmpdir } from "os";
+import { resolve, join, dirname } from "path";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import type { ProjectDirectory } from "./config.js";
 import { RUBRIC } from "./rubric.js";
@@ -89,8 +89,8 @@ function exec(cmd: string, cwd?: string): string {
 /**
  * exec() that distinguishes "ran, produced nothing" from "did not run".
  *
- * 🔒 LOCKED [EXEC-FAILURE-IS-NOT-EMPTY] — 2026-08-13
- * ⛔ NEVER let a caller treat exec()'s "" as a factual answer for a check that can FAIL SAFE.
+ * [LOCKED] [EXEC-FAILURE-IS-NOT-EMPTY], 2026-08-13
+ * [NEVER] let a caller treat exec()'s "" as a factual answer for a check that can FAIL SAFE.
  * WHY: exec() returns "" for every failure mode — command not found, not a git repo, timeout,
  *      permission denied — indistinguishable from a successful empty result. The `Secrets exposure`
  *      check read `git ls-files .env` → "" as ".env is not tracked" and awarded a full 6/6 PASS.
@@ -163,8 +163,8 @@ function matchDocTopics(content: string, topics: typeof AGENT_DOC_TOPICS): strin
 /**
  * Primary language of a project, used to pick which tooling checks even apply.
  *
- * 🔒 LOCKED [SCORE-LANGUAGE-AWARE] — 2026-08-15
- * ⛔ NEVER score a project against tooling from a language it does not use.
+ * [LOCKED] [SCORE-LANGUAGE-AWARE], 2026-08-15
+ * [NEVER] score a project against tooling from a language it does not use.
  * WHY: the Odoo connector — a pure Python addon with 15 passing tests — was scored
  *      "❌ No tsconfig/jsconfig" (0/5) and "❌ No lint config" (0/4). A Python project is not
  *      *missing* a TypeScript config; the check simply does not apply, and reporting 0/5 for it
@@ -253,8 +253,8 @@ function readlinkSafe(filePath: string): string {
  * Resolve an agent doc that may live in `.github/` or at the repo root.
  * Returns the first location that exists (`.github/` wins), or null.
  *
- * 🔒 LOCKED [DOC-PATH-DUAL] — 2026-08-07
- * ⛔ NEVER collapse a caller back to a single hardcoded join(p, ".github", file).
+ * [LOCKED] [DOC-PATH-DUAL], 2026-08-07
+ * [NEVER] collapse a caller back to a single hardcoded join(p, ".github", file).
  * WHY: the scorer read `.github/` only, while `contextengine init` writes SKILLS.md
  *      at the repo root and the generated pre-commit hook accepts both. Every project
  *      keeping these at root scored 0/10 + 0/3 for files that existed, so SCORE.md
@@ -311,7 +311,7 @@ function countTestFiles(dirPath: string, depth: number = 0): TestCount {
         if (sub.error !== null) return sub;
         count += sub.count;
       } else if (entry.isFile()) {
-        // 🔒 [SCORE-LANGUAGE-AWARE] — the extension list is part of the language assumption.
+        // [LOCK] [SCORE-LANGUAGE-AWARE], the extension list is part of the language assumption.
         // `dart` was absent, so PLANK.io's 68 Flutter tests in plank_app/test/ counted as ZERO:
         // the directory was found, every file was skipped, and the row credited the Node backend
         // alone. A test counter that silently ignores a language reports "no tests" for a suite
@@ -983,19 +983,12 @@ function auditPm2(projects: ProjectInfo[]): AuditFinding[] {
 }
 
 /**
- * Check for version issues — EOL runtimes, outdated deps, MUI v4/v5 coexistence.
+ * Check two dependency problems: MUI v4 and v5 installed together, and react-scripts before 5.
+ * Runtime end-of-life is not checked: a table of EOL dates sat here unread from v1.9.42 to
+ * 2026-09-29 (review row C7-2) and was removed rather than left to look like a check.
  */
 function auditVersions(projects: ProjectInfo[]): AuditFinding[] {
   const findings: AuditFinding[] = [];
-
-  // Known EOL dates (approximate)
-  const eolRuntimes: Record<string, { eol: string; replacement: string }> = {
-    "php 7.4": { eol: "Nov 2022", replacement: "PHP 8.2+" },
-    "node 14": { eol: "Apr 2023", replacement: "Node 20 LTS" },
-    "node 16": { eol: "Sep 2023", replacement: "Node 20 LTS" },
-    "python 3.7": { eol: "Jun 2023", replacement: "Python 3.11+" },
-    "python 3.8": { eol: "Oct 2024", replacement: "Python 3.11+" },
-  };
 
   for (const p of projects) {
     // Check MUI v4/v5 coexistence
@@ -1256,8 +1249,8 @@ export interface ScoreCheck {
 }
 
 /**
- * 🔒 LOCKED [ABSENCE-IS-NOT-A-VERDICT] — 2026-08-13
- * ⛔ NEVER emit "pass" or "fail" for a condition the check could not actually determine,
+ * [LOCKED] [ABSENCE-IS-NOT-A-VERDICT], 2026-08-13
+ * [NEVER] emit "pass" or "fail" for a condition the check could not actually determine,
  *    and NEVER write a detail string that hides WHICH locations were inspected.
  * WHY: three live bugs, all the same shape — the scorer wrote *absence of evidence* down as
  *      a *verdict*, and the verdict pointed at the wrong fix.
@@ -1293,8 +1286,8 @@ export interface CanaryResult {
 }
 
 /**
- * 🔒 LOCKED [SCORE-CANARY] — 2026-08-13
- * ⛔ NEVER weaken this to "test one known bug", and never let a deviation be a warning only.
+ * [LOCKED] [SCORE-CANARY], 2026-08-13
+ * [NEVER] weaken this to "test one known bug", and never let a deviation be a warning only.
  * WHY: every guard in this file was written AFTER the failure it prevents — the doc-path bug, the
  *      dangling-hook bug, the shrinking-denominator bug. A wall of named guards is a museum of past
  *      mistakes: valuable, but it does nothing about the next one. The canary is the only check here
@@ -1406,8 +1399,8 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   // --- Documentation (30 points max) ---
 
   // copilot-instructions.md (6 pts) — scored on CONTENT, not length.
-  // 🔒 LOCKED [SCORE-CONTENT-NOT-LENGTH] — 2026-08-14
-  // ⛔ NEVER score an agent doc on line count alone.
+  // [LOCKED] [SCORE-CONTENT-NOT-LENGTH], 2026-08-14
+  // [NEVER] score an agent doc on line count alone.
   // WHY: this was 10 points — a tenth of the entire score — awarded for ">50 lines". Fifty lines
   //      of anything earned full marks, so the largest single check in the rubric was also the
   //      easiest to satisfy without doing the work. Length is a proxy for effort; it measures
@@ -1443,8 +1436,8 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   }
 
   // Doc freshness (4 pts) — is the agent doc keeping up with the code?
-  // 🔒 LOCKED [SCORE-DOC-FRESHNESS] — 2026-08-14
-  // ⛔ NEVER treat a doc's existence as evidence that it is current.
+  // [LOCKED] [SCORE-DOC-FRESHNESS], 2026-08-14
+  // [NEVER] treat a doc's existence as evidence that it is current.
   // WHY: a 500-line copilot-instructions.md last touched a year ago scored identically to one
   //      updated yesterday. Stale agent docs are worse than missing ones — an agent trusts them.
   // FIX: count commits that touched the repo since the doc was last modified, excluding the doc
@@ -1891,8 +1884,8 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   }
 
   // --- Calculate totals ---
-  // 🔒 LOCKED [SCORE-ARITHMETIC-INVARIANT] — 2026-08-13
-  // ⛔ NEVER compute the percentage against a summed maxScore without checking it equals 100 first.
+  // [LOCKED] [SCORE-ARITHMETIC-INVARIANT], 2026-08-13
+  // [NEVER] compute the percentage against a summed maxScore without checking it equals 100 first.
   // WHY: several checks only push a result inside an `if` (e.g. "Deps gitignored" is skipped
   //      entirely when a project has no .gitignore). A skipped check silently SHRANK the
   //      denominator, so a project got a percentage out of 97 while every report — and every
@@ -1936,8 +1929,8 @@ export function scoreProject(dir: ProjectDirectory): ProjectScore {
   else if (percentage >= 50) grade = "D";
   else grade = "F";
 
-  // 🔒 LOCKED [SECURITY-IS-DISQUALIFYING] — 2026-08-14
-  // ⛔ NEVER let exposed secrets be averaged away into a good grade.
+  // [LOCKED] [SECURITY-IS-DISQUALIFYING], 2026-08-14
+  // [NEVER] let exposed secrets be averaged away into a good grade.
   // WHY: security was 20 of 100, so a project could commit its .env and still score 80% on the
   //      strength of good docs. Weighting alone cannot express "this one thing is not a rounding
   //      error" — at any weight below ~50 the arithmetic still lets other categories outvote it.

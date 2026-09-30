@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "fs";
 import { execFileSync } from "child_process";
 import { join } from "path";
-import { KNOWN_COMMANDS, SERVER_COMMANDS, suggestCommands, isKnownCommand } from "../src/cli-commands.js";
+import { KNOWN_COMMANDS, SERVER_COMMANDS, suggestCommands } from "../src/cli-commands.js";
 
 const CLI_SRC = readFileSync(join(process.cwd(), "src/cli.ts"), "utf-8");
 
@@ -55,15 +55,15 @@ describe("suggestCommands", () => {
   });
 });
 
-describe("isKnownCommand", () => {
+describe("KNOWN_COMMANDS membership", () => {
   it("knows the commands the help text advertises", () => {
     for (const c of ["search", "score", "cost", "audit-verify", "audit-rotate", "init"]) {
-      expect(isKnownCommand(c)).toBe(true);
+      expect(KNOWN_COMMANDS).toContain(c);
     }
   });
   it("rejects a command that does not exist", () => {
     // SESSION_22 §E3 measured this one and mistook a booting MCP server for a missing gate.
-    expect(isKnownCommand("check-ports")).toBe(false);
+    expect(KNOWN_COMMANDS).not.toContain("check-ports");
   });
 });
 

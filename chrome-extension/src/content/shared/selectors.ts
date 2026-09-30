@@ -1,9 +1,9 @@
-// 🔒 LOCKED [SELECTORS] — 2026-06-22
-// ⛔ NEVER hardcode a single selector path. The two-tier model (testid → structural)
+// [LOCKED] [SELECTORS], 2026-06-22
+// [NEVER] hardcode a single selector path. The two-tier model (testid → structural)
 //    is the only way to survive Anthropic / OpenAI DOM churn. If a selector breaks,
 //    add a new entry to the FALLBACKS array — do NOT replace the primary in place
 //    (the old primary might still resolve in older browser cache states).
-// ⛔ NEVER capture from a frame that isn't `top` (all_frames:false in manifest).
+// [NEVER] capture from a frame that isn't `top` (all_frames:false in manifest).
 //    Anthropic embeds rendered LaTeX iframes that contain prompt text echoes.
 // WHY: DOM selectors break silently. Two-tier with the CI fixture smoke test in
 //    LICENSE_THIRD_PARTY.md is the contract that catches "anthropic shipped a

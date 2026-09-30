@@ -1,12 +1,12 @@
-// 🔒 LOCKED [DRIFT-HEURISTICS] — 2026-06-23
-// ⛔ NEVER make a heuristic fire on a single event in isolation. Every
+// [LOCKED] [DRIFT-HEURISTICS], 2026-06-23
+// [NEVER] make a heuristic fire on a single event in isolation. Every
 //    heuristic looks at a WINDOW of events. Single-event triggers will
 //    fire on the user's normal workflow and burn trust in the alerts.
-// ⛔ NEVER raise a critical severity from a heuristic without a corresponding
+// [NEVER] raise a critical severity from a heuristic without a corresponding
 //    audit event (drift.detected with full payload). Critical = OS
 //    notification + interrupt — the audit trail is what the user reviews
 //    after-the-fact to understand WHY the alert fired.
-// ⛔ NEVER trust the assistant's claim that something exists in the file
+// [NEVER] trust the assistant's claim that something exists in the file
 //    system. The fabrication_suspect check is precisely about catching
 //    those claims. If you add helpers, default to "verify against fs".
 // WHY: Drift alerts have to be precise. False positives train users to
@@ -481,8 +481,8 @@ export type { AuditRecord, AuditEvent };
 
 // ─── Transcript-based heuristics (multi-agent cost) ────────────────────────
 //
-// 🔒 LOCKED [TRANSCRIPT-HEURISTICS-ARE-SEPARATE] — 2026-08-19
-// ⛔ NEVER add these to the HEURISTICS array above. Those take AuditRecord[]
+// [LOCKED] [TRANSCRIPT-HEURISTICS-ARE-SEPARATE], 2026-08-19
+// [NEVER] add these to the HEURISTICS array above. Those take AuditRecord[]
 //    from ~/.contextengine/audit.log; these take RunUsage from Claude Code's
 //    own JSONL transcripts. Different source, different cadence, no overlap.
 // WHY: the [DRIFT-HEURISTICS] LOCK requires audit heuristics to stay pure
@@ -579,8 +579,8 @@ export function detectContextBurn(
  * reported, so nothing was known about per-agent consumption when the spend
  * was committed.
  *
- * 🔒 LOCKED [CANARY-IS-A-TIME-ORDERING] — 2026-08-19
- * ⛔ NEVER implement this as "no agent reported". A completed 300-agent run
+ * [LOCKED] [CANARY-IS-A-TIME-ORDERING], 2026-08-19
+ * [NEVER] implement this as "no agent reported". A completed 300-agent run
  *    has 300 reports and was still un-canaried.
  * WHY: the rule being enforced is "run ONE unit and read its consumption
  *    BEFORE scaling". That is a statement about ordering, not about outcomes,

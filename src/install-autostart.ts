@@ -1,10 +1,10 @@
-// 🔒 LOCKED [AUTOSTART-INSTALL] — 2026-06-23
-// ⛔ NEVER bootstrap into a `system/` domain (would need root + run as root).
+// [LOCKED] [AUTOSTART-INSTALL], 2026-06-23
+// [NEVER] bootstrap into a `system/` domain (would need root + run as root).
 //    Use `gui/$UID` — per-user agent, started at user login, runs as the user.
-// ⛔ NEVER write the plist before checking if a server is already listening on
+// [NEVER] write the plist before checking if a server is already listening on
 //    the port. A pre-existing process means we'd race with the launchd-managed
 //    one for port 7842.
-// ⛔ NEVER ship a plist that calls `npx -y @latest` — every restart would
+// [NEVER] ship a plist that calls `npx -y @latest`, every restart would
 //    fetch the registry, eating ~3s and breaking offline. Pin a specific
 //    node path + a specific dist path.
 // WHY: This is the "set it and forget it" entrypoint for non-technical users.
@@ -15,15 +15,15 @@
 //    add equivalent systemd / NSSM logic. Keep `gui/$UID` and KeepAlive
 //    discipline in any new platform.
 
-import { existsSync, writeFileSync, mkdirSync, readlinkSync } from "fs";
+import { existsSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { homedir, platform } from "os";
 import { execFileSync } from "child_process";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 
-// 🔒 LOCKED [M2-ESM-FILENAME-FIX] — 2026-06-24
-// ⛔ NEVER reference bare `__filename` in this file — the package is
+// [LOCKED] [M2-ESM-FILENAME-FIX], 2026-06-24
+// [NEVER] reference bare `__filename` in this file, the package is
 //    `"type": "module"` so __filename is `undefined` at runtime and
 //    `dirname(__filename || "")` was returning dirname("") = "." which
 //    silently broke the dev-tree fallback. Audit FRESH_USER_AUDIT_
@@ -202,6 +202,9 @@ function waitForPort(timeoutSec: number = 30): boolean | null {
   return false;
 }
 
+/* eslint-disable no-console -- the three commands below print their report on stdout, CLI only.
+   The helpers above stay under the rule, in case the MCP server ever imports one: its stdout is
+   the protocol (CLAUDE.md rule 5). */
 export async function cliInstallAutostart(args: string[]): Promise<void> {
   const help = args.includes("-h") || args.includes("--help");
   if (help) {
@@ -419,3 +422,4 @@ running entrypoint.`);
   console.log(``);
   console.log(`Logs: ~/.contextengine/logs/mcp-stderr.log`);
 }
+/* eslint-enable no-console */

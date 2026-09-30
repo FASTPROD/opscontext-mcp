@@ -1,6 +1,6 @@
 {
   "name": "@compr/opscontext-mcp",
-  "version": "2.15.0",
+  "version": "2.16.0",
   "description": "OpsContext for AI Agents — read-only fleet visibility (PM2/nginx/Docker/git/cron) + tamper-evident audit log + policy-as-code hooks. The ops + compliance layer Claude Code can't grow natively.",
   "type": "module",
   "main": "dist/index.js",
@@ -11,13 +11,13 @@
     "contextengine-mcp": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node prune-dist.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint src/",
-    "prepublishOnly": "node scripts/check-npm-token-expiry.mjs && npm run build && node scripts/obfuscate-rubric.mjs",
+    "lint": "eslint src/ --max-warnings 0",
+    "prepublishOnly": "node scripts/check-npm-token-expiry.mjs && npm run build && node scripts/obfuscate-rubric.mjs && node prune-dist.mjs --check",
     "check-token": "node scripts/check-npm-token-expiry.mjs",
     "verify-release": "bash scripts/verify-release.sh"
   },
@@ -65,6 +65,7 @@
     "dist/",
     "!dist/test*",
     "!dist/**/*.map",
+    "!dist/**/*.d.ts",
     "defaults/",
     "!defaults/__pycache__",
     "skills/",

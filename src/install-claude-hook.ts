@@ -1,11 +1,11 @@
-// 🔒 LOCKED [CLAUDE-HOOK-INSTALL] — 2026-06-23
-// ⛔ NEVER overwrite existing entries in hooks.PostToolUse — must APPEND.
+// [LOCKED] [CLAUDE-HOOK-INSTALL], 2026-06-23
+// [NEVER] overwrite existing entries in hooks.PostToolUse, must APPEND.
 //    Users (and CE itself via the dogfood settings) commonly have
 //    matcher-specific PostToolUse entries (e.g. "Read|Edit|Write" gating)
 //    that would be silently destroyed by a replace.
-// ⛔ NEVER write to ~/.claude/settings.json without parsing first. A typo
+// [NEVER] write to ~/.claude/settings.json without parsing first. A typo
 //    or non-JSON state means Claude Code refuses to start.
-// ⛔ NEVER emit on PreToolUse — would double-count vs PostToolUse for the
+// [NEVER] emit on PreToolUse, would double-count vs PostToolUse for the
 //    `stuck` heuristic and skew `silent_failure` counts.
 // WHY: Claude Code hook wiring is the ONLY way the user's terminal Claude
 //    Code sessions get into the OpsContext audit log. The installer has to
@@ -278,6 +278,9 @@ function globalCliPath(): string | null {
   }
 }
 
+/* eslint-disable no-console -- the two commands below print their report on stdout, CLI only.
+   The rest of this file stays under the rule: fleet-health.ts imports claudeHookRegistrations(),
+   so this module loads inside the MCP server, whose stdout is the protocol (CLAUDE.md rule 5). */
 export async function cliInstallClaudeHook(args: string[]): Promise<void> {
   const help = args.includes("-h") || args.includes("--help");
   if (help) {
@@ -517,3 +520,4 @@ manually if you want them gone. The audit log is NOT touched.`);
   console.log(`   Hook script kept at: ${HOOK_SCRIPT}`);
   console.log(`   Audit log untouched.`);
 }
+/* eslint-enable no-console */

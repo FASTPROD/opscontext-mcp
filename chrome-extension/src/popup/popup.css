@@ -2,7 +2,7 @@
   --bg: #0f172a; --surface: #1e293b; --border: #334155;
   --text: #f1f5f9; --muted: #94a3b8; --accent: #3b82f6;
   --ok: #22c55e; --warn: #f59e0b; --err: #ef4444;
-  --info: #3b82f6; /* 🔒 LOCKED [H2-UNAUTHENTICATED-NOT-RED] 2026-06-24
+  --info: #3b82f6; /* [LOCKED] [H2-UNAUTHENTICATED-NOT-RED] 2026-06-24
                        — unauthenticated must NOT share color with error,
                        per FRESH_USER_AUDIT_2026-06-23.md H2. "no secret
                        configured" is informational, not a failure. */

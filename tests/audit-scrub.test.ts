@@ -10,7 +10,6 @@ import {
   acknowledgeRedaction,
   readAuditLog,
   listSegments,
-  resetCacheForTest,
 } from "../src/audit.js";
 import { redactPayload } from "../src/secret-shapes.js";
 
@@ -21,13 +20,11 @@ beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), "ce-scrub-test-"));
   originalHome = process.env.CONTEXTENGINE_HOME;
   process.env.CONTEXTENGINE_HOME = tempHome;
-  resetCacheForTest();
 });
 
 afterEach(() => {
   if (originalHome === undefined) delete process.env.CONTEXTENGINE_HOME;
   else process.env.CONTEXTENGINE_HOME = originalHome;
-  resetCacheForTest();
   rmSync(tempHome, { recursive: true, force: true });
 });
 

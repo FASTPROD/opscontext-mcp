@@ -1,11 +1,11 @@
 // LOCKED — verified March 3 2026 — Xenova all-MiniLM-L6-v2 local CPU embeddings + disk cache
 // DO NOT RE-AUDIT — stable since v1.0, no API keys, no data leaves machine
 //
-// 🔒 LOCKED [OPTIONAL-HF] — 2026-06-10
-// ⛔ NEVER convert `await import("@huggingface/transformers")` to a static
+// [LOCKED] [OPTIONAL-HF], 2026-06-10
+// [NEVER] convert `await import("@huggingface/transformers")` to a static
 //    import. HF is in optionalDependencies — a static import breaks installs
 //    that ran with --omit=optional (locked-down npm proxies, air-gapped CI).
-// ⛔ NEVER remove the try/catch around the dynamic import or the
+// [NEVER] remove the try/catch around the dynamic import or the
 //    isMissingDep detection branch — both keep the MCP server alive on
 //    fresh installs where HF didn't download.
 // WHY: The package was failing to install on enterprise environments because
@@ -20,7 +20,10 @@ import { embedKey, appendEmbeddings } from "./embedding-store.js";
 
 // We dynamically import @huggingface/transformers to keep startup fast
 // and handle the case where it fails gracefully.
-let embedPipeline: any = null;
+/** The part of the transformers pipeline this file calls: one text in, one pooled vector out.
+ *  Written here because the package's own pipeline types are too large for tsc to infer (TS2590). */
+type EmbedPipeline = (text: string, options: { pooling: "mean"; normalize: boolean }) => Promise<{ data: ArrayLike<number> }>;
+let embedPipeline: EmbedPipeline | null = null;
 
 export const MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 
@@ -37,9 +40,9 @@ export async function initEmbeddings(): Promise<boolean> {
   try {
     console.error(`[ContextEngine] 🧠 Loading embedding model: ${MODEL_NAME}...`);
     const { pipeline } = await import("@huggingface/transformers");
-    embedPipeline = await pipeline("feature-extraction", MODEL_NAME, {
+    embedPipeline = (await pipeline("feature-extraction", MODEL_NAME, {
       dtype: "fp32",
-    });
+    })) as unknown as EmbedPipeline;
     console.error(`[ContextEngine] ✅ Embedding model loaded`);
     return true;
   } catch (err) {
@@ -69,6 +72,7 @@ export async function initEmbeddings(): Promise<boolean> {
  * Embed a single text string → float32 vector (384 dimensions).
  */
 async function embedText(text: string): Promise<Float32Array> {
+  if (!embedPipeline) throw new Error("the embedding model is not loaded");
   const output = await embedPipeline(text, {
     pooling: "mean",
     normalize: true,

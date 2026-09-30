@@ -1,9 +1,9 @@
-// 🔒 LOCKED [CLAUDE-INTEGRATION] — 2026-06-11
-// ⛔ NEVER change the BEGIN/END managed-block markers without a migration
+// [LOCKED] [CLAUDE-INTEGRATION], 2026-06-11
+// [NEVER] change the BEGIN/END managed-block markers without a migration
 //    path. Users will have these markers committed in their CLAUDE.md
 //    files; changing the format silently doubles the block (old marker
 //    stays in place, new marker appended fresh).
-// ⛔ NEVER include rule content that could be sensitive (raw command lines,
+// [NEVER] include rule content that could be sensitive (raw command lines,
 //    file paths with secrets, etc.) in the managed block — CLAUDE.md is
 //    committed to git. Emit IDs + categories + short descriptions only.
 // WHY: OpsContext-managed sections in CLAUDE.md are the highest-leverage

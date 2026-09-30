@@ -177,6 +177,7 @@ async function readStdinJson(): Promise<Record<string, unknown>> {
 /** `contextengine session-gate`: the Stop hook body. Exit 2 blocks the turn end, 0 lets it end. */
 export async function cliSessionGate(args: string[]): Promise<never> {
   if (args.includes("-h") || args.includes("--help")) {
+    // eslint-disable-next-line no-console -- the usage text of a CLI command; the hook never passes --help
     console.log(`Usage: contextengine session-gate   (as a Claude Code Stop hook; see install-claude-hook)
 
 Refuses to end a Claude Code turn (exit 2, reason on stderr) while the repo's CE session is

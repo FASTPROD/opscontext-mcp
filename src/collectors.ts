@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import { readFileSync, existsSync, readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from "fs";
-import { resolve, join, basename, dirname } from "path";
+import { resolve, join } from "path";
 import { homedir } from "os";
 import type { Chunk } from "./ingest.js";
 
@@ -501,6 +501,20 @@ export function collectDocker(sourceName: string, onFail?: CollectorFailure): Ch
 // 7. PM2 Collector (running processes)
 // ---------------------------------------------------------------------------
 
+/** The fields collectPM2 reads from `pm2 jlist`; any of them may be absent. */
+interface Pm2Process {
+  name?: string;
+  pid?: number;
+  pm2_env?: {
+    status?: string;
+    PORT?: string | number;
+    port?: string | number;
+    pm_cwd?: string;
+    pm_uptime?: number;
+    restart_time?: number;
+  };
+}
+
 /**
  * Collect PM2 process list — what apps are running, ports, status.
  */
@@ -529,8 +543,8 @@ export function collectPM2(sourceName: string, onFail?: CollectorFailure): Chunk
 
   {
     const formatted = processes
-      .map((p: any) => {
-        const env = p.pm2_env || {};
+      .map((p: Pm2Process) => {
+        const env: NonNullable<Pm2Process["pm2_env"]> = p.pm2_env || {};
         return [
           `${p.name}: ${env.status || "unknown"}`,
           `  pid: ${p.pid || "N/A"}`,

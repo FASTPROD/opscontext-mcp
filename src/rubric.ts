@@ -1,8 +1,8 @@
 /**
  * Scoring thresholds — the numbers that decide what earns what.
  *
- * 🔒 LOCKED [RUBRIC-SINGLE-TABLE] — 2026-08-14
- * ⛔ NEVER inline a scoring threshold back into src/agents.ts.
+ * [LOCKED] [RUBRIC-SINGLE-TABLE], 2026-08-14
+ * [NEVER] inline a scoring threshold back into src/agents.ts.
  * WHY: these values are what makes a score gameable — knowing ">50 lines earns the full 10"
  *      lets anyone pad a file to a number instead of writing the content. They were scattered
  *      as bare literals across ~10 call sites in agents.ts, so they shipped readable in

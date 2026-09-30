@@ -20,8 +20,8 @@
  * @module
  */
 
-// Import the Adapter type from ContextEngine
-// import type { Adapter } from "@compr/contextengine-mcp/adapters";
+// The Adapter shape (name, description, collect, and optional validate, init, destroy) is
+// described in src/adapters.ts of the public repo; the npm package ships no type declarations.
 
 /**
  * Notion adapter — fetches pages and databases from Notion

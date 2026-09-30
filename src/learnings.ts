@@ -219,8 +219,8 @@ export function withStoreLock<T>(fn: () => T): T {
       mkdirSync(STORE_LOCK_DIR);
       try { writeFileSync(join(STORE_LOCK_DIR, "pid"), String(process.pid)); } catch { /* diagnostics only */ }
       break;
-    } catch (e: any) {
-      if (e?.code !== "EEXIST") throw e;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
       let age = 0;
       try { age = Date.now() - statSync(STORE_LOCK_DIR).mtimeMs; } catch { age = 0; }
       // [LOCK] [A-DEAD-STORE-HOLDER-LOSES-THE-LOCK-AT-ONCE]
@@ -272,11 +272,12 @@ function readStoreFromDisk(): LearningsStore {
     try {
       store = JSON.parse(raw);
       if (!store || !Array.isArray(store.learnings)) throw new Error("no learnings array");
-    } catch (e: any) {
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
       const keep = `${LEARNINGS_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
       try { copyFileSync(LEARNINGS_PATH, keep); } catch { /* the original stays in place regardless */ }
-      safeAppend("learning.store_unreadable", { path: LEARNINGS_PATH, bytes: raw.length, kept: keep, error: String(e?.message || e) });
-      throw new Error(`${LEARNINGS_PATH} exists but is unreadable (${e?.message || e}); refusing to start fresh over it. Copy kept at ${keep}. Another process may be mid-write: retry in a moment.`);
+      safeAppend("learning.store_unreadable", { path: LEARNINGS_PATH, bytes: raw.length, kept: keep, error: why });
+      throw new Error(`${LEARNINGS_PATH} exists but is unreadable (${why}); refusing to start fresh over it. Copy kept at ${keep}. Another process may be mid-write: retry in a moment.`);
     }
     // Filter out corrupted entries missing required 'rule' field; a missing or unknown
     // category becomes "other" (two June-era records crashed list_learnings on 2026-09-05).
@@ -737,44 +738,63 @@ export function importLearningsFromFile(
   return result;
 }
 
+/** One entry of an imported JSON file. Untrusted: any field may be missing or of another type. */
+interface ImportedEntry {
+  rule?: unknown;
+  category?: unknown;
+  context?: unknown;
+  project?: unknown;
+}
+
 function importFromJson(content: string, defaultProject?: string, source?: string): ImportResult {
   const result: ImportResult = { imported: 0, updated: 0, skipped: 0, ignored: 0, errors: [] };
   const startedAt = Date.now();
 
   try {
-    const data = JSON.parse(content);
-    const items: any[] = Array.isArray(data)
-      ? data
-      : data.learnings
-        ? data.learnings
-        : [];
+    const data: unknown = JSON.parse(content);
+    const listed = Array.isArray(data) ? data : (data as { learnings?: unknown }).learnings;
+    if (listed && !Array.isArray(listed)) throw new Error('"learnings" is not a list');
+    const items: unknown[] = Array.isArray(listed) ? listed : [];
 
-    for (const item of items) {
-      if (!item.rule || !item.category) {
+    for (const entry of items) {
+      // [LOCKED] [IMPORT-SKIPS-A-BAD-ENTRY], 2026-09-29
+      // [NEVER] read an entry's fields before checking that it is an object and its rule is text.
+      // WHY: typed `any`, a null entry or a rule that is a number threw inside this loop, and the
+      //      whole file was refused as "JSON parse error: Cannot read properties of null" although
+      //      the JSON parsed: every good entry after the bad one was lost. Found while typing the
+      //      `any` away (E2E review C7-2).
+      // FIX: each entry is checked on its own; a bad one is skipped and named, the rest imports;
+      //      a context or project that is not text is ignored (empty context, default project).
+      const item: ImportedEntry = entry !== null && typeof entry === "object" ? entry : {};
+      if (typeof item.rule !== "string" || !item.rule || !item.category) {
         result.skipped++;
-        result.errors.push(`Skipped entry missing rule or category: ${JSON.stringify(item).substring(0, 80)}`);
+        result.errors.push(`Skipped entry missing rule or category: ${JSON.stringify(entry).substring(0, 80)}`);
         continue;
       }
       if (item.rule.trim().length < MIN_RULE_LENGTH) {
         result.skipped++;
         continue;
       }
-      const cat = LEARNING_CATEGORIES.includes(item.category) ? item.category : "other";
+      const cat = typeof item.category === "string" && (LEARNING_CATEGORIES as readonly string[]).includes(item.category)
+        ? item.category
+        : "other";
+      const context = typeof item.context === "string" ? item.context : "";
+      const project = typeof item.project === "string" && item.project ? item.project : defaultProject;
       try {
         // "imported" means created by this call and "updated" means changed by it: the record
         // saveLearning() returns says so through its created and updated instants. A lookup by the
         // rule's own category cannot tell: saveLearning() infers the category of an "other" rule and
         // finds it there (50 such rules counted as imported on one sweep, 0 written).
         // [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED]
-        const saved = saveLearning(cat, item.rule, item.context || "", item.project || defaultProject, source);
+        const saved = saveLearning(cat, item.rule, context, project, source);
         if (Date.parse(saved.created) >= startedAt) result.imported++;
         else if (Date.parse(saved.updated) >= startedAt) result.updated++;
       } catch {
         result.skipped++;
       }
     }
-  } catch (e: any) {
-    result.errors.push(`JSON parse error: ${e.message}`);
+  } catch (e) {
+    result.errors.push(`JSON parse error: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   return result;
@@ -1304,10 +1324,10 @@ export function autoImportFromSources(
     if (result.errors.length === 0) memoUpdates.set(source.path, { mtimeMs: st.mtimeMs, size: st.size, trustKey });
   }
   });
-  } catch (e: any) {
+  } catch (e) {
     // A refused write (growth or shrink tripwire, lock timeout) must not take the server down;
     // it is reported to the caller and the store is left as it was. [LOCK] [STORE-GROWTH-IS-A-TRIPWIRE-TOO]
-    refused = String(e?.message || e);
+    refused = e instanceof Error ? e.message : String(e);
     totalImported = 0;
     totalUpdated = 0;
     processed = 0;

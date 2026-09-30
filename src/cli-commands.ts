@@ -1,6 +1,6 @@
 /**
- * 🔒 LOCKED [UNKNOWN-COMMAND-MUST-NOT-START-A-SERVER] — 2026-08-20
- * ⛔ NEVER route an unrecognised argv[2] to the MCP server again. The MCP server starts
+ * [LOCKED] [UNKNOWN-COMMAND-MUST-NOT-START-A-SERVER], 2026-08-20
+ * [NEVER] route an unrecognised argv[2] to the MCP server again. The MCP server starts
  *    ONLY on a bare invocation, or on the explicit `serve` alias.
  * WHY: `cli.ts` dispatched with a long if/else chain ending in `else { import("./index.js") }`,
  *      so ANY unknown token started a stdio server that silently waits on stdin. A typo
@@ -109,8 +109,4 @@ export function suggestCommands(input: string, limit = 3): string[] {
     .filter((s) => s.d <= 3)
     .sort((a, b) => a.d - b.d || a.c.localeCompare(b.c));
   return scored.slice(0, limit).map((s) => s.c);
-}
-
-export function isKnownCommand(token: string): boolean {
-  return KNOWN_COMMANDS.includes(token);
 }

@@ -2,6 +2,7 @@
 // leaves alone. Throwaway HOME; the real ~/.contextengine is never touched.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { trustProjects } from "./trusted-projects.js";
+import type { Learning, LearningsStore } from "./learnings.js";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -48,10 +49,11 @@ const ORDINARY_DOC = [
 ].join("\n");
 
 // Imported records only: the first load merges the 14 bundled defaults, which carry no source.
-function rules(): string[] { return records().map((l: any) => l.rule); }
+function rules(): string[] { return records().map((l) => l.rule); }
 // The first load merges the 14 bundled defaults into a fresh store; they carry no source.
-function records(): any[] { return JSON.parse(readFileSync(storePath, "utf-8")).learnings.filter((l: any) => l.source !== undefined); }
-function byRule(rule: string): any { return JSON.parse(readFileSync(storePath, "utf-8")).learnings.find((l: any) => l.rule === rule); }
+function store(): LearningsStore { return JSON.parse(readFileSync(storePath, "utf-8")); }
+function records(): Learning[] { return store().learnings.filter((l) => l.source !== undefined); }
+function byRule(rule: string): Learning { return store().learnings.find((l) => l.rule === rule)!; }
 function reset(): void { mkdirSync(dir, { recursive: true }); writeFileSync(storePath, JSON.stringify({ version: 1, count: 0, learnings: [] })); }
 
 beforeAll(async () => {
@@ -151,5 +153,27 @@ describe("JSON import", () => {
     writeFileSync(p, JSON.stringify([{ category: "git", rule: "never rewrite a pushed branch", context: "" }]));
     expect(L.importLearningsFromFile(p).imported).toBe(1);
     expect(byRule("never rewrite a pushed branch").source).toBe(p);
+  });
+
+  // [LOCK] [IMPORT-SKIPS-A-BAD-ENTRY] in learnings.ts
+  it("skips a bad entry and still imports the good ones after it", () => {
+    reset();
+    const p = join(home, "mixed.json");
+    writeFileSync(p, JSON.stringify([
+      null,
+      { category: "git", rule: 42 },
+      { category: "git", rule: "tag a release only after its tests pass", context: 7, project: ["x"] },
+      { category: "git", rule: "never force-push a branch someone else pulled" },
+    ]));
+    const r = L.importLearningsFromFile(p, "other", "Proj");
+    expect(r.imported).toBe(2);
+    expect(r.skipped).toBe(2);
+    expect(r.errors).toHaveLength(2);
+    expect(r.errors[0]).toContain("null");
+    expect(r.errors[1]).toContain("42");
+    const odd = byRule("tag a release only after its tests pass");
+    expect(odd.context).toBe("");
+    expect(odd.project).toBe("Proj");
+    expect(byRule("never force-push a branch someone else pulled").category).toBe("git");
   });
 });

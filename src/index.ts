@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource, findConfigFileWithOrigin } from "./config.js";
@@ -93,18 +93,13 @@ try {
 import {
   loadAdapters,
   collectFromAdapters,
-  destroyAdapters,
-  listRegisteredAdapters,
   type AdapterEntry,
 } from "./adapters.js";
 import {
   gateCheckFresh,
   licenceCheckState,
   activate,
-  deactivate,
   getActivationStatus,
-  heartbeat,
-  loadLicense,
 } from "./activation.js";
 import { ProtocolFirewall } from "./firewall.js";
 
@@ -969,8 +964,8 @@ server.tool(
     const gate = await gateCheckFresh("score_project");
     if (gate) return { content: [{ type: "text" as const, text: gate }] };
 
-    // 🔒 LOCKED [SCORE-CANARY-COVERS-EVERY-SCORER] — 2026-08-19
-    // ⛔ NEVER let a scoring entry point run without the canary.
+    // [LOCKED] [SCORE-CANARY-COVERS-EVERY-SCORER], 2026-08-19
+    // [NEVER] let a scoring entry point run without the canary.
     // WHY: [SCORE-CANARY] was wired on the CLI only. This MCP tool — the path
     //    Claude Code actually scores through — had zero call sites, so a
     //    drifting scorer would have been caught when a human typed the
@@ -1412,8 +1407,8 @@ server.tool(
             ]
               .filter(Boolean)
               .join("\n"));
-    } catch (e: any) {
-      return respond("save_learning", `❌ Learning rejected: ${e.message}`);
+    } catch (e) {
+      return respond("save_learning", `❌ Learning rejected: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 );
@@ -1504,8 +1499,8 @@ server.tool(
         project,
         { permissive: permissive === true },
       );
-    } catch (e: any) {
-      return respond("import_learnings", `⛔ Import refused: ${e?.message || e}`);
+    } catch (e) {
+      return respond("import_learnings", `⛔ Import refused: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     // Re-inject learnings into search index (project-scoped)
