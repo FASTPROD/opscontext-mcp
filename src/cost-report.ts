@@ -1,6 +1,6 @@
 /**
- * Multi-agent cost report, shared by the CLI (`contextengine cost`) and the MCP tool
- * (`agent_cost`). One renderer, two surfaces.
+ * Multi-agent cost report for the CLI (`contextengine cost`). It also served the MCP tool
+ * `agent_cost` until that tool was retired on 2026-09-30.
  *
  * [LOCKED] [COST-REPORT-ONE-RENDERER] — 2026-08-21
  * [NEVER] render the cost report in cli.ts or index.ts directly.
@@ -9,6 +9,13 @@
  *      floor-not-cost) that drifts the first time one of them is edited.
  * FIX: buildCostReport() returns { text, json }; cli.ts prints, index.ts responds. Both surfaces
  *      read the same thresholds from .contextengine/policy.json via loadCostThresholds().
+ * 2026-09-30: the MCP tool `agent_cost` retired (0 calls in every chat on the author's Mac, the
+ *      owner's decision, E2E_REVIEW_2026-09 C1-1); the CLI is the one surface and the renderer
+ *      stays here for the next one. That tool carried [COST-POLICY-DIR-IS-EXPLICIT]: a long-lived
+ *      server's working folder is not a project (under launchd it is the home folder), and the MCP
+ *      surface priced with built-in defaults while the CLI in the repo read policy.json. So
+ *      buildCostReport() takes the policy folder as an argument, never process.cwd() on its own:
+ *      a surface that is not started inside a repo must be told which repo prices it.
  */
 import {
   collectRuns,

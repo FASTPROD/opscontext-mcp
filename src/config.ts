@@ -44,16 +44,11 @@ export interface ContextEngineConfig {
   /** Enable system-wide operational data (docker, pm2, nginx, cron, shell history) — default true */
   collectSystemOps?: boolean;
   /**
-   * Plugin adapters — custom data source connectors.
-   * Each adapter is an ES module that implements the Adapter interface.
-   * @example [{ "name": "notion", "module": "./adapters/notion.js", "config": { "token": "$NOTION_TOKEN" } }]
+   * Retired 2026-09-30 (2.17.0): plugin adapters no longer exist. A config that still lists some is
+   * told once and the entries are ignored; no code named here is ever loaded.
+   * [LOCK] [ADAPTERS-RETIRED] (src/index.ts)
    */
-  adapters?: Array<{
-    name: string;
-    module: string;
-    config?: Record<string, unknown>;
-    enabled?: boolean;
-  }>;
+  adapters?: unknown[];
 }
 
 import { discoverClaudeMemory } from "./claude-integration.js";
@@ -82,6 +77,15 @@ const DEFAULT_PATTERNS = [
   "docs/LEARNINGS.md",
 ];
 
+/** The one line a config that still lists adapters gets, or null when it lists none.
+ *  [LOCK] [ADAPTERS-RETIRED] (src/index.ts) */
+export function retiredAdaptersNote(config: ContextEngineConfig, configPath?: string): string | null {
+  const n = Array.isArray(config.adapters) ? config.adapters.length : 0;
+  if (n === 0) return null;
+  return `[ContextEngine] Plugin adapters were retired in 2.17.0: the ${n} adapter entr${n === 1 ? "y" : "ies"} in ` +
+    `${configPath ?? "the config"} ${n === 1 ? "is" : "are"} ignored, and no adapter code is loaded.`;
+}
+
 /**
  * Look for contextengine.json in standard locations.
  * Priority: env var > CWD > home dir
@@ -91,7 +95,8 @@ export function findConfigFile(): string | null {
 }
 
 /** Where the config came from: the env var, the current folder, or the home folder. A config in
- *  the current folder may belong to a downloaded repository. [LOCK] [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG] */
+ *  the current folder may belong to a downloaded repository, which is why only the user's own
+ *  config could load adapter code until adapters were retired. [LOCK] [ADAPTERS-RETIRED] (src/index.ts) */
 export function findConfigFileWithOrigin(): { path: string; origin: "env" | "cwd" | "home" } | null {
   const candidates: Array<{ path: string; origin: "env" | "cwd" | "home" }> = [];
 

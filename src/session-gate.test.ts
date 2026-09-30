@@ -89,3 +89,21 @@ describe("normalizeName", () => {
     expect(G.normalizeName("GOOGLE Analytics")).toBe("googleanalytics");
   });
 });
+
+// [LOCK] [SESSIONS-FOLLOW-THE-CE-HOME] (src/ce-home.ts): the gate and the store read one folder.
+describe("the gate reads the folder the session store writes", () => {
+  it("finds a session saved through the store under another CE home, with no folder passed", async () => {
+    const { saveSession } = await import("./sessions.js");
+    const before = process.env.CONTEXTENGINE_HOME;
+    process.env.CONTEXTENGINE_HOME = mkdtempSync(join(tmpdir(), "ce-gate-home-"));
+    try {
+      const dir = repo("Gatehome");
+      saveSession("Gatehome", "progress", "saved after the commit");
+      const r = G.evaluateSessionGate({ repo: dir });
+      expect(r.reason).toBe("fresh");
+      expect(r.block).toBe(false);
+    } finally {
+      process.env.CONTEXTENGINE_HOME = before;
+    }
+  });
+});

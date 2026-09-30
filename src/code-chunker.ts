@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "fs";
 import { join, extname, basename, relative } from "path";
 import type { Chunk } from "./ingest.js";
-import { hasLockMarker } from "./ingest.js";
+import { hasLockMarker, lockBlockTags } from "./ingest.js";
 
 /**
  * Code Chunker — parse TS/JS/Python files into function/class/method chunks.
@@ -230,6 +230,7 @@ export function parseCodeFile(
     const lines = text.split("\n");
     if (lines.length <= 200 && text.trim().length > 0) {
       const locked = hasLockMarker(text);
+      const guardedBy = lockBlockTags(text); // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
       return [{
         source: sourceName,
         section: `${basename(filePath)} (entire file)`,
@@ -237,6 +238,7 @@ export function parseCodeFile(
         lineStart: 1,
         lineEnd: lines.length,
         ...(locked && { locked: true }),
+        ...(guardedBy.length > 0 && { guardedBy }),
       }];
     }
     return [];
@@ -244,6 +246,7 @@ export function parseCodeFile(
 
   return blocks.map((b) => {
     const locked = hasLockMarker(b.content);
+    const guardedBy = lockBlockTags(b.content); // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
     return {
       source: sourceName,
       section: `${basename(filePath)} > ${b.kind} ${b.name}`,
@@ -251,6 +254,7 @@ export function parseCodeFile(
       lineStart: b.lineStart,
       lineEnd: b.lineEnd,
       ...(locked && { locked: true }),
+      ...(guardedBy.length > 0 && { guardedBy }),
     };
   });
 }

@@ -45,20 +45,6 @@ function activePublicKeyPem(): string {
   return testPublicKeyPem ?? LICENSE_PUBLIC_KEY_PEM;
 }
 
-/**
- * True when `signatureB64` is an Ed25519 signature of `bytes` by the pinned key. Used for the
- * community rules file, which is signed as a whole. [LOCK] [COMMUNITY-TIER-A-IS-SIGNED]
- */
-export function verifyDetachedSignature(bytes: Buffer, signatureB64: string): boolean {
-  try {
-    const sig = Buffer.from(signatureB64.trim(), "base64");
-    if (sig.length !== 64) return false;
-    return verify(null, bytes, createPublicKey(activePublicKeyPem()), sig);
-  } catch {
-    return false;
-  }
-}
-
 // Production Ed25519 public key. Paired private key lives ONLY on the
 // activation server. Public key SHA-256 fingerprint (first 32 hex chars):
 //   12d0c34c917a47fbed99945d2b7fb439

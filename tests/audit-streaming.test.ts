@@ -11,7 +11,6 @@ import { createHash } from "crypto";
 import {
   verifyChain,
   readAuditLog,
-  filterByRange,
   acknowledgeRedaction,
   type AuditRecord,
   type IntegrityReport,
@@ -197,20 +196,6 @@ describe("verifyChain streams the history", () => {
     expect(streamed.unreadable.map((u) => [u.file, u.line])).toEqual([["audit-0002.jsonl", 22], ["audit.log", 9]]);
     expect(streamed.acknowledgements).toHaveLength(1);
     expect(streamed.acknowledgements![0].records).toBe(1);
-  });
-
-  it("counts the records in a range in the same pass, as filterByRange does", () => {
-    const seg = chain(40);
-    const live = chain(40, last(seg).hash, 40);
-    writeSegment(1, seg);
-    writeLive(live);
-    const since = seg[10].ts;
-    const until = live[5].ts;
-    const report = verifyChain({ countRange: { since, until } });
-    expect(report.ok).toBe(true);
-    expect(report.inRange).toBe(filterByRange(readAuditLog(), since, until).length);
-    expect(verifyChain({ countRange: { since } }).inRange).toBe(70);
-    expect("inRange" in verifyChain()).toBe(false);
   });
 
   it("a history file it cannot open is a failed report, not a crash", () => {

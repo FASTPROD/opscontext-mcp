@@ -31,6 +31,8 @@ export interface Chunk {
   indexedAt?: string;
   /** True if chunk contains a lock marker (LOCKED / ALREADY IMPLEMENTED) — signals agents should not re-audit */
   locked?: boolean;
+  /** Code only: the tags of the whole LOCK blocks this chunk holds. [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE] */
+  guardedBy?: string[];
 }
 
 /**
@@ -53,6 +55,33 @@ const LOCK_PATTERNS = [
 /** Check if a chunk's content contains a lock marker */
 export function hasLockMarker(text: string): boolean {
   return LOCK_PATTERNS.some(p => p.test(text));
+}
+
+// [LOCKED] [LOCK-BLOCK-IS-FLAGGED-IN-CODE] - 2026-09-30
+// [NEVER] flag a doc chunk as guarded because it quotes or explains a LOCK block, flag a code chunk
+//         on a cross-reference alone, or give a LOCK block the "do not re-audit" words.
+// WHY: the fleet's LOCK blocks (a [LOCKED] [TAG] header, then [NEVER], WHY and FIX lines; the older
+//      form opened with an emoji) were invisible to LOCK_PATTERNS: in the live index of 2026-09-30,
+//      6 chunks of 5,183 were flagged and 70 carried a marker unflagged (E2E_REVIEW_2026-09 batch 3
+//      finding, the owner's yes on 2026-09-30). The old banner says "verified, DO NOT re-audit",
+//      the wrong words for a LOCK, which asks for its WHY to be read before a change. Of the 41
+//      chunks holding a whole block, 32 were code and 9 were docs explaining the convention.
+// FIX: lockBlockTags() returns the tags of whole blocks (a tagged header, a [NEVER] line and a WHY
+//      line in the same chunk); only the code chunker sets `guardedBy` from it (docs go through
+//      parseMarkdown, which never does), and a search result says lockGuardLine().
+const LOCK_HEADER = /(?:\[LOCKED\]|\u{1F512}\s*LOCKED)\s*\[([A-Z0-9][A-Z0-9_-]*)\]/gu;
+const LOCK_NEVER = /\[NEVER\]|\u26D4\s*NEVER/u;
+const LOCK_WHY = /(?:^|\n)\s*(?:\/\/|#|\*|<!--)?\s*WHY:/;
+
+/** The tags of the whole LOCK blocks in `text`, in order, each once; [] when there is none. */
+export function lockBlockTags(text: string): string[] {
+  if (!LOCK_NEVER.test(text) || !LOCK_WHY.test(text)) return [];
+  return [...new Set([...text.matchAll(LOCK_HEADER)].map((m) => m[1]))];
+}
+
+/** The line a search result carries for a chunk guarded by LOCK blocks (tags non-empty). */
+export function lockGuardLine(tags: string[]): string {
+  return `Guarded by LOCK ${tags.map((t) => `[${t}]`).join(" ")}: read its WHY before changing this code.`;
 }
 
 /**

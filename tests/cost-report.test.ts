@@ -32,16 +32,18 @@ describe("cost report, one renderer for CLI and MCP", () => {
   it("neither cli.ts nor index.ts renders the report themselves", () => {
     for (const f of ["cli.ts", "index.ts"]) {
       const src = readFileSync(join(root, "src", f), "utf-8");
-      expect(src).toContain("buildCostReport(");
       expect(src).not.toMatch(/NOTIONAL, NOT BILLED|TOP RUNS BY VALUED COST|NEVER-RENDER-AN-UNKNOWN/);
     }
+    expect(readFileSync(join(root, "src", "cli.ts"), "utf-8")).toContain("buildCostReport(");
   });
 
-  it("agent_cost is registered as an MCP tool and listed in the manifest", () => {
+  it("the CLI is the one surface: the MCP tool agent_cost stays retired (2026-09-30)", () => {
+    // Retired with 0 calls on the owner's decision (E2E_REVIEW_2026-09 C1-1). Bringing it back
+    // means reading the carried [COST-POLICY-DIR-IS-EXPLICIT] note in src/cost-report.ts first.
     const idx = readFileSync(join(root, "src", "index.ts"), "utf-8");
-    expect(idx).toMatch(/server\.tool\(\s*"agent_cost"/);
+    expect(idx).not.toMatch(/server\.tool\(\s*"agent_cost"/);
     const manifest = readFileSync(join(root, "src", "tools-manifest.ts"), "utf-8");
-    expect(manifest).toContain('"agent_cost"');
+    expect(manifest).not.toMatch(/^\s*"agent_cost",$/m);
   });
 
   it("thresholds follow the directory passed, not the process cwd", () => {

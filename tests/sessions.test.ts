@@ -1,12 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, rmSync, mkdirSync } from "fs";
+import { existsSync, rmSync, mkdirSync, mkdtempSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import {
   saveSession,
   loadSession,
   listSessions,
-  deleteSession,
   formatSession,
   formatSessionList,
 } from "../src/sessions.js";
@@ -76,19 +75,6 @@ describe("sessions", () => {
     expect(found!.entries).toBe(1);
   });
 
-  it("deleteSession removes session file", () => {
-    saveSession(TEST_SESSION, "key", "val");
-    expect(loadSession(TEST_SESSION)).not.toBeNull();
-    const deleted = deleteSession(TEST_SESSION);
-    expect(deleted).toBe(true);
-    expect(loadSession(TEST_SESSION)).toBeNull();
-  });
-
-  it("deleteSession returns false for non-existent session", () => {
-    const deleted = deleteSession("nonexistent-xyz-999");
-    expect(deleted).toBe(false);
-  });
-
   it("formatSession produces readable output", () => {
     const session = saveSession(TEST_SESSION, "branch", "main");
     const text = formatSession(session);
@@ -109,8 +95,10 @@ describe("sessions", () => {
     // Names with special chars should not throw
     const session = saveSession("test/with:special<chars>", "k", "v");
     expect(session.name).toBeDefined();
-    // Clean up
-    deleteSession("test/with:special<chars>");
+    // Every character outside [A-Za-z0-9_.-] becomes "_" in the file name.
+    const file = join(SESSIONS_DIR, "test_with_special_chars_.json");
+    expect(existsSync(file)).toBe(true);
+    rmSync(file);
   });
 });
 
@@ -129,5 +117,26 @@ describe("a session file that cannot be read", () => {
     expect(entry).toBeDefined();
     expect(entry!.error).toMatch(/JSON/);
     expect(formatSessionList(listSessions())).toMatch(new RegExp(`\\| ${CORRUPT} \\| could not be read: `));
+  });
+});
+
+// [LOCK] [SESSIONS-FOLLOW-THE-CE-HOME] (src/ce-home.ts). The store fixed the login home's folder at
+// import while the session gate read CONTEXTENGINE_HOME, so a scratch CE home still wrote into the
+// real sessions folder (E2E_REVIEW_2026-09 C1-2).
+describe("the sessions folder follows CONTEXTENGINE_HOME, read at every call", () => {
+  it("a session saved after the CE home changes lands in the new home, not the login home's", () => {
+    const before = process.env.CONTEXTENGINE_HOME;
+    const other = mkdtempSync(join(tmpdir(), "ce-sessions-home-"));
+    process.env.CONTEXTENGINE_HOME = other;
+    try {
+      saveSession("probe-home", "k", "v");
+      expect(existsSync(join(other, "sessions", "probe-home.json"))).toBe(true);
+      expect(existsSync(join(homedir(), ".contextengine", "sessions", "probe-home.json"))).toBe(false);
+      expect(listSessions().map((x) => x.name)).toContain("probe-home");
+      expect(loadSession("probe-home")?.entries[0].value).toBe("v");
+    } finally {
+      process.env.CONTEXTENGINE_HOME = before;
+      rmSync(other, { recursive: true, force: true });
+    }
   });
 });

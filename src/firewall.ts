@@ -50,7 +50,6 @@ const EXEMPT_TOOLS = new Set([
   "list_sessions",
   "load_session",
   "delete_learning",
-  "import_learnings",
   "activate",
   "activation_status",
 ]);

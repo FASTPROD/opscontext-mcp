@@ -694,8 +694,8 @@ export interface ImportOptions {
 //          Not "rules": "## Key rules" and "### Security Rules" are ordinary doc sections, and
 //          the word let 231 subsection headings back in on the evening this shipped;
 //      (4) JSON files, which are explicit by construction.
-//      `permissive: true` (MCP `import_learnings`, CLI `--permissive`) restores the old parser for
-//      a file the user chose on purpose. Every imported record now carries `source`.
+//      `permissive: true` (CLI `--permissive`; the MCP tool `import_learnings` that also took it
+//      retired on 2026-09-30) restores the old parser for a file the user chose on purpose. Every imported record now carries `source`.
 export const LEARNINGS_FILE_NAME = /learnings?\.md$/i;
 export const LEARNINGS_HEADING =
   /\b(learnings?|lessons?|gotchas?|pitfalls?|anti-?patterns?|never repeat|do not repeat|don'?t repeat|the hard way|hard way|mistakes?)\b/i;

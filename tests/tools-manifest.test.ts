@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "fs";
+import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import {
   ALL_TOOLS,
@@ -59,5 +59,29 @@ describe("tools-manifest", () => {
 
   it("PREMIUM_TOOLS (re-exported from activation.ts) === PREMIUM_TOOL_NAMES", () => {
     expect([...PREMIUM_TOOLS]).toEqual([...PREMIUM_TOOL_NAMES]);
+  });
+});
+
+// Retired 2026-09-30 (E2E_REVIEW_2026-09 C1-1). The list_sources description still told agents to call
+// read_source after the tool was gone; found on the release build, fixed the same day.
+describe("no string an agent reads names a retired tool", () => {
+  const RETIRED = ["read_source", "delete_session", "audit_verify", "drift_status", "agent_cost", "import_learnings"];
+  it("outside comments, src/ names none of them (agent_cost stays only as the policy.json key)", () => {
+    const dir = join(__dirname, "..", "src");
+    const hits: string[] = [];
+    for (const f of readdirSync(dir).filter((n) => n.endsWith(".ts") && !n.endsWith(".test.ts"))) {
+      const code = readFileSync(join(dir, f), "utf-8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/(^|[^:])\/\/.*$/gm, "$1");
+      for (const name of RETIRED) {
+        const re = new RegExp(`\\b${name}\\b`, "g");
+        for (const m of code.matchAll(re)) {
+          const around = code.slice(Math.max(0, m.index! - 20), m.index! + name.length + 20);
+          if (name === "agent_cost" && /policy\.agent_cost|agent_cost:|agent_cost\.pricing|no agent_cost in policy/.test(around)) continue;
+          hits.push(`${f}: ${around.replace(/\s+/g, " ")}`);
+        }
+      }
+    }
+    expect(hits).toEqual([]);
   });
 });

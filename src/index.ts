@@ -3,8 +3,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource, findConfigFileWithOrigin } from "./config.js";
-import { ingestSources, Chunk } from "./ingest.js";
+import { loadSources, loadProjectDirs, loadConfig, resolveProjectDir, KnowledgeSource, findConfigFileWithOrigin, retiredAdaptersNote } from "./config.js";
+import { ingestSources, lockGuardLine, Chunk } from "./ingest.js";
 import { redactChunk } from "./secret-shapes.js";
 import { summarizeSource } from "./source-summary.js";
 import { searchChunks, SearchResult } from "./search.js";
@@ -44,19 +44,16 @@ import {
   saveSession,
   loadSession,
   listSessions,
-  deleteSession,
   formatSession,
   formatSessionList,
 } from "./sessions.js";
-import { verifyChain, autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
+import { autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
 import { registerServer, listServers, formatServers, liveDaemonPid } from "./server-registry.js";
 import { secureCeHome } from "./ce-home.js";
 import { trimDaemonLog } from "./daemon-log.js";
 import { QUOTED_TEXT_NOTE } from "./framing.js";
 import { computeFleetHealth, writeFleetHealth } from "./fleet-health.js";
 import { startEventIngestServer } from "./http-server.js";
-import { detect } from "./detector.js";
-import { buildCostReport } from "./cost-report.js";
 import {
   saveLearning,
   searchLearnings,
@@ -65,14 +62,8 @@ import {
   learningsToChunks,
   learningsStats,
   formatLearnings,
-  importLearningsFromFile,
   autoImportFromSources,
   LEARNING_CATEGORIES, parseSince } from "./learnings.js";
-import {
-  communityRulesToChunks,
-  mergeWithDedup,
-  loadCommunityStore,
-} from "./community-sync.js";
 import { readFileSync, existsSync, watch, statSync, writeFileSync, mkdirSync } from "fs";
 import { basename, join, dirname } from "path";
 import { homedir } from "os";
@@ -90,11 +81,6 @@ try {
   const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
   PKG_VERSION = pkg.version || PKG_VERSION;
 } catch { /* fallback */ }
-import {
-  loadAdapters,
-  collectFromAdapters,
-  type AdapterEntry,
-} from "./adapters.js";
 import {
   gateCheckFresh,
   licenceCheckState,
@@ -120,7 +106,7 @@ let corpus: string | undefined;
 let indexerPid: number | null = null;
 let setRegistryRole: ((r: ServerRole) => void) | null = null;
 let setRegistryEventPort: ((port: number | null) => void) | null = null;
-let warnedCwdAdapters = false;
+let warnedRetiredAdapters = false;
 /** key -> vector, loaded from ~/.contextengine/embeddings.bin and grown by what we embed. */
 let vectorStore: Map<string, Float32Array> = new Map();
 let indexSeq = 0;
@@ -142,12 +128,52 @@ firewall.setLearningSearchFn((query, projects) => {
     .map((l) => ({ rule: l.rule, project: l.project, category: l.category }));
 });
 
+// [LOCKED] [COMMUNITY-RETIRED] - 2026-09-30
+// [NEVER] let rules from outside this machine into the index again, or export the user's learnings
+//         for publication, without the three guards the retired modules carried.
+// WHY: the community rules (src/community-sync.ts, src/community-export.ts and the commands
+//      sync-community-rules and export-learnings) were never used: no rules file on the owner's
+//      Mac, no sync since August, 0 calls in any chat (E2E_REVIEW_2026-09 C2-3). Retired on the
+//      owner's decision. What they had learned, kept here:
+//      [COMMUNITY-TIER-A-IS-SIGNED] (2026-09-25): tier A was plain JSON from a public GitHub
+//        repository, checked by nothing but TLS, so whoever could write to that repository wrote
+//        into every user's search results; a sandbox accepted 5,001 unsigned rules, one of 200 KB
+//        (A6-4). The fix was an Ed25519 signature of the exact bytes by the pinned licence key,
+//        and caps on the count, the rule and context lengths, and the tags.
+//      [COMMUNITY-SYNC-REPLAY-GUARD] (2026-06-25): a valid signature alone let a tier B response
+//        captured by any past subscriber be replayed on any other machine for ever; the signed
+//        payload had to name the licence token, the machine id and an expiry 24 hours away at most.
+//      [COMMUNITY-EXPORT-SAFETY] (2026-06-24): the export was the only thing between the user's
+//        personal learnings (production incidents, client fixes) and a public repository under
+//        MIT, and one missed pattern is a leak with no take-back. Its redaction only ever grew,
+//        its salt was a compile-time constant, and security, deployment and infrastructure
+//        learnings never left in tier A.
+// FIX: nothing on this side calls the server any more. The server side
+//      (server/src/community-rules-server.ts, LOCK [COMMUNITY-RULES-SERVER], and
+//      server/scripts/sign-community-rules.mjs) stays until the next server update, the owner's
+//      call (2026-09-30). A revival starts from these three guards.
+// [LOCKED] [ADAPTERS-RETIRED] - 2026-09-30
+// [NEVER] import or run code that a config file names, in the MCP server or the CLI: every
+//         dynamic import in src/ takes a path written in the source (tests/adapters-retired.test.ts).
+// WHY: the plug-in adapters (src/adapters.ts, examples/adapters/) were never used: nothing was
+//      configured on the owner's Mac (E2E_REVIEW_2026-09 batch 3 finding), and the owner retired
+//      them. They were a door for code: a config named an ES module and the server imported it.
+//      [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG] (2026-09-25): without CONTEXTENGINE_CONFIG the
+//      server reads ./contextengine.json from the folder it starts in, which for Claude Code is the
+//      project opened, so a downloaded repository carrying a config and a module ran its own code
+//      in the user's session when the project was opened (proven in a sandbox, A6-5), and a
+//      relative path in the user's own config resolved from that folder too. The fix then: adapter
+//      code only from CONTEXTENGINE_CONFIG or ~/.contextengine.json, paths from that file's folder.
+//      Also found: an adapter's destroy() hook never ran, since the server has no shutdown path.
+// FIX: a config that still lists adapters is told once on stderr that they are ignored
+//      (retiredAdaptersNote() in src/config.ts), and no module it names is loaded. A revival starts
+//      from the config-origin rule above and a shutdown path that runs destroy().
 /**
- * Parse every source, collect ops and code, import learnings (indexer only), inject learnings,
- * community rules and adapters. Sets `sources`, `chunks`, `activeProjectNames`. No embedding
+ * Parse every source, collect ops and code, import learnings (indexer only), inject learnings.
+ * Sets `sources`, `chunks`, `activeProjectNames`. No embedding
  * here. One body for startup and for every reindex; the two used to be separate copies.
  */
-async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boolean }): Promise<void> {
+async function buildIndex(opts: { importLearnings: boolean }): Promise<void> {
   sources = loadSources();
   chunks = ingestSources(sources);
 
@@ -239,59 +265,17 @@ async function buildIndex(opts: { importLearnings: boolean; loadAdapters?: boole
     );
   }
 
-  // Inject community rules from the cached store (best-effort — no network
-  // touched here; the daily `sync-community-rules` CLI keeps the cache fresh).
-  // Deduped against the local learnings so identical content never double-emits.
-  const communityChunks = communityRulesToChunks();
-  if (communityChunks.length > 0) {
-    const before = chunks.length;
-    chunks = mergeWithDedup(chunks, communityChunks);
-    const added = chunks.length - before;
-    const skipped = communityChunks.length - added;
-    const store = loadCommunityStore();
-    console.error(
-      `[ContextEngine] 🌐 Injected ${added} community rule chunks ` +
-      `(${skipped} dedup'd vs local; ${store.rules.length} total in cache)`
-    );
-  }
+  // No community rules here since 2026-09-30. [LOCK] [COMMUNITY-RETIRED] (above buildIndex)
 
-  // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: before the adapters, whose block can return early.
+  // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]
   chunks = chunks.map(redactChunk);
 
-  // Collect from plugin adapters
-  // [LOCKED] [ADAPTERS-ONLY-FROM-THE-USERS-OWN-CONFIG] - 2026-09-25
-  // [NEVER] import an adapter module named by a contextengine.json found in the current folder, or
-  //         resolve a relative adapter path from the current folder.
-  // WHY: without CONTEXTENGINE_CONFIG (the README's setup), the server reads ./contextengine.json
-  //      from the folder it starts in, which for Claude Code is the project opened. An adapter entry
-  //      there is import()ed, so a downloaded repository carrying a config and a module ran its own
-  //      code in the user's session when the project was opened; proven in a sandbox on 2026-09-25
-  //      (E2E_REVIEW_2026-09 A6-5). A relative path in the user's own config also resolved from
-  //      that folder, not from the config's.
-  // FIX: adapters load only from the config named by CONTEXTENGINE_CONFIG or ~/.contextengine.json,
-  //      relative paths resolve from that file's folder; a config found in the current folder may
-  //      still list sources, never code.
-  const cfgFile = findConfigFileWithOrigin();
-  if (config.adapters && config.adapters.length > 0 && cfgFile?.origin === "cwd") {
-    if (!warnedCwdAdapters) {
-      warnedCwdAdapters = true;
-      console.error(
-        `[ContextEngine] ⛔ Adapters in ${cfgFile.path} were NOT loaded: a config found in the current folder may not run code. ` +
-          `Point CONTEXTENGINE_CONFIG at it, or move the adapters to ~/.contextengine.json.`,
-      );
-    }
-  } else if (config.adapters && config.adapters.length > 0) {
-    if (opts.loadAdapters) {
-      const adapterCount = await loadAdapters(config.adapters as AdapterEntry[], cfgFile ? dirname(cfgFile.path) : process.cwd());
-      if (adapterCount === 0) return;
-    }
-    const adapterChunks = await collectFromAdapters(config.adapters as AdapterEntry[]);
-    if (adapterChunks.length > 0) {
-      chunks.push(...adapterChunks.map(redactChunk));
-      console.error(
-        `[ContextEngine] 🔌 Adapters contributed ${adapterChunks.length} chunks`
-      );
-    }
+  // Plugin adapters retired 2026-09-30: a config that still lists some is told once, and no code it
+  // names is loaded. [LOCK] [ADAPTERS-RETIRED] (above buildIndex)
+  const adaptersNote = warnedRetiredAdapters ? null : retiredAdaptersNote(config, findConfigFileWithOrigin()?.path);
+  if (adaptersNote) {
+    warnedRetiredAdapters = true;
+    console.error(adaptersNote);
   }
 }
 
@@ -775,6 +759,7 @@ server.tool(
           ...(r.chunk.locked
             ? ["🔒 LOCKED — This content has been verified. DO NOT re-audit or re-implement."]
             : []),
+          ...(r.chunk.guardedBy?.length ? [lockGuardLine(r.chunk.guardedBy)] : []), // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
           `Source: ${r.chunk.source}`,
           `Section: ${r.chunk.section}`,
           `Lines: ${r.chunk.lineStart}-${r.chunk.lineEnd}`,
@@ -793,7 +778,7 @@ server.tool(
 // ---------------------------------------------------------------------------
 server.tool(
   "list_sources",
-  "List all knowledge sources indexed by ContextEngine, each with a one-line summary (from the file's own head: frontmatter description, title plus first sentence, or module docstring), status (found/missing) and chunk counts. Read the summary to pick the right source before calling read_source.",
+  "List all knowledge sources indexed by ContextEngine, each with a one-line summary (from the file's own head: frontmatter description, title plus first sentence, or module docstring), status (found/missing) and chunk counts. Read the summary to pick the right source, then search_context for its passages.",
   {},
   async () => {
     const lines = sources.map((s) => {
@@ -823,52 +808,6 @@ server.tool(
     ].join("\n");
 
     return respond("list_sources", text);
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: read_source
-// ---------------------------------------------------------------------------
-server.tool(
-  "read_source",
-  "Read the full content of a specific knowledge source by name.",
-  {
-    source_name: z
-      .string()
-      .describe("Name of the source (from list_sources output)"),
-  },
-  async ({ source_name }) => {
-    const source = sources.find(
-      (s) => s.name.toLowerCase() === source_name.toLowerCase()
-    );
-    if (!source) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Unknown source: "${source_name}". Use list_sources to see available sources.`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    if (!existsSync(source.path)) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Source file not found: ${source.path}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // [LOCK] [INDEX-NEVER-SERVES-A-CREDENTIAL]: the whole file goes through the same redaction as a
-    // search result; read_source used to return it raw (E2E_REVIEW_2026-09 A6-6).
-    const content = redactChunk({ content: readFileSync(source.path, "utf-8") }).content;
-    return respond("read_source", `# ${source.name}\n${QUOTED_TEXT_NOTE}\n\n${content}`, source_name);
   }
 );
 
@@ -1078,127 +1017,6 @@ server.tool(
     const sessions = listSessions();
     const text = formatSessionList(sessions);
     return respond("list_sessions", text);
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: delete_session (Session Persistence)
-// ---------------------------------------------------------------------------
-server.tool(
-  "delete_session",
-  "Delete a saved session by name. Returns success/not-found. Use for cleanup of stale or obsolete session context.",
-  {
-    name: z.string().describe("Session name to delete"),
-  },
-  async ({ name }) => {
-    const ok = deleteSession(name);
-    if (ok) {
-      return respond("delete_session", `✅ Deleted session "${name}".`);
-    }
-    const available = listSessions().map((s) => s.name);
-    const hint = available.length
-      ? `\n\nAvailable sessions: ${available.join(", ")}`
-      : "";
-    return respond("delete_session", `Session "${name}" not found.${hint}`);
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: audit_verify (Compliance — tamper-evident audit log)
-// ---------------------------------------------------------------------------
-server.tool(
-  "audit_verify",
-  "Verify the integrity of the local audit log chain. Returns OK + record count, or BROKEN + break index when a record has been edited or the chain otherwise diverges. Produces evidence aligned with SOC 2 CC7.2 (change monitoring) and ISO 27001 A.12.4.1 (event logging) — evidence artifacts, not a certification (OpsContext is not itself SOC 2– or ISO 27001–certified; see docs/compliance/). The audit log lives at ~/.contextengine/audit.log and records every state-changing operation (learning save/delete/import, session save/delete, activation activate/deactivate) as a hash-chained JSONL line.",
-  {
-    since: z.string().optional().describe("ISO date — restrict integrity report counters to records on/after this timestamp (chain still verified end-to-end)"),
-    until: z.string().optional().describe("ISO date — restrict counters to records on/before this timestamp"),
-  },
-  async ({ since, until }) => {
-    // One streaming pass: the range count rides the verification. [LOCK] [VERIFY-STREAMS-THE-HISTORY]
-    const report = verifyChain(since || until ? { countRange: { since, until } } : {});
-    const summary: string[] = [];
-    summary.push(`Audit chain: ${report.ok ? "✅ INTACT" : "❌ BROKEN"}`);
-    summary.push(`Total records: ${report.total}`);
-    if ((report.redactedIndices ?? []).length > 0) {
-      summary.push(`Redacted and acknowledged on the chain: ${report.redactedIndices!.length} record(s), not counted as altered`);
-    }
-    if (since || until) {
-      summary.push(`Range filter: ${since ?? "start"} → ${until ?? "now"}  (${report.inRange ?? 0} record(s) in range)`);
-    }
-    if (!report.ok) {
-      summary.push(`Break at index: ${report.breakAtIndex}`);
-      summary.push(`Reason: ${report.breakReason}`);
-      summary.push("");
-      summary.push("A broken chain means the log was either edited after the fact or partially");
-      summary.push("written during a crash. For compliance evidence, treat all records from the");
-      summary.push("break onward as unverified.");
-    }
-    return respond("audit_verify", summary.join("\n"));
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: agent_cost (multi-agent token / cost / capacity report)
-// ---------------------------------------------------------------------------
-// Same renderer as `contextengine cost`. [LOCK] [COST-REPORT-ONE-RENDERER]
-// Free tool: it reads the caller's own Claude Code transcripts on this machine,
-// nothing leaves it. Added 2026-08-21, one day after the CLI (707fcc8).
-server.tool(
-  "agent_cost",
-  "Multi-agent cost report from Claude Code's own transcripts on this machine: tokens moved (cache read/write, fresh input, output), valued cost at API list prices (marked NOTIONAL on a subscription, UNPRICED when no rate matches), capacity intensity (subagents, failed, died at window, tool calls per agent, cache reuse), top runs, and context_burn / fanout_without_canary signals. Call it after a fan-out to read what it consumed, or before one to compare with the last. Thresholds come from .contextengine/policy.json agent_cost, else built-in defaults.",
-  {
-    days: z.number().int().positive().optional().describe("Only runs started within the last N days"),
-    project: z.string().optional().describe("Filter by project slug as it appears in ~/.claude/projects (e.g. -Users-yan-Projects-ContextEngine)"),
-    session: z.string().optional().describe("Filter by parent session id"),
-    run: z.string().optional().describe("Filter by run id (wf_... or task group id)"),
-    top: z.number().int().positive().max(50).optional().describe("How many runs to list (default 10)"),
-    json: z.boolean().optional().describe("Return the structured JSON report instead of the text one"),
-    policy_dir: z.string().optional().describe("Absolute path of the repo whose .contextengine/policy.json supplies agent_cost thresholds and rates. Default: the MCP server's working directory, which under launchd is the home dir, not a repo; the report names which source it used on its 'thresholds:' line"),
-  },
-  async ({ days, project, session, run, top, json, policy_dir }) => {
-    // [COST-POLICY-DIR-IS-EXPLICIT] — the daemon's cwd is not a project. Without this the MCP
-    // surface silently priced with built-in defaults while the CLI in the repo read policy.json.
-    const report = buildCostReport({ days, project, session, run, top }, policy_dir || process.cwd());
-    if (json && report.json) return respond("agent_cost", JSON.stringify(report.json, null, 2));
-    return respond("agent_cost", report.text);
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: drift_status (Detector — read current drift signals)
-// ---------------------------------------------------------------------------
-// Agents should call this between major task phases. If any 'critical' signal
-// is active, they should pause and surface to the human. The signals are also
-// appended to the audit log as drift.detected events so post-hoc review can
-// reconstruct what fired and when.
-server.tool(
-  "drift_status",
-  "Returns active drift / loop / stuck-tool / fabrication / silent-failure signals detected over the recent audit-log window. Use to self-check before starting a major task phase. If any 'critical' signal is active (fabrication_suspect or silent_failure), pause and surface to the human.",
-  {
-    windowSeconds: z.number().optional().describe("Look-back window in seconds. Default 300 (5 min)."),
-    minSeverity: z.enum(["info", "warn", "critical"]).optional().describe("Floor filter for severity. Default 'info' (everything)."),
-  },
-  async ({ windowSeconds, minSeverity }) => {
-    const signals = detect({ windowSeconds: windowSeconds ?? 300 });
-    const order = { info: 0, warn: 1, critical: 2 } as const;
-    const floor = order[minSeverity ?? "info"];
-    const filtered = signals.filter((s) => order[s.severity] >= floor);
-    const lines: string[] = [];
-    lines.push(`Drift signals: ${filtered.length} active (window=${windowSeconds ?? 300}s, minSeverity=${minSeverity ?? "info"}).`);
-    if (filtered.length === 0) {
-      lines.push("All clear.");
-    } else {
-      for (const s of filtered) {
-        const sev = s.severity.toUpperCase();
-        lines.push(`  [${sev}] ${s.kind}: ${s.reason}`);
-      }
-      const critical = filtered.filter((s) => s.severity === "critical");
-      if (critical.length > 0) {
-        lines.push("");
-        lines.push(`⛔ ${critical.length} CRITICAL signal(s) — pause the task and surface to the human.`);
-      }
-    }
-    return respond("drift_status", lines.join("\n"));
   }
 );
 
@@ -1468,76 +1286,6 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Tool: import_learnings (Bulk Import from Files)
-// ---------------------------------------------------------------------------
-server.tool(
-  "import_learnings",
-  "Bulk-import learnings from a Markdown or JSON file. By default only MARKED learnings are imported: inline bullets with a [category] prefix, anything inside a *LEARNINGS.md file, anything under a heading that says learnings / lessons / gotchas / rules, and JSON arrays of {category, rule, context}. Set permissive=true to also import every H3 heading, bold bullet and table row (H2=category, H3=rule, bullets=context). Deduplicates against existing learnings.",
-  {
-    file_path: z
-      .string()
-      .describe("Absolute path to the Markdown (.md) or JSON (.json) file to import from"),
-    default_category: z
-      .string()
-      .optional()
-      .describe("Default category for rules where category cannot be inferred. Defaults to 'other'."),
-    project: z
-      .string()
-      .optional()
-      .describe("Project name to tag all imported learnings with (e.g., 'FC_project')"),
-    permissive: z
-      .boolean()
-      .optional()
-      .describe("Import every heading, bold bullet and table row as a rule (the pre-2.5.7 behaviour). Default false: only marked learnings."),
-  },
-  async ({ file_path, default_category, project, permissive }) => {
-    let result;
-    try {
-      result = importLearningsFromFile(
-        file_path,
-        default_category || "other",
-        project,
-        { permissive: permissive === true },
-      );
-    } catch (e) {
-      return respond("import_learnings", `⛔ Import refused: ${e instanceof Error ? e.message : String(e)}`);
-    }
-
-    // Re-inject learnings into search index (project-scoped)
-    const newChunks = learningsToChunks(activeProjectNames);
-    const nonLearningChunks = chunks.filter((c) => c.source !== "💡 Learnings Store");
-    chunks.length = 0;
-    chunks.push(...nonLearningChunks, ...newChunks);
-
-    const stats = learningsStats();
-    const lines = [
-      `# Import Results\n`,
-      `- **Imported:** ${result.imported} new learnings`,
-      `- **Updated:** ${result.updated} existing learnings (dedup match)`,
-      `- **Skipped:** ${result.skipped} entries (missing data)`,
-      `- **Ignored:** ${result.ignored} headings / bold bullets / table rows outside a learnings scope (pass permissive=true to import them)`,
-      ``,
-      `📊 Store total: ${stats.total} learnings across ${Object.keys(stats.categories).length} categories`,
-      ``,
-    ];
-
-    if (result.errors.length > 0) {
-      lines.push(`## ⚠️ Errors (${result.errors.length})\n`);
-      for (const err of result.errors.slice(0, 10)) {
-        lines.push(`- ${err}`);
-      }
-      if (result.errors.length > 10) {
-        lines.push(`- ... and ${result.errors.length - 10} more`);
-      }
-    }
-
-    lines.push(`\nAll imported learnings now auto-surface in \`search_context\` results.`);
-
-    return respond("import_learnings", lines.join("\n"));
-  }
-);
-
-// ---------------------------------------------------------------------------
 // Tool: activate (License Activation)
 // ---------------------------------------------------------------------------
 server.tool(
@@ -1684,7 +1432,7 @@ async function main() {
   if (role === "reader") adopted = adoptSharedIndex();
   if (!adopted) {
     if (role === "reader") console.error("[ContextEngine] 📥 No shared index yet; building locally once, without importing learnings");
-    await buildIndex({ importLearnings: role === "indexer", loadAdapters: true });
+    await buildIndex({ importLearnings: role === "indexer" });
   }
 
   // 2. Register MCP resources

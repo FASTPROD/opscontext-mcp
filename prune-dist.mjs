@@ -15,7 +15,7 @@
  *
  * [LOCKED] [DIST-HAS-NO-ORPHANS], 2026-09-29
  * [NEVER] replace this with `rm -rf dist`: every MCP server on the owner's Mac runs from dist/,
- *         and the CLI imports some modules lazily (community-export, audit, detector), so a
+ *         and the CLI imports some modules lazily (audit, detector, the installers), so a
  *         process that imports one while the folder is being rebuilt finds it gone.
  * WHY: src/cache.ts was deleted on 2026-09-05 and tsc never removed dist/cache.js: 2.6.0 to
  *      2.12.0 shipped it (the 2.12.0 tarball in the npm cache still carries it) until it was

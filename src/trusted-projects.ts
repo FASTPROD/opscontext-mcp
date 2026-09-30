@@ -11,7 +11,7 @@
 //      not exist yet it is seeded with every project that already has learnings in the store, so
 //      an upgrade changes nothing for projects whose learnings were already being imported, and a
 //      project seen for the first time starts untrusted. `contextengine trust <project>` marks
-//      one. Explicit imports (import_learnings, import-learnings) are not gated here.
+//      one. Explicit imports (`contextengine import-learnings`) are not gated here.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { ceHome } from "./ce-home.js";

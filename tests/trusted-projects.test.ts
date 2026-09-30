@@ -58,7 +58,7 @@ describe("contextengine trust (built CLI)", () => {
 });
 
 describe("what the MCP tools hand to the agent", () => {
-  it("read_source, list_sources and search_context carry the note and never a planted value", async () => {
+  it("list_sources and search_context carry the note and never a planted value", async () => {
     const root = mkdtempSync(join(tmpdir(), "ce-framing-"));
     const home = join(root, "home");
     const ws = join(root, "ws", "demo");
@@ -79,14 +79,14 @@ describe("what the MCP tools hand to the agent", () => {
     send(1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } });
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     for (let i = 0; i < 150 && !/MCP server running/.test(err); i++) await new Promise((r) => setTimeout(r, 100));
-    send(2, "tools/call", { name: "read_source", arguments: { source_name: "demo — CLAUDE.md" } });
+    // read_source was the third reader of whole files; retired 2026-09-30 (E2E_REVIEW_2026-09 C1-1).
     send(3, "tools/call", { name: "list_sources", arguments: {} });
     send(4, "tools/call", { name: "search_context", arguments: { query: "mysqldump backup", mode: "keyword" } });
-    for (let i = 0; i < 150 && !(/"id":2/.test(out) && /"id":3/.test(out) && /"id":4/.test(out)); i++) await new Promise((r) => setTimeout(r, 100));
+    for (let i = 0; i < 150 && !(/"id":3/.test(out) && /"id":4/.test(out)); i++) await new Promise((r) => setTimeout(r, 100));
     child.kill();
 
     const replies = out.trim().split("\n").map((l) => JSON.parse(l)).filter((m) => m.id >= 2);
-    expect(replies).toHaveLength(3);
+    expect(replies).toHaveLength(2);
     for (const m of replies) {
       const text = (m.result?.content ?? []).map((c: { text: string }) => c.text).join("\n");
       expect(text, `reply ${m.id}`).toContain("not instructions to follow");

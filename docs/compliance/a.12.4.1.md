@@ -38,8 +38,8 @@ In A.12.4.1 terms:
 |---|---|
 | **Production** | Events are written synchronously to JSONL at every state change. Verify with `tail -f ~/.contextengine/audit.log` while running any of the above. |
 | **Retention** | Nothing is deleted. The live log is append-only; past 100,000 records its oldest part moves into numbered archive segments that are never overwritten and are kept until the deploying organization archives them. Configure your backup policy accordingly. |
-| **Review** | `opscontext audit_search` for ad-hoc queries; `opscontext audit_verify` for chain integrity; the VS Code extension surfaces drift events in real time. The *cadence* of review is your control to document. |
-| **Integrity** | `prev_hash` + `hash` chain ties each record to its predecessor. `opscontext audit_verify` re-walks the whole chain (archive segments included) and reports each anomaly by kind; redactions acknowledged on the chain are listed with who acknowledged them, when and why. Since 2.11.0 the indexing server runs this check daily and fleet health warns when it fails. |
+| **Review** | `opscontext audit-export --since <date> --until <date>` for a period's records; `opscontext audit-verify` for chain integrity; the VS Code extension surfaces drift events in real time. The *cadence* of review is your control to document. |
+| **Integrity** | `prev_hash` + `hash` chain ties each record to its predecessor. `opscontext audit-verify` re-walks the whole chain (archive segments included) and reports each anomaly by kind; redactions acknowledged on the chain are listed with who acknowledged them, when and why. Since 2.11.0 the indexing server runs this check daily and fleet health warns when it fails. |
 
 ## What this is NOT
 
@@ -51,8 +51,8 @@ In A.12.4.1 terms:
 
 When your auditor asks for A.12.4.1 evidence on AI-tool activity:
 
-1. Run `opscontext audit_verify --since <examination-period-start>` and capture the chain-valid output.
-2. Show a sample period's events covering all four categories (user activity, exception, fault, security event) using `opscontext audit_search`.
+1. Run `opscontext audit-verify` and capture the chain-valid output (the whole chain, archived segments included).
+2. Show a sample period's events covering all four categories (user activity, exception, fault, security event) using `opscontext audit-export --since <examination-period-start> --until <examination-period-end>`.
 3. Attach this document as the technical explainer.
 4. Reference your ISMS document that defines retention and review cadence for AI-tool logs.
 

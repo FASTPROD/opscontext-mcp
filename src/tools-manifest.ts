@@ -24,11 +24,15 @@
 /**
  * Every tool name registered on the MCP server, in registration order.
  * Order is not load-bearing — kept stable for easier diffs.
+ *
+ * 2026-09-30: read_source, delete_session, audit_verify, drift_status, agent_cost and
+ * import_learnings retired (0 calls in every chat on the author's Mac, the owner's decision,
+ * E2E_REVIEW_2026-09 C1-1). The command-line commands behind them stay: audit-verify, watch,
+ * cost, import-learnings.
  */
 export const ALL_TOOLS = [
   "search_context",
   "list_sources",
-  "read_source",
   "reindex",
   "list_projects",
   "check_ports",
@@ -37,15 +41,10 @@ export const ALL_TOOLS = [
   "save_session",
   "load_session",
   "list_sessions",
-  "delete_session",
-  "audit_verify",
-  "drift_status",
-  "agent_cost",
   "end_session",
   "save_learning",
   "list_learnings",
   "delete_learning",
-  "import_learnings",
   "activate",
   "activation_status",
 ] as const;

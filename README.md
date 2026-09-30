@@ -36,7 +36,6 @@ Plus the persistent-memory + search features carried forward from the contexteng
 - 💾 **Session Persistence** — AI agents can save/restore context across conversations
 - 💡 **Learning Store** — permanent operational rules that auto-surface in search results
 - 🛡️ **Protocol Firewall** — progressive enforcement that ensures agents commit, document, and save learnings
-- 🔌 **Plugin Adapters** — extend with custom data sources (Notion, Jira, RSS, etc.)
 - 🧩 **MCP native** — works with any MCP-compatible client (VS Code, Claude, Cursor, OpenClaw)
 
 ### What OpsContext is NOT
@@ -222,7 +221,6 @@ OpsContext is **source-available with a free tier**. The free tier covers everyt
 | End-of-session enforcement | ✅ | ✅ |
 | Protocol Firewall (agent compliance) | ✅ | ✅ |
 | VS Code extension (git monitor, chat) | ✅ | ✅ |
-| Plugin adapters | ✅ | ✅ |
 | **Project health score (A+ to F)** | — | ✅ |
 | **Compliance audit** | — | ✅ |
 | **Port conflict detection** | — | ✅ |
@@ -276,11 +274,20 @@ npx @compr/opscontext-mcp score ContextEngine --html
 npx @compr/opscontext-mcp list-learnings
 npx @compr/opscontext-mcp list-learnings security
 
-# Show live MCP session stats (value meter)
-npx @compr/opscontext-mcp stats
-
 # Run compliance audit across all projects
 npx @compr/opscontext-mcp audit
+
+# Verify the tamper-evident audit log, archived segments included
+npx @compr/opscontext-mcp audit-verify
+
+# Multi-agent token, cost and capacity report from Claude Code's own transcripts
+npx @compr/opscontext-mcp cost
+
+# Stream drift / loop / stuck-tool alerts from the audit log
+npx @compr/opscontext-mcp watch
+
+# Bulk-import learnings from a Markdown or JSON file
+npx @compr/opscontext-mcp import-learnings rules.md -c deployment
 
 # Scaffold config for a new project
 npx @compr/opscontext-mcp init
@@ -291,30 +298,31 @@ npx @compr/opscontext-mcp help
 
 CLI mode uses keyword search (BM25) which is instant — no model loading required.
 
-## Tools (20)
+## Tools (16)
 
 | Tool | Description | Tier |
 |------|-------------|------|
 | `search_context` | Hybrid keyword+semantic search with mode selector | Free |
 | `list_sources` | Show all indexed sources with chunk counts | Free |
-| `read_source` | Read full content of a knowledge source by name | Free |
 | `reindex` | Force full re-index of all sources | Free |
 | `save_session` | Save key-value entry to a named session | Free |
 | `load_session` | Load all entries from a named session | Free |
 | `list_sessions` | List all saved sessions | Free |
-| `delete_session` | Delete a saved session | Free |
 | `end_session` | Pre-flight checklist — uncommitted changes + doc freshness | Free |
 | `save_learning` | Save a permanent operational rule — auto-surfaces in search | Free |
 | `list_learnings` | List all permanent learnings, optionally by category | Free |
 | `delete_learning` | Remove a learning by ID | Free |
-| `import_learnings` | Bulk-import learnings from Markdown or JSON files | Free |
-| `audit_verify` | Verify tamper-evident audit log chain (evidence aligned with [SOC 2 CC7.2](docs/compliance/cc7.2.md), [ISO 27001 A.12.4.1](docs/compliance/a.12.4.1.md) — not a certification) | Free |
 | `activate` | Activate a PRO license on this machine | Free |
 | `activation_status` | Check current license status | Free |
 | `list_projects` | Discover and analyze all projects (tech stack, git, docker) | PRO |
 | `check_ports` | Scan all projects for port conflicts | PRO |
 | `run_audit` | Compliance agent — git, hooks, .env, Docker, PM2, versions | PRO |
 | `score_project` | AI-readiness scoring 0-100% with letter grades (A+ to F) | PRO |
+
+Retired in 2.17.0, unused: `read_source`, `delete_session`, `audit_verify`, `drift_status`, `agent_cost`
+and `import_learnings`. The command line keeps what they did: `audit-verify` (evidence aligned with
+[SOC 2 CC7.2](docs/compliance/cc7.2.md) and [ISO 27001 A.12.4.1](docs/compliance/a.12.4.1.md), not a
+certification), `watch`, `cost` and `import-learnings`.
 
 All tools are wrapped by the **Protocol Firewall** — a built-in enforcement layer that ensures agents save learnings, persist sessions, and commit code. No action needed from users; it's automatic.
 
@@ -337,12 +345,12 @@ For full control, create a `contextengine.json`:
     ".cursorrules",
     "AGENTS.md"
   ],
-  "codeDirs": ["src"],
-  "adapters": [
-    { "name": "feeds", "module": "./adapters/rss-adapter.js", "config": { "feeds": ["https://blog.example.com/rss.xml"] } }
-  ]
+  "codeDirs": ["src"]
 }
 ```
+
+The `adapters` key was retired in 2.17.0 with the plug-in adapters: a config that still lists some gets one
+line on stderr saying they are ignored, and no adapter code is loaded.
 
 ### Auto-discovered patterns
 
@@ -386,65 +394,6 @@ CONTEXTENGINE_WORKSPACES=/tmp/sandbox npx @compr/opscontext-mcp score --all
 > Note: the **search corpus** (`search`, `reindex`, `list-sources`) still prefers the config
 > file's `workspaces` over the env var. If you rely on the env var to scope indexing, set
 > `CONTEXTENGINE_CONFIG` to a config without `workspaces`, or unset `workspaces` there.
-
-## Plugin Adapters
-
-Extend ContextEngine with custom data sources via the adapter interface. Adapters are ES modules that collect data and return searchable chunks.
-
-```json
-{
-  "adapters": [
-    {
-      "name": "notion",
-      "module": "./adapters/notion-adapter.js",
-      "config": { "token": "$NOTION_API_TOKEN" }
-    },
-    {
-      "name": "feeds",
-      "module": "./adapters/rss-adapter.js",
-      "config": { "feeds": ["https://blog.example.com/rss.xml"], "maxItems": 20 }
-    }
-  ]
-}
-```
-
-### Creating an Adapter
-
-An adapter is a JS/TS module that exports an object with a `collect()` method:
-
-```javascript
-// my-adapter.js
-export default {
-  name: "my-source",
-  description: "Fetches data from My Source",
-
-  validate(config) {
-    if (!config?.apiKey) return "Missing apiKey";
-    return null;
-  },
-
-  async collect(config) {
-    // Fetch data and return Chunk[]
-    return [{
-      source: "my-source",
-      section: "## Title",
-      content: "Content to index...",
-      lineStart: 1,
-      lineEnd: 1,
-    }];
-  },
-};
-```
-
-See [examples/adapters/](examples/adapters/) for complete Notion and RSS adapter examples.
-
-### Adapter Features
-
-- **Environment variable resolution** — use `"$ENV_VAR"` syntax in config
-- **Factory pattern** — export `createAdapter(config)` for per-instance configuration
-- **Validation** — optional `validate()` method checks config before collection
-- **Lifecycle hooks** — optional `init()` and `destroy()` for setup/cleanup
-- **Safe execution** — adapter failures never crash the server
 
 ## How It Works
 

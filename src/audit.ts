@@ -207,9 +207,7 @@ export type AuditEvent =
   // One record per auto-import sweep; a learning.import record only names a source that imported,
   // updated or failed (added 2026-09-29). [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED] (src/learnings.ts)
   | "learning.sweep"
-  | "learning.export"
   | "session.save"
-  | "session.delete"
   | "activation.activate"
   | "activation.deactivate"
   | "activation.heartbeat"
@@ -237,9 +235,6 @@ export type AuditEvent =
   // Detector outputs (Phase 3)
   | "drift.detected"
   | "notification.fired"
-  // Community-rules sync client (shared learnings hybrid, Phase 1)
-  | "community.sync_ok"
-  | "community.sync_error"
   // Log rotation — records which segment a slice of history moved to (added 2026-08-20)
   | "audit.rotate"
   | "audit.redact"
@@ -1425,8 +1420,6 @@ export interface IntegrityReport {
   /** Records whose hash already appeared earlier in the history: a second copy of a record,
    *  counted once and never relinked. Not tampering, not a fork. [LOCK] [VERIFY-FORK-IS-NOT-TAMPER] */
   duplicateIndices?: number[];
-  /** Records whose `ts` falls in the range asked for (`countRange`), counted in the same pass. */
-  inRange?: number;
   /** The acknowledgements that turned altered records into redacted ones: who said so, when, why.
    *  An acknowledgement is a statement by whoever ran it, so the verifier shows every one it used.
    *  [LOCK] [REDACTION-IS-A-CHAINED-RECORD] */
@@ -1468,12 +1461,6 @@ export interface IntegrityReport {
  *      every copy: 190,011 records "verified" for 120,011 real ones after an interrupted rotation
  *      (E2E_REVIEW_2026-09 B2-1, B2-2). A copy's content is still checked against its own hash.
  */
-export interface VerifyOptions {
-  /** Count, in the same pass, the records whose `ts` falls in the range (both ends inclusive, the
-   *  comparison filterByRange() makes); the count comes back as `inRange`. */
-  countRange?: { since?: string; until?: string };
-}
-
 /**
  * Every line of one history file, split on "\n" only, read in 4 MB pieces. Yields the 1-based
  * line number as `split("\n")` would count it and the text; empty lines are yielded too and the
@@ -1518,7 +1505,7 @@ function* fileLines(path: string): Generator<[number, string]> {
  *      history: 11 of 11 fields identical). readAuditLog() still returns arrays for the callers
  *      that need records.
  */
-export function verifyChain(opts: VerifyOptions = {}): IntegrityReport {
+export function verifyChain(): IntegrityReport {
   const unreadable: UnreadableLine[] = [];
   const tampered: Array<{ index: number; hash: string; contentHash: string }> = [];
   const orphans: number[] = [];
@@ -1526,8 +1513,6 @@ export function verifyChain(opts: VerifyOptions = {}): IntegrityReport {
   const duplicates: number[] = [];
   const acks = new Map<string, { contentHash: string; ackIndex: number }>();
   const ackMeta = new Map<number, { ts: string; actor: string; reason: string }>();
-  const range = opts.countRange;
-  let inRange = 0;
 
   const failed = (e: unknown): IntegrityReport => ({
     ok: false,
@@ -1590,7 +1575,6 @@ export function verifyChain(opts: VerifyOptions = {}): IntegrityReport {
           skipping = false;
         }
         const i = index++;
-        if (range && inRangeTs(r.ts, range.since, range.until)) inRange++;
 
         // 1. Content integrity — the only check that can prove tampering. Computed against
         //    the record's OWN prev_hash, so a fork does not cascade into false tamper reports
@@ -1678,14 +1662,7 @@ export function verifyChain(opts: VerifyOptions = {}): IntegrityReport {
     acknowledgements,
     unreadable,
     redactedIndices: redacted,
-    ...(range ? { inRange } : {}),
   };
-}
-
-function inRangeTs(ts: string, since?: string, until?: string): boolean {
-  if (since && ts < since) return false;
-  if (until && ts > until) return false;
-  return true;
 }
 
 /**

@@ -4,6 +4,37 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.17.0] 2026-09-30: what nobody used is gone
+
+Batch 4 of the end-to-end review (rows C1-1, C1-2, C2-3, C5-2 and three findings of batch 3): the features
+nobody used, measured again (the chats kept on the author's Mac and the audit log agree: zero calls) and
+removed on the owner's decision, plus two fixes found on the way. Proven on the release build from outside
+the repository, side by side with 2.16.0.
+
+- **Six MCP tools retired, the command line keeps what they did.** `read_source`, `delete_session`,
+  `audit_verify`, `drift_status`, `agent_cost` and `import_learnings` had no call. The server offers 16
+  tools; a client that calls a retired one gets "Tool ... not found". Use `contextengine audit-verify`,
+  `watch`, `cost` and `import-learnings` instead.
+- **Four commands retired:** `stats` (the VS Code status bar and panel keep their numbers), `delete-session`
+  (a session is a file in the sessions folder), `sync-community-rules` and `export-learnings`.
+- **Community rules retired on the client.** The sync and export modules were never used; their three safety
+  lessons (signed rules, a signature bound to the request, an export that only ever redacts more) are kept in
+  a LOCK for any revival.
+- **Plug-in adapters retired, and no code a config names can run.** A config that still lists `adapters` gets
+  one line on stderr saying they are ignored; nothing it names is loaded. A test checks that every dynamic
+  import in the source takes a path written there.
+- **The sessions folder follows `CONTEXTENGINE_HOME`,** for the session store and the session gate alike. It
+  followed the login home before, so a run with its own CE home wrote into the real sessions.
+- **Search says when code is guarded by a LOCK.** A code chunk that holds a whole LOCK block (header, NEVER,
+  WHY) carries "Guarded by LOCK [TAG]: read its WHY before changing this code."
+- **The compliance guides name commands that exist:** `audit-verify` for the chain, `audit-export --since
+  --until` for a period's records (they named `audit_verify --since` and `audit_search`).
+- **Package:** 56 files to 51, 349 kB to 329 kB (the adapter examples went).
+
+Upgrading: nothing to do unless you relied on a retired tool or command. A config's `adapters` entries are
+ignored from now on. Your learnings stay in `~/.contextengine/learnings.json`, readable with
+`contextengine list-learnings`.
+
 ## [2.16.0] 2026-09-30: nothing ships that does nothing
 
 Batch 3 of the end-to-end review (rows C2-1, C2-2, C7-1, C7-2 and C7-4): what the package carried or ran

@@ -57,13 +57,6 @@ describe("CLI smoke tests", () => {
     expect(typeof output).toBe("string");
   });
 
-  it("stats returns session stats or no-session message", () => {
-    const output = run("stats");
-    expect(typeof output).toBe("string");
-    // Either shows stats or "No active session stats found"
-    expect(output.length).toBeGreaterThan(0);
-  });
-
   it("unknown command exits without crash", () => {
     // Unknown commands may enter interactive mode, so just verify help works
     const output = run("help");

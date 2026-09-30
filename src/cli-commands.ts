@@ -16,7 +16,8 @@
  *      the literals the dispatcher actually handles, so the two cannot drift.
  */
 
-/** Every token `cli.ts` dispatches on, including flag-style aliases. */
+/** Every token `cli.ts` dispatches on, including flag-style aliases. Retired 2026-09-30: stats,
+ *  delete-session, sync-community-rules, export-learnings ([LOCK] [COMMUNITY-RETIRED], src/index.ts). */
 export const KNOWN_COMMANDS: readonly string[] = [
   "--help",
   "--version",
@@ -37,10 +38,8 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "cost",
   "deactivate",
   "delete-learning",
-  "delete-session",
   "emit-event",
   "end-session",
-  "export-learnings",
   "help",
   "hook",
   "import-learnings",
@@ -61,10 +60,8 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "score",
   "search",
   "serve",
-  "stats",
   "status",
   "sync-claude-md",
-  "sync-community-rules",
   "uninstall-autostart",
   "uninstall-claude-hook",
   "version",

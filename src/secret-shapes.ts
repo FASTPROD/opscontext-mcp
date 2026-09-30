@@ -147,9 +147,10 @@ export function redactSecrets(input: string): RedactionResult {
  *      The same day the fix was found to cover one builder of two: the CLI's initEngine() never
  *      called it, and `contextengine search` returned 7 of 7 planted fake credentials in clear
  *      (E2E_REVIEW_2026-09 A6-2). The VS Code extension shells out to that CLI.
- * FIX: every chunk, whatever collected it (docs, code, ops collectors, learnings, community rules,
- *      adapters), is redacted with the capture shapes as the index is built, by this one function,
- *      called by both builders (src/index.ts buildIndex, src/cli.ts initEngine).
+ * FIX: every chunk, whatever collected it (docs, code, ops collectors, learnings; community rules and
+ *      adapters until their retirement on 2026-09-30), is redacted with the capture shapes as the index
+ *      is built, by this one function, called by both builders (src/index.ts buildIndex,
+ *      src/cli.ts initEngine).
  *      The source files are not touched: cleaning those is the owner's call, file by file.
  */
 export function redactChunk<T extends { content: string }>(c: T): T {

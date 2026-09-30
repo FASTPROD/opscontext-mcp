@@ -1,9 +1,12 @@
 // LOCKED — verified March 3 2026 — session persistence: save/load/list/delete + auto-session inject
+// 2026-09-30: delete retired with its two surfaces, the delete_session tool and the delete-session
+// command (0 uses, the owner's decision, E2E_REVIEW_2026-09 C1-1 and C1-2). A session is a file in
+// the sessions folder; removing one is removing that file.
 // DO NOT RE-AUDIT — 16 session tests passing, stable since v1.16.0
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { sessionsDir } from "./ce-home.js";
 import { safeAppend } from "./audit.js";
 
 /**
@@ -18,7 +21,7 @@ import { safeAppend } from "./audit.js";
  * - Store project-specific notes that persist between agent restarts
  */
 
-const SESSIONS_DIR = join(homedir(), ".contextengine", "sessions");
+// The folder follows the CE home, read at every call. [LOCK] [SESSIONS-FOLLOW-THE-CE-HOME] (src/ce-home.ts)
 
 export interface SessionEntry {
   key: string;
@@ -34,15 +37,15 @@ export interface Session {
 }
 
 function ensureDir(): void {
-  if (!existsSync(SESSIONS_DIR)) {
-    mkdirSync(SESSIONS_DIR, { recursive: true });
+  if (!existsSync(sessionsDir())) {
+    mkdirSync(sessionsDir(), { recursive: true });
   }
 }
 
 function sessionPath(name: string): string {
   // Sanitize name for filesystem
   const safe = name.replace(/[^a-zA-Z0-9_\-\.]/g, "_").substring(0, 100);
-  return join(SESSIONS_DIR, `${safe}.json`);
+  return join(sessionsDir(), `${safe}.json`);
 }
 
 /**
@@ -102,14 +105,15 @@ export interface SessionListEntry { name: string; entries: number; created: stri
 
 export function listSessions(): SessionListEntry[] {
   ensureDir();
+  const dir = sessionsDir();
 
   try {
-    return readdirSync(SESSIONS_DIR)
+    return readdirSync(dir)
       .filter((f) => f.endsWith(".json"))
       .map((f): SessionListEntry => {
         try {
           const session: Session = JSON.parse(
-            readFileSync(join(SESSIONS_DIR, f), "utf-8")
+            readFileSync(join(dir, f), "utf-8")
           );
           return {
             name: session.name,
@@ -124,22 +128,9 @@ export function listSessions(): SessionListEntry[] {
         }
       });
   } catch (err) {
-    console.error(`[ContextEngine] sessions folder could not be read (${SESSIONS_DIR}): ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[ContextEngine] sessions folder could not be read (${dir}): ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
-}
-
-/**
- * Delete a session.
- */
-export function deleteSession(name: string): boolean {
-  const path = sessionPath(name);
-  if (existsSync(path)) {
-    unlinkSync(path);
-    safeAppend("session.delete", { name });
-    return true;
-  }
-  return false;
 }
 
 /**

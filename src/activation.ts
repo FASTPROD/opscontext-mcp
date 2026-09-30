@@ -20,9 +20,9 @@
  * collector + multi-project data.
  *
  * Free (no activation required):
- *   - search_context, list_sources, read_source, reindex
- *   - save/load/list/delete/end_session
- *   - save/list/delete/import_learning
+ *   - search_context, list_sources, reindex
+ *   - save/load/list/end_session
+ *   - save/list/delete_learning
  *   - Operational collectors run during reindex (PM2, nginx, Docker, git,
  *     cron, .env redacted, composer, systemd) — collected data is searchable
  *     via search_context
@@ -68,7 +68,7 @@ const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily check
 // the count and the name list have a SINGLE source of truth. Adding a new
 // PRO tool requires editing src/tools-manifest.ts (which also feeds the
 // VS Code extension's info panel via ~/.contextengine/server-meta.json).
-import { PREMIUM_TOOL_NAMES } from "./tools-manifest.js";
+import { ALL_TOOLS, PREMIUM_TOOL_NAMES } from "./tools-manifest.js";
 export const PREMIUM_TOOLS = PREMIUM_TOOL_NAMES;
 
 // ---------------------------------------------------------------------------
@@ -462,9 +462,8 @@ export function gateCheck(toolName: string): string | null {
     return `🔒 "${toolName}" requires a ContextEngine Pro license.\n\n` +
       `Activate with: npx contextengine activate <license-key> <email>\n` +
       `Get a license: https://api.compr.ch/contextengine/pricing\n\n` +
-      `Free tools available: search_context, list_sources, read_source, reindex, ` +
-      `save_session, load_session, list_sessions, end_session, save_learning, ` +
-      `list_learnings, import_learnings`;
+      // From the manifest: a hand-kept list had drifted (it named two retired tools and missed one).
+      `Free tools available: ${ALL_TOOLS.filter((t) => !requiresActivation(t)).join(", ")}`;
   }
 
   // [LOCK] [LICENSE-IS-CHECKED-DAILY]: past the grace, an unreachable licence server means no Pro.

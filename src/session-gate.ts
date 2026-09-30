@@ -15,8 +15,8 @@
 //      of me": never block twice. Not a git repo, or no commit yet: nothing to gate, pass.
 import { existsSync, readdirSync, statSync } from "fs";
 import { basename, join } from "path";
-import { homedir } from "os";
 import { execFileSync } from "child_process";
+import { sessionsDir as defaultSessionsDir } from "./ce-home.js";
 
 export interface GateInput {
   /** The repository the turn ran in (CLAUDE_PROJECT_DIR, else cwd). */
@@ -119,7 +119,7 @@ function fmt(ts: number): string {
 export function evaluateSessionGate(input: GateInput): GateResult {
   const repo = input.repo;
   const name = basename(repo);
-  const sessionsDir = input.sessionsDir ?? join(process.env.CONTEXTENGINE_HOME || join(homedir(), ".contextengine"), "sessions");
+  const sessionsDir = input.sessionsDir ?? defaultSessionsDir(); // [LOCK] [SESSIONS-FOLLOW-THE-CE-HOME]
   const base: Omit<GateResult, "block" | "reason" | "message"> = { sessionName: name, sessionTs: 0, commitTs: 0, docsBehind: null, sessionDoc: null };
   if (input.stopHookActive) return { ...base, block: false, reason: "loop_guard", message: "" };
   const couldNotCheck = (why: string): GateResult =>

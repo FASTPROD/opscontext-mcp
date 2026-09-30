@@ -109,13 +109,12 @@ Add to your OpenClaw `openclaw.json` MCP servers section:
 }
 ```
 
-## Available Tools (17)
+## Available Tools (16)
 
 | Tool | Description |
 |------|-------------|
 | `search_context` | Hybrid BM25+semantic search with temporal decay. Modes: hybrid, keyword, semantic |
 | `list_sources` | Show all indexed sources with chunk counts and embedding status |
-| `read_source` | Read full content of a knowledge source by name |
 | `reindex` | Force full re-index of all sources |
 | `list_projects` | Discover and analyze all projects (tech stack, git, docker, pm2) |
 | `check_ports` | Scan all projects for port conflicts |
@@ -128,9 +127,12 @@ Add to your OpenClaw `openclaw.json` MCP servers section:
 | `end_session` | Pre-flight checklist — checks uncommitted git changes + doc freshness |
 | `save_learning` | Save a permanent operational rule — auto-surfaces in search results |
 | `list_learnings` | List all permanent learnings, optionally filtered by category |
-| `import_learnings` | Bulk-import learnings from Markdown or JSON files |
+| `delete_learning` | Remove a learning by its ID |
 | `activate` | Activate a Pro license on this machine |
 | `activation_status` | Check current license activation status |
+
+On the command line only since 2.17.0: `contextengine audit-verify` (the audit chain), `watch` (drift
+alerts), `cost` (multi-agent report) and `import-learnings` (bulk import).
 
 ## Core Capabilities
 
@@ -250,6 +252,14 @@ DO NOT RE-AUDIT                    // audit skip signal
 ALREADY IMPLEMENTED                // status marker
 VERIFIED — DO NOT                  // verified block
 ```
+
+### LOCK blocks (since 2.17.0)
+
+A code chunk that holds a whole LOCK block (a `[LOCKED] [TAG]` header, a `[NEVER]` line and a `WHY:`
+line; the older header opened with a padlock emoji) carries its own line in search results:
+`Guarded by LOCK [TAG]: read its WHY before changing this code.` Read the WHY first. If the change is
+still needed, keep the LOCK, or replace it with one that carries the old WHY. A doc that only explains
+the convention is never flagged.
 
 ### Rules for agents
 
