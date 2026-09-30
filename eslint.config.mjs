@@ -16,7 +16,7 @@ export default tseslint.config(
   },
   // CLI files legitimately use console.log for user output
   {
-    files: ["src/cli.ts", "src/test.ts", "src/secrets-lock.ts"],
+    files: ["src/cli.ts", "src/test.ts", "src/secrets-lock.ts", "src/anchor-cli.ts"],
     rules: {
       "no-console": "off",
     },

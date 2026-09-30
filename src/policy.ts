@@ -21,7 +21,7 @@
 
 import { z } from "zod";
 import { existsSync, readFileSync } from "fs";
-import { join } from "path";
+import { dirname, join, resolve } from "path";
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -202,6 +202,18 @@ export const AgentCostSchema = z.object({
   description: z.string().optional(),
 });
 
+/**
+ * SealHour (src/anchor.ts): whether this repository requires the audit chain to be stamped. With
+ * `required: true`, a period without a stamp (SealHour off on the machine, a checkpoint queued, the
+ * hourly job stopped, the chain's last record gone) is an error in `anchor status`, `anchor verify` and
+ * end-session, not a warning (workplan 2, Chantier 1, correction 1). Optional: a policy without it is
+ * unchanged. [LOCK] [POLICY-CONTRACT]: an optional field with a default, version 1 stays loadable.
+ */
+export const AnchoringSchema = z.object({
+  required: z.boolean().default(false).describe("true: a period of activity without a stamp is an error, not a warning"),
+  description: z.string().optional(),
+});
+
 export const PolicySchema = z.object({
   version: z.literal(1).describe("Policy schema version. Pin to 1 — bumps require a migration path."),
   extends: z
@@ -216,6 +228,7 @@ export const PolicySchema = z.object({
   bypass_tokens: z.array(BypassTokenSchema).default([]),
   rule_parity: z.array(RuleParitySchema).default([]),
   agent_cost: AgentCostSchema.optional(),
+  anchoring: AnchoringSchema.optional(),
 });
 export type Policy = z.infer<typeof PolicySchema>;
 
@@ -286,6 +299,20 @@ export function repoPolicyPath(repoRoot: string): string {
   return join(repoRoot, ".contextengine", "policy.json");
 }
 
+/** The policy of the repository holding `dir`: the nearest .contextengine/policy.json at or above it,
+ *  stopping at the repository's root (.git). null when there is none. */
+export function findRepoPolicy(dir: string): { root: string; result: ValidationResult } | null {
+  let d = resolve(dir);
+  for (;;) {
+    const r = loadRepoPolicy(d);
+    if (r) return { root: d, result: r };
+    if (existsSync(join(d, ".git"))) return null;
+    const up = dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pretty-print
 // ---------------------------------------------------------------------------
@@ -322,6 +349,7 @@ export function formatPolicySummary(policy: Policy): string {
   for (const b of policy.bypass_tokens) {
     lines.push(`  - ${b.id} → TTL ${b.ttl_seconds}s, reason ≥ ${b.requires_reason_min_length} chars`);
   }
+  lines.push(`Anchoring (SealHour): ${policy.anchoring?.required ? "required: a period without a stamp is an error" : "not required"}`);
   lines.push(`Rule-parity rules: ${policy.rule_parity.length}`);
   for (const r of policy.rule_parity) {
     lines.push(

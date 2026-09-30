@@ -17,6 +17,76 @@ import { hasLockMarker, lockBlockTags } from "./ingest.js";
  */
 
 const CODE_EXTENSIONS = new Set([".ts", ".js", ".mts", ".mjs", ".py"]);
+/** Above this size a file gets no function chunks, only its LOCK blocks. */
+const FUNCTION_CHUNKS_MAX_BYTES = 100_000;
+/** Above this size a file gets nothing: bundles and generated code. */
+const LOCK_PIECES_MAX_BYTES = 1_000_000;
+
+// [LOCKED] [EVERY-LOCK-BLOCK-IS-FINDABLE] - 2026-09-30
+// [NEVER] cut a code chunk at its declaration line again, leaving the comment above it out, or let a
+//         whole LOCK block in an indexed code file stay out of the index because no function holds it.
+// WHY: a LOCK block usually sits directly above the code it guards, at the top of a file, or above a
+//      constant, and the chunker kept only function bodies and skipped files over 100 KB. Measured on
+//      the owner's fleet on 2026-09-30 (E2E_REVIEW_2026-09 batch 4 finding, re-measured in batch 5):
+//      1,213 code chunks, 34 flagged "Guarded by LOCK"; of the LOCK headers in the indexed code files,
+//      69 sat inside a function chunk, 36 directly above one, 128 elsewhere, and 80 more in three
+//      files skipped for size (this repository's own cli.ts and agents.ts among them). An agent
+//      searching for guarded code mostly found it unflagged, and the WHY words were not searchable.
+// FIX: a function, class, interface or type chunk starts at the comment and decorator lines directly
+//      above it (no blank line between); every whole block not inside such a chunk becomes a chunk of
+//      its own (the block and the line of code under it), also in files up to LOCK_PIECES_MAX_BYTES
+//      that are too large for function chunks. A header counts only where it opens its comment line:
+//      a sentence that mentions the convention is not a block. The owner's yes, 2026-09-30.
+//      [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE] (src/ingest.ts)
+const HEADER_OPENS_LINE = /^\s*(?:\/\/+|\/\*+|\*|#)\s*(?:\[LOCKED\]|\u{1F512}\s*LOCKED)\s*\[([A-Z0-9][A-Z0-9_-]*)\]/u;
+
+function isCommentLine(line: string, py: boolean): boolean {
+  const t = line.trim();
+  if (py) return t.startsWith("#");
+  return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
+}
+
+/** First line (1-based) of the comment and decorator lines directly above `lineStart`, no blank line between. */
+function leadingCommentStart(lines: string[], lineStart: number, py: boolean): number {
+  let first = lineStart;
+  for (let i = lineStart - 2; i >= 0; i--) {
+    const l = lines[i];
+    if (l.trim() === "") break;
+    if (isCommentLine(l, py) || /^\s*@[\w.]+/.test(l)) { first = i + 1; continue; }
+    break;
+  }
+  return first;
+}
+
+/** A chunk per whole LOCK block whose header line no chunk in `covered` holds. [LOCK] [EVERY-LOCK-BLOCK-IS-FINDABLE] */
+function lockBlockChunks(filePath: string, sourceName: string, lines: string[], covered: Array<[number, number]>, py: boolean): Chunk[] {
+  const out: Chunk[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!HEADER_OPENS_LINE.test(lines[i])) continue;
+    const header = i + 1;
+    if (covered.some(([s, e]) => header >= s && header <= e)) continue;
+    let j = i + 1; // the block: its comment lines, up to the next header or the first line of code
+    while (j < lines.length && isCommentLine(lines[j], py) && !HEADER_OPENS_LINE.test(lines[j])) j++;
+    let k = j; // the line of code it guards, past any comment or blank line
+    while (k < lines.length && (lines[k].trim() === "" || isCommentLine(lines[k], py))) k++;
+    const guarded = k < lines.length ? lines[k].slice(0, 200) : null;
+    const content = lines.slice(i, j).join("\n") + (guarded !== null ? `\n${guarded}` : "");
+    // The tag is the header's own; the block must be whole (its NEVER and WHY lines) to count.
+    const tag = HEADER_OPENS_LINE.exec(lines[i])?.[1];
+    if (!tag || lockBlockTags(content).length === 0) continue;
+    const guardedBy = [tag];
+    out.push({
+      source: sourceName,
+      section: `${basename(filePath)} > LOCK ${guardedBy.map((t) => `[${t}]`).join(" ")}`,
+      content,
+      lineStart: header,
+      lineEnd: guarded !== null ? k + 1 : j,
+      ...(hasLockMarker(content) && { locked: true }),
+      guardedBy,
+    });
+  }
+  return out;
+}
 const SKIP_DIRS = new Set([
   "node_modules", ".git", "dist", "build", "coverage",
   "__pycache__", ".venv", "venv", ".next", ".cache",
@@ -212,22 +282,21 @@ function parsePython(text: string): CodeBlock[] {
  */
 export function parseCodeFile(
   filePath: string,
-  sourceName: string
+  sourceName: string,
+  opts: { lockBlocksOnly?: boolean } = {}
 ): Chunk[] {
   const ext = extname(filePath).toLowerCase();
+  const py = ext === ".py";
   const text = readFileSync(filePath, "utf-8");
+  const lines = text.split("\n");
+  // [LOCK] [EVERY-LOCK-BLOCK-IS-FINDABLE]: a file too large for function chunks still gives its blocks.
+  if (opts.lockBlocksOnly) return lockBlockChunks(filePath, sourceName, lines, [], py);
 
-  let blocks: CodeBlock[];
-  if (ext === ".py") {
-    blocks = parsePython(text);
-  } else {
-    blocks = parseTSJS(text);
-  }
+  const blocks: CodeBlock[] = py ? parsePython(text) : parseTSJS(text);
 
   // If no blocks found, create a single chunk for the whole file
   // (but only if it's not too large)
   if (blocks.length === 0) {
-    const lines = text.split("\n");
     if (lines.length <= 200 && text.trim().length > 0) {
       const locked = hasLockMarker(text);
       const guardedBy = lockBlockTags(text); // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
@@ -241,22 +310,27 @@ export function parseCodeFile(
         ...(guardedBy.length > 0 && { guardedBy }),
       }];
     }
-    return [];
+    return lockBlockChunks(filePath, sourceName, lines, [], py);
   }
 
-  return blocks.map((b) => {
-    const locked = hasLockMarker(b.content);
-    const guardedBy = lockBlockTags(b.content); // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
+  const chunks: Chunk[] = blocks.map((b) => {
+    // The comment above a declaration is part of it: a LOCK block or a doc comment usually sits
+    // there. [LOCK] [EVERY-LOCK-BLOCK-IS-FINDABLE]
+    const first = leadingCommentStart(lines, b.lineStart, py);
+    const content = first < b.lineStart ? `${lines.slice(first - 1, b.lineStart - 1).join("\n")}\n${b.content}` : b.content;
+    const locked = hasLockMarker(content);
+    const guardedBy = lockBlockTags(content); // [LOCK] [LOCK-BLOCK-IS-FLAGGED-IN-CODE]
     return {
       source: sourceName,
       section: `${basename(filePath)} > ${b.kind} ${b.name}`,
-      content: b.content,
-      lineStart: b.lineStart,
+      content,
+      lineStart: first,
       lineEnd: b.lineEnd,
       ...(locked && { locked: true }),
       ...(guardedBy.length > 0 && { guardedBy }),
     };
   });
+  return chunks.concat(lockBlockChunks(filePath, sourceName, lines, chunks.map((c) => [c.lineStart, c.lineEnd]), py));
 }
 
 /**
@@ -294,11 +368,12 @@ export function scanCodeDir(
           // Skip test files, config files, and very large files
           if (entry.includes(".test.") || entry.includes(".spec.")) continue;
           if (entry === "jest.config.js" || entry === "webpack.config.js") continue;
-          if (stat.size > 100_000) continue; // skip files > 100KB
+          if (stat.size > LOCK_PIECES_MAX_BYTES) continue;
 
           const relPath = relative(dirPath, full);
           const sourceName = `${projectName}/${relPath}`;
-          const chunks = parseCodeFile(full, sourceName);
+          // [LOCK] [EVERY-LOCK-BLOCK-IS-FINDABLE]: over 100 KB, only the file's LOCK blocks.
+          const chunks = parseCodeFile(full, sourceName, { lockBlocksOnly: stat.size > FUNCTION_CHUNKS_MAX_BYTES });
           allChunks.push(...chunks);
         }
       } catch {

@@ -2374,8 +2374,20 @@ async function cliEndSession(): Promise<void> {
   // --- Check 3b: running servers ([LOCK] [SERVERS-ARE-INVENTORIED]) ---
   checks.push("## 3b. Running servers\n");
   const fleet = listServers();
-  checks.push("```\n" + formatServers(fleet) + "\n" + formatFleetHealth(computeFleetHealth({ version: readPackageVersion(), report: fleet })) + "\n```");
+  const fleetHealth = computeFleetHealth({ version: readPackageVersion(), report: fleet });
+  checks.push("```\n" + formatServers(fleet) + "\n" + formatFleetHealth(fleetHealth) + "\n```");
   if (fleet.warnings.length > 0) failCount += fleet.warnings.length;
+  // SealHour: with anchoring required by this repo's policy, a period without a stamp fails the
+  // session. [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] (src/anchor.ts)
+  {
+    const { anchoringPolicy } = await import("./anchor.js");
+    const pol = anchoringPolicy();
+    const a = fleetHealth.anchor;
+    if (pol.required && (!a || !a.enabled || a.problem)) {
+      checks.push(`- ❌ FAIL — ${pol.where} requires the audit chain to be stamped: ${a ? (a.enabled ? a.problem : "SealHour is off on this machine (contextengine anchor enable)") : "SealHour status unknown"}`);
+      failCount++;
+    }
+  }
   checks.push("");
 
   // --- Check 3c: CI on HEAD ([LOCK] [PUSHED-MEANS-CI-READ]) ---
@@ -2549,6 +2561,10 @@ Usage:
                                        Export hash-chained audit log (evidence aligned with
                                        SOC 2 CC7.2 + ISO 27001 A.12.4.1 — not a certification)
   contextengine audit-verify           Verify audit log chain integrity (tamper detection)
+  contextengine anchor <enable|status|code on|off|copy <folder>|verify|export-evidence <from> <to>|tick|disable>
+                                       SealHour: an outside time stamp for the audit chain, every hour. Off until
+                                       'anchor enable', which shows what leaves the machine and asks first.
+                                       Interim mode for now: free public time stamp services, directly
   contextengine servers [--cost]       List running MCP servers, their build vs the file on disk, role; --cost adds CPU time and memory
   contextengine audit-redact-ack       Acknowledge deliberately redacted records on the chain (--index i,j --reason "...")
   contextengine audit-rotate [--keep-days N] [--max-records N] [--dry-run]
@@ -2823,6 +2839,12 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
   import("./install-claude-hook.js").then((m) =>
     m.cliInstallClaudeHook(process.argv.slice(3)),
   ).catch((err) => {
+    console.error("Error:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+} else if (command === "anchor") {
+  // SealHour (interim backend): off until `anchor enable`. [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE]
+  import("./anchor-cli.js").then((m) => m.cliAnchor(process.argv.slice(3))).catch((err) => {
     console.error("Error:", err instanceof Error ? err.message : err);
     process.exit(1);
   });

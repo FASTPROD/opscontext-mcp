@@ -87,5 +87,5 @@ describe("acknowledged redactions", () => {
     const v = verifyChain();
     expect(v.ok).toBe(true);
     expect(v.redactedIndices).toEqual([7]);
-  });
+  }, 30_000); // 2,300 appends and a rotation: about 4 s alone, over 10 s in a full parallel run on the owner's Mac (2026-09-30)
 });

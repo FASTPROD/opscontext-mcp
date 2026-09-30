@@ -62,7 +62,7 @@ describe("audit auto-rotation at MCP startup", () => {
     expect(existsSync(join(tempHome, "audit.rotate.lock"))).toBe(false);
     // Hysteresis: a second start right after does not rotate again.
     expect(autoRotateAuditLog({ trigger: 2_200, maxRecords: 2_100 }).action).toBe("below_trigger");
-  });
+  }, 30_000); // 2,300 appends and a rotation: about 4 s alone, over 10 s in a full parallel run on the owner's Mac (2026-09-30)
 
   it("a late starter sees the fresh lock and backs off without touching the log", () => {
     seed(2_300);

@@ -24,6 +24,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "-h",
   "-v",
   "activate",
+  "anchor",
   "audit",
   "audit-export",
   "audit-rotate",

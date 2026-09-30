@@ -69,33 +69,6 @@ describe("CLI smoke tests", () => {
     expect(typeof output).toBe("string");
   });
 
-  it("export-learnings --help prints the cross-client warning", () => {
-    const output = run("export-learnings --help");
-    expect(output).toContain("export-learnings");
-    expect(output).toContain("--project");
-    // The cross-client confidentiality warning is the whole point of this command
-    expect(output.toLowerCase()).toContain("cross-client confidentiality");
-  });
-
-  it("export-learnings --project <nonexistent> returns valid empty JSON", () => {
-    const output = run(
-      "export-learnings --project __nonexistent_project_xyzzy_qwerty__ --format json",
-    );
-    // Strip any incidental log lines and take just the JSON
-    const jsonStart = output.indexOf("{");
-    expect(jsonStart).toBeGreaterThanOrEqual(0);
-    const json = output.slice(jsonStart);
-    const parsed = JSON.parse(json);
-    expect(parsed.version).toBe(1);
-    expect(parsed.scope.project).toBe("__nonexistent_project_xyzzy_qwerty__");
-    expect(parsed.scope.include_universal).toBe(false);
-    expect(parsed.count).toBe(0);
-    expect(parsed.learnings).toEqual([]);
-  });
-
-  it("export-learnings without --project emits the ALL-projects warning header in markdown", () => {
-    const output = run("export-learnings --format markdown");
-    expect(output).toMatch(/ALL projects/);
-    expect(output).toMatch(/cross-project IP/i);
-  });
+  // export-learnings retired 2026-09-30 ([LOCK] [COMMUNITY-RETIRED], src/index.ts); its three smoke
+  // tests stayed and passed only while the live dist/ was older than the retirement.
 });

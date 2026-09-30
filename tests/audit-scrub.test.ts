@@ -60,7 +60,7 @@ describe("scrubAuditLog", () => {
     expect(r.redactedRecords).toBe(3);
     expect(r.counts).toEqual({ stripe_key: 1, sshpass_password: 1, url_password: 1 });
     expect(allText()).toBe(before);
-  });
+  }, 30_000); // a seeded history, then a full scrub: about 4 s alone, over 10 s in a full parallel run on the owner's Mac (2026-09-30)
 
   it("removes the secrets from the archive and the live log, and the chain still verifies", () => {
     seedWithSecrets();

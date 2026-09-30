@@ -1,7 +1,7 @@
 // [LOCK] [SERVERS-ARE-INVENTORIED]: the registry must name every live server, its build against
 // the file on disk, and drop dead records. Throwaway HOME via src/test-setup.ts.
 import { describe, it, expect, beforeAll } from "vitest";
-import { mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync, statSync, unlinkSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -86,5 +86,78 @@ describe("roles (one indexer, many readers)", () => {
     expect(w).toBeDefined();
     expect(Number(w!.match(/^(\d+) of/)![1])).toBeGreaterThanOrEqual(5);
     stop();
+  });
+});
+
+// [LOCK] [A-HALF-READ-RECORD-IS-NOT-DEAD]: E2E_REVIEW_2026-09 C0. A listing that read a record while
+// its owner rewrote it deleted it, and the owner then indexed on its own for 15 s (11 times in the
+// live log, 28 to 30 September). The first three tests fail on the code before.
+const psWorks = spawnSync("ps", ["-o", "pid=", "-p", String(process.pid)]).status === 0;
+
+describe("a record caught mid-rewrite", () => {
+  it("is left in place and not listed while its process is alive, empty or half written", () => {
+    mkdirSync(dir(), { recursive: true });
+    // The roles test above leaves extra records carrying this pid under other names.
+    for (const f of readdirSync(dir())) if (f.startsWith(`${process.pid}-`)) unlinkSync(join(dir(), f));
+    const file = join(dir(), `${process.pid}.json`);
+    for (const torn of ["", `{"pid": ${process.pid}, "started": "20`]) {
+      writeFileSync(file, torn);
+      const rep = R.listServers();
+      expect(existsSync(file)).toBe(true);
+      expect(rep.servers.some((s) => s.pid === process.pid)).toBe(false);
+      expect(rep.warnings.some((w) => w.startsWith(`${process.pid}.json: the record could not be read`))).toBe(true);
+    }
+    unlinkSync(file);
+  });
+  it("is replaced whole: the new record is renamed into place, never truncated and refilled", () => {
+    const script = join(home(), "fake-server-whole.js");
+    writeFileSync(script, "console.log('whole')");
+    const { stop, setRole } = R.registerServer({ version: "9.9.9", script, corpus: "whole12whole", role: "reader" });
+    const file = join(dir(), `${process.pid}.json`);
+    const before = statSync(file).ino;
+    setRole("indexer");
+    expect(statSync(file).ino).not.toBe(before);
+    expect(JSON.parse(readFileSync(file, "utf8")).role).toBe("indexer");
+    expect(readdirSync(dir()).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    stop();
+  });
+  it("of a dead process is still removed, and so is a dead writer's temp file; a live writer's temp file stays", () => {
+    mkdirSync(dir(), { recursive: true });
+    const dead = spawnSync("true").pid as number;
+    writeFileSync(join(dir(), `${dead}.json`), "");
+    writeFileSync(join(dir(), `.${dead}.json.tmp`), "{");
+    writeFileSync(join(dir(), `.${process.ppid}.json.tmp`), "{");
+    const rep = R.listServers();
+    expect(readdirSync(dir())).not.toContain(`${dead}.json`);
+    expect(readdirSync(dir())).not.toContain(`.${dead}.json.tmp`);
+    expect(readdirSync(dir())).toContain(`.${process.ppid}.json.tmp`);
+    expect(rep.removed).toBeGreaterThanOrEqual(1);
+    unlinkSync(join(dir(), `.${process.ppid}.json.tmp`));
+  });
+  it.skipIf(!psWorks)("of a pid reused since the file was written is removed (the pid's process started later)", () => {
+    mkdirSync(dir(), { recursive: true });
+    const file = join(dir(), `${process.pid}.json`);
+    writeFileSync(file, "");
+    const past = new Date("2020-01-01T00:00:00Z");
+    utimesSync(file, past, past);
+    R.listServers();
+    expect(existsSync(file)).toBe(false);
+  });
+});
+
+describe("a corpus nobody indexes", () => {
+  it("is named when all its servers run an old build and none indexes; not once one does", () => {
+    mkdirSync(dir(), { recursive: true });
+    const script = join(home(), "fake-server-noidx.js");
+    writeFileSync(script, "console.log('disk build')");
+    const now = new Date().toISOString();
+    const rec = (pid: number, role: "reader" | "indexer") => ({ pid, ppid: 1, parent: "test", started: now, heartbeat: now, version: "1", script, build: "an-old-build", cwd: "/", node: "v20", corpus: "noidx1noidx1", role });
+    writeFileSync(join(dir(), `${process.pid}.json`), JSON.stringify(rec(process.pid, "reader")));
+    writeFileSync(join(dir(), `${process.ppid}.json`), JSON.stringify(rec(process.ppid, "reader")));
+    expect(R.listServers().warnings.some((w) => /^corpus noidx1noidx1 has no indexer: its 2 server\(s\) run an old build/.test(w))).toBe(true);
+    writeFileSync(join(dir(), `${process.ppid}.json`), JSON.stringify(rec(process.ppid, "indexer")));
+    expect(R.listServers().warnings.some((w) => /^corpus noidx1noidx1 has no indexer/.test(w))).toBe(false);
+    unlinkSync(join(dir(), `${process.pid}.json`));
+    unlinkSync(join(dir(), `${process.ppid}.json`));
   });
 });

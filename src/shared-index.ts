@@ -15,6 +15,17 @@
 //      Off unless CONTEXTENGINE_SHARED_INDEX=1 until the trial has run on a real fleet. A reader
 //      that finds no index runs the old pipeline once, without importing learnings: the fallback
 //      is today's code path, not a second one.
+// 2026-09-30 (E2E_REVIEW_2026-09 C0, the owner's yes): [NEVER] let an old build take over
+//      indexing from a reader. Measured in the live log: after every build every server is
+//      stale, and "earliest start" then handed the corpus to the OLDEST window, a chat server on
+//      2.12.0 from 28 September; at 08:51 and 15:51 that day it ran its 2.12.0 importer (about
+//      900 records of per-source noise each time, 28 learnings re-dated) and wrote the shared
+//      index with 2.12.0 code, for 9 to 11 minutes, until the agent was restarted by hand. And
+//      the agent won among current builds only when it happened to start first.
+//      Now: current builds first, the launchd agent first among them; with no current build,
+//      the agent, else the server already indexing, else nobody (every server reads the last
+//      shared index until a current one starts, a few seconds when the agent restarts itself).
+//      [LOCK] [AUTOSTART-IS-THE-STANDING-INDEXER] [LOCK] [A-HALF-READ-RECORD-IS-NOT-DEAD]
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -102,20 +113,25 @@ export function sharedIndexMtime(corpus: string): number | null {
 }
 
 /**
- * Who indexes this corpus. Among the live registered servers of the corpus: a server whose
- * build equals the file on disk beats a stale one, then the earliest start, then the lowest pid.
- * A server that does not find itself in the registry indexes on its own: never wait on a
- * registry that failed.
+ * Who indexes this corpus, among its live registered servers. Servers whose build equals the file
+ * on disk come first: the launchd agent, then the earliest start, then the lowest pid. When every
+ * server runs an older build: the launchd agent, else the server already indexing, else nobody
+ * (indexer null, every server a reader of the last shared index). An old build never takes over
+ * from a reader. A server that does not find itself in the registry indexes on its own: never wait
+ * on a registry that failed. [LOCK] [ONE-INDEXER-MANY-READERS]
  */
 export function electIndexer(corpus: string, servers: ServerReport["servers"], myPid: number): { indexer: number | null; role: ServerRole } {
   const mine = servers.filter((s) => s.corpus === corpus);
   if (!mine.some((s) => s.pid === myPid)) return { indexer: null, role: "indexer" };
-  mine.sort((a, b) => {
-    if (a.staleBuild !== b.staleBuild) return a.staleBuild ? 1 : -1;
+  const order = (a: (typeof mine)[number], b: (typeof mine)[number]): number => {
+    if (Boolean(a.daemon) !== Boolean(b.daemon)) return a.daemon ? -1 : 1;
     const t = a.started.localeCompare(b.started);
     if (t !== 0) return t;
     return a.pid - b.pid;
-  });
-  const winner = mine[0];
+  };
+  const current = mine.filter((s) => !s.staleBuild);
+  const pool = current.length > 0 ? current : mine.filter((s) => s.daemon || s.role === "indexer");
+  const winner = pool.sort(order)[0];
+  if (!winner) return { indexer: null, role: "reader" };
   return { indexer: winner.pid, role: winner.pid === myPid ? "indexer" : "reader" };
 }

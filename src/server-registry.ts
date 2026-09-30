@@ -12,7 +12,7 @@
 //      goes on exit, and a lister removes records whose pid is dead. `contextengine servers`
 //      and the end-session checklist compare each record's build hash with the file on disk
 //      now, and warn when more than SERVER_COUNT_WARN servers run at once.
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { basename, dirname, join } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
@@ -194,7 +194,14 @@ export function registerServer(opts: { version: string; script: string; corpus?:
     ...(opts.daemon ? { daemon: true } : {}),
   };
   const file = join(dir, `${process.pid}.json`);
-  const write = () => { try { writeFileSync(file, JSON.stringify(record, null, 2)); } catch { /* registry is diagnostics, never fatal */ } };
+  // Whole or not at all: a temp file renamed into place. [LOCK] [A-HALF-READ-RECORD-IS-NOT-DEAD]
+  const tmp = join(dir, `.${process.pid}.json.tmp`);
+  const write = () => {
+    try {
+      writeFileSync(tmp, JSON.stringify(record, null, 2));
+      renameSync(tmp, file);
+    } catch { /* registry is diagnostics, never fatal */ }
+  };
   write();
   const timer = setInterval(() => { record.heartbeat = new Date().toISOString(); write(); }, HEARTBEAT_MS);
   timer.unref();
@@ -235,6 +242,52 @@ export function liveDaemonPid(exceptPid: number = process.pid): number | null {
   return null;
 }
 
+/**
+ * [LOCKED] [A-HALF-READ-RECORD-IS-NOT-DEAD] - 2026-09-30
+ * [NEVER] delete a registry record because it could not be parsed while the process its name gives
+ *         is alive, or go back to writing a record in place (truncate, then write).
+ * WHY: every server rewrites its record every 60 s and on each role or port change, and every server
+ *      lists the registry every 15 s. The write truncated the file, then filled it; a listing that
+ *      landed in between read an empty or half record and deleted it. The owner of the deleted record
+ *      then did not find itself at its next election and indexed on its own ("never wait on a
+ *      registry that failed"): model loaded, corpus re-indexed with an import sweep, shared index
+ *      rewritten, for 15 s until its heartbeat brought the record back. 11 times in the live log from
+ *      28 to 30 September (E2E_REVIEW_2026-09 C0); reproduced in a scratch home, one empty or half
+ *      record of a live pid and one listServers(): the file gone.
+ * FIX: a record is written to a hidden temp file and renamed into place, so a reader sees the old
+ *      record or the new one. A record that still cannot be parsed at a second read is skipped with a
+ *      warning while the pid in its name is alive and started before the file was last written;
+ *      otherwise (a dead pid, a reused one, no pid in the name) it is removed as before. A dead
+ *      writer's temp file is removed. [LOCK] [A-RECORD-BELONGS-TO-ITS-OWN-PROCESS]
+ */
+function readRecord(path: string): { rec: ServerRecord; error: null } | { rec: null; error: string } {
+  let error = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return { rec: JSON.parse(readFileSync(path, "utf8")) as ServerRecord, error: null };
+    } catch (err) {
+      error = (err as Error).message;
+    }
+  }
+  return { rec: null, error };
+}
+
+/** An unreadable record's own process may be rewriting it: alive, and started before its last write. */
+function ownerMayBeWriting(file: string, path: string): boolean {
+  const m = /^(\d+)\.json$/.exec(file);
+  if (!m) return false;
+  const pid = Number(m[1]);
+  if (!isAlive(pid)) return false;
+  refreshStartTimes([pid]);
+  const startedMs = startCache.get(pid)?.startedMs ?? null;
+  if (startedMs === null) return true; // cannot tell: the pid test decides, as recordIsLive does
+  try {
+    return startedMs <= statSync(path).mtimeMs + 5_000;
+  } catch {
+    return false; // gone meanwhile
+  }
+}
+
 /** Read every record, drop the dead ones, compare builds with the files on disk now. */
 export function listServers(): ServerReport {
   const dir = registryDir();
@@ -242,11 +295,22 @@ export function listServers(): ServerReport {
   if (!existsSync(dir)) return report;
   const records: Array<{ path: string; rec: ServerRecord }> = [];
   for (const f of readdirSync(dir)) {
-    if (!f.endsWith(".json")) continue;
     const path = join(dir, f);
-    let rec: ServerRecord;
-    try { rec = JSON.parse(readFileSync(path, "utf8")); } catch { try { unlinkSync(path); } catch { /* */ } report.removed++; continue; }
-    records.push({ path, rec });
+    const tmpOf = /^\.(\d+)\.json\.tmp$/.exec(f);
+    if (tmpOf) {
+      if (!isAlive(Number(tmpOf[1]))) { try { unlinkSync(path); } catch { /* */ } }
+      continue;
+    }
+    if (!f.endsWith(".json")) continue;
+    const r = readRecord(path);
+    if (r.rec) { records.push({ path, rec: r.rec }); continue; }
+    // [LOCK] [A-HALF-READ-RECORD-IS-NOT-DEAD]
+    if (ownerMayBeWriting(f, path)) {
+      report.warnings.push(`${f}: the record could not be read (${r.error}); its process is alive, so it is not listed this time and left in place`);
+      continue;
+    }
+    try { unlinkSync(path); } catch { /* */ }
+    report.removed++;
   }
   refreshStartTimes(records.filter(({ rec }) => isAlive(rec.pid)).map(({ rec }) => rec.pid)); // one ps for the listing
   for (const { path, rec } of records) {
@@ -277,6 +341,14 @@ export function listServers(): ServerReport {
   const indexing = report.servers.filter((s) => s.role !== "reader");
   if (indexing.length > SERVER_COUNT_WARN) {
     report.warnings.push(`${indexing.length} of ${report.servers.length} servers index on their own; every doc change makes each of them re-index the corpus (${SERVER_COUNT_WARN} is the comfortable ceiling; CONTEXTENGINE_SHARED_INDEX=1 makes all but one per corpus readers)`);
+  }
+  // A corpus nobody indexes is said, never implied: every server of it runs an old build, and an old
+  // build never takes over from a reader. [LOCK] [ONE-INDEXER-MANY-READERS]
+  for (const c of new Set(report.servers.map((s) => s.corpus).filter((x): x is string => Boolean(x)))) {
+    const of = report.servers.filter((s) => s.corpus === c);
+    if (of.every((s) => s.staleBuild) && !of.some((s) => s.role === "indexer" || s.daemon)) {
+      report.warnings.push(`corpus ${c} has no indexer: its ${of.length} server(s) run an old build and serve the last shared index until one on the current build starts (reload a window, or restart the launchd agent)`);
+    }
   }
   return report;
 }

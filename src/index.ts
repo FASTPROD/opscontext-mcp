@@ -49,10 +49,12 @@ import {
 } from "./sessions.js";
 import { autoRotateAuditLog, safeAppend, readVerifyState } from "./audit.js";
 import { registerServer, listServers, formatServers, liveDaemonPid } from "./server-registry.js";
+import { checkAgentRestart, recordAgentRestart, preflightBuild } from "./agent-restart.js";
 import { secureCeHome } from "./ce-home.js";
 import { trimDaemonLog } from "./daemon-log.js";
 import { QUOTED_TEXT_NOTE } from "./framing.js";
 import { computeFleetHealth, writeFleetHealth } from "./fleet-health.js";
+import { anchorHealth, anchoringPolicy, anchorTickDue } from "./anchor.js";
 import { startEventIngestServer } from "./http-server.js";
 import {
   saveLearning,
@@ -106,6 +108,10 @@ let corpus: string | undefined;
 let indexerPid: number | null = null;
 let setRegistryRole: ((r: ServerRole) => void) | null = null;
 let setRegistryEventPort: ((port: number | null) => void) | null = null;
+/** The build this server registered with; the launchd agent leaves for a newer one. [LOCK] [THE-AGENT-FOLLOWS-THE-BUILD] */
+let loadedBuild: string | null = null;
+let lastRestartNote: string | null = null;
+let preflightRunning = false;
 let warnedRetiredAdapters = false;
 /** key -> vector, loaded from ~/.contextengine/embeddings.bin and grown by what we embed. */
 let vectorStore: Map<string, Float32Array> = new Map();
@@ -527,6 +533,12 @@ function stopIndexPolling(): void {
   indexPoll = null;
 }
 
+/** Who indexes, for the log: a pid, or nobody while every server of the corpus runs an old build. */
+function indexerLabel(): string {
+  if (indexerPid !== null) return `pid ${indexerPid}`;
+  return role === "indexer" ? `pid ${process.pid}` : "none: every server of this corpus runs an old build, the last shared index is served";
+}
+
 /** Re-run the election; on a change of role, switch what this server does. */
 function evaluateRole(reason: string): void {
   if (!corpus) return;
@@ -543,7 +555,7 @@ function evaluateRole(reason: string): void {
   role = e.role;
   setRegistryRole?.(role);
   safeAppend("server.role", { pid: process.pid, corpus, role, indexer: indexerPid, reason });
-  console.error(`[ContextEngine] 🧭 Role ${was} -> ${role} (${reason}; indexer pid ${indexerPid ?? process.pid})`);
+  console.error(`[ContextEngine] 🧭 Role ${was} -> ${role} (${reason}; indexer ${indexerLabel()})`);
   if (role === "indexer") {
     stopIndexPolling();
     ensureModel().then(() => reindex()).then(() => startWatching()).catch((err) => {
@@ -605,6 +617,41 @@ function maybeScheduleChainCheck(): void {
   }
 }
 
+let lastAnchorSpawn = 0;
+
+/**
+ * SealHour's hourly job, in its own low-priority process (`anchor tick --scheduled`), like the daily chain
+ * check: it reads the history and talks to the time stamp services, never on this event loop. Started by
+ * the indexing server only, when anchors/state.json says a checkpoint or a queued stamp is due; the job
+ * itself takes the anchor lock, so a second indexer (shared index off) can never make a second chain.
+ * Nothing at all unless the owner said yes on the enable screen. CONTEXTENGINE_ANCHOR=0 turns it off.
+ * [LOCK] [ONE-EMITTER-PER-MACHINE] [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE] (src/anchor.ts)
+ */
+function maybeScheduleAnchorTick(): void {
+  if (role !== "indexer" || process.env.CONTEXTENGINE_ANCHOR === "0") return;
+  const now = Date.now();
+  if (now - SERVER_STARTED_AT < 60_000 || now - lastAnchorSpawn < 5 * 60_000) return;
+  let due = false;
+  try {
+    due = anchorTickDue(new Date(now));
+  } catch {
+    return;
+  }
+  if (!due) return;
+  lastAnchorSpawn = now;
+  try {
+    const cli = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
+    const child = spawn(process.execPath, [cli, "anchor", "tick", "--scheduled"], { stdio: "ignore", detached: true, env: process.env });
+    if (child.pid) {
+      try { setPriority(child.pid, 10); } catch { /* the job still runs, at normal priority */ }
+    }
+    child.unref();
+    console.error(`[ContextEngine] SealHour hourly job started (pid ${child.pid ?? "?"})`);
+  } catch (err) {
+    console.error(`[ContextEngine] could not start the SealHour hourly job: ${(err as Error).message}`);
+  }
+}
+
 /**
  * The indexer writes ~/.contextengine/fleet-health.json once a minute: version drift, reindex
  * rate, today's blocks and refusals, the last verified release. Every surface reads that file.
@@ -619,15 +666,54 @@ function publishHealth(): void {
     }
     if (role === "indexer") writeFleetHealth(h);
     maybeScheduleChainCheck();
+    maybeScheduleAnchorTick();
   } catch (err) {
     console.error(`[ContextEngine] ⚠ fleet health failed: ${(err as Error).message}`);
   }
+}
+
+/**
+ * The launchd agent leaves for a new build once its folder is quiet, and launchd starts it again on
+ * that build. Chat servers never do. Said once per state in the log. [LOCK] [THE-AGENT-FOLLOWS-THE-BUILD]
+ */
+function followTheBuild(): void {
+  if (process.env.OPSCONTEXT_DAEMON !== "1" || loadedBuild === null || ending || preflightRunning) return;
+  const say = (note: string | null, icon = "🔄") => {
+    if (note && note !== lastRestartNote) console.error(`[ContextEngine] ${icon} ${note}`);
+    lastRestartNote = note;
+  };
+  const script = fileURLToPath(import.meta.url);
+  let d: ReturnType<typeof checkAgentRestart>;
+  try {
+    d = checkAgentRestart({ script, loadedBuild, startedAt: SERVER_STARTED_AT });
+  } catch (err) {
+    say(`could not decide whether to restart for a new build: ${(err as Error).message}`, "⚠");
+    return;
+  }
+  if (!d.restart) { say(d.note); return; }
+  const { from, to } = d;
+  preflightRunning = true;
+  preflightBuild(script, to).then((p) => {
+    preflightRunning = false;
+    if (!p.ok) { say(`build ${to} on disk does not start (${p.error}); this agent stays on ${from}`, "⚠"); return; }
+    try {
+      // The marker first: without it a fresh agent could leave again for the same build.
+      recordAgentRestart({ pid: process.pid, from, to });
+    } catch (err) {
+      say(`could not write the restart marker (${(err as Error).message}); this agent stays on ${from}`, "⚠");
+      return;
+    }
+    safeAppend("server.self_restart", { pid: process.pid, from, to });
+    console.error(`[ContextEngine] 🔄 build ${to} is on disk, quiet, and starts (this agent runs ${from}): leaving so launchd starts it on the new build`);
+    endThisServer();
+  });
 }
 
 function startRolePolling(): void {
   if (rolePoll) return;
   rolePoll = setInterval(() => {
     if (corpus) evaluateRole("periodic");
+    followTheBuild();
     if (++healthTick % 4 === 0) publishHealth(); // every 60 s
   }, ROLE_POLL_MS);
   rolePoll.unref();
@@ -823,7 +909,10 @@ server.tool(
       adoptSharedIndex();
       return respond(
         "reindex",
-        `This server reads the shared index of corpus ${corpus}, written by pid ${indexerPid ?? "?"}: reloaded seq ${indexSeq}, ${chunks.length} chunks, ${embeddedChunks.length} vectors. Saving a doc makes the indexer rebuild; every reader picks it up within ${INDEX_POLL_MS / 1000} s.`
+        `This server reads the shared index of corpus ${corpus} (indexer ${indexerLabel()}): reloaded seq ${indexSeq}, ${chunks.length} chunks, ${embeddedChunks.length} vectors. ` +
+          (indexerPid !== null
+            ? `Saving a doc makes the indexer rebuild; every reader picks it up within ${INDEX_POLL_MS / 1000} s.`
+            : `Nothing rebuilds it until a server on the current build starts: reload a window, or restart the launchd agent. [LOCK] [ONE-INDEXER-MANY-READERS]`)
       );
     }
     await reindex();
@@ -1156,6 +1245,27 @@ server.tool(
 
     checks.push("");
 
+    // --- SealHour: the outside time stamp of the audit chain, in the words of the contract. ---
+    // [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] (src/anchor.ts)
+    checks.push("## 3. SealHour\n");
+    try {
+      const a = anchorHealth();
+      const pol = anchoringPolicy();
+      if (pol.required && (!a.enabled || a.problem)) {
+        checks.push(`- ❌ **FAIL** — ${a.line} (required by ${pol.where})`);
+        failCount++;
+      } else if (a.problem) {
+        checks.push(`- ⚠️ **CHECK** — ${a.line}`);
+        failCount++;
+      } else {
+        checks.push(`- ${a.enabled ? "✅" : "ℹ️"} ${a.line}`);
+      }
+    } catch (err) {
+      checks.push(`- ❔ **UNCHECKED** — SealHour status could not be read: ${(err as Error).message}`);
+      uncheckedCount++;
+    }
+    checks.push("");
+
     // --- Summary ---
     checks.push("## Summary\n");
     const total = passCount + failCount + uncheckedCount;
@@ -1383,6 +1493,9 @@ function registerResources(): void {
 // Start
 // ---------------------------------------------------------------------------
 async function main() {
+  // A build proving it starts, for the launchd agent about to leave for it: every static import has
+  // been evaluated by now, and nothing is written. [LOCK] [THE-AGENT-FOLLOWS-THE-BUILD]
+  if (process.env.CONTEXTENGINE_PREFLIGHT === "1") process.exit(0);
   // [LOCK] [CE-HOME-IS-PRIVATE]: the folder is 0700 before the registry, the index or the log write
   // into it.
   secureCeHome();
@@ -1409,6 +1522,7 @@ async function main() {
   try {
     const reg = registerServer({ version: PKG_VERSION, script: fileURLToPath(import.meta.url), corpus, role: corpus ? "reader" : undefined, daemon: process.env.OPSCONTEXT_DAEMON === "1", onSignal: endThisServer });
     stopRegistry = reg.stop;
+    loadedBuild = reg.record.build;
     setRegistryRole = reg.setRole;
     setRegistryEventPort = reg.setEventPort;
     const fleet = listServers();
@@ -1420,7 +1534,7 @@ async function main() {
       safeAppend("server.role", { pid: process.pid, corpus, role, indexer: indexerPid, reason: "start" });
     }
     console.error(`[ContextEngine] 🧭 ${formatServers(fleet)}`);
-    if (corpus) console.error(`[ContextEngine] 🧭 This server: ${role} of corpus ${corpus}${role === "reader" ? ` (indexer pid ${indexerPid})` : ""}`);
+    if (corpus) console.error(`[ContextEngine] 🧭 This server: ${role} of corpus ${corpus}${role === "reader" ? ` (indexer ${indexerLabel()})` : ""}`);
     safeAppend("server.start", { pid: reg.record.pid, parent: reg.record.parent, version: reg.record.version, build: reg.record.build, cwd: reg.record.cwd, servers_running: fleet.servers.length, stale_builds: fleet.servers.filter((x) => x.staleBuild).length });
   } catch (err) {
     console.error("[ContextEngine] ⚠ Server registry failed:", err);

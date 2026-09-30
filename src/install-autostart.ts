@@ -37,8 +37,8 @@ const __filename_esm = fileURLToPath(import.meta.url);
 const __dirname_esm = dirname(__filename_esm);
 const requireFromHere = createRequire(import.meta.url);
 
-const LABEL = "com.opscontext.mcp";
-const PLIST_FILE = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+export const LABEL = "com.opscontext.mcp";
+export const PLIST_FILE = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 const LOG_DIR = join(homedir(), ".contextengine", "logs");
 const PORT = 7842;
 

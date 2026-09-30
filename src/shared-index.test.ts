@@ -1,5 +1,6 @@
-// [LOCK] [ONE-INDEXER-MANY-READERS]: one writer per corpus, chosen current-build-first then
-// oldest; readers load what it wrote and nothing half-written. Throwaway HOME via test-setup.
+// [LOCK] [ONE-INDEXER-MANY-READERS]: one writer per corpus, chosen current-build-first, the launchd
+// agent first, then oldest; an old build never takes over from a reader; readers load what it wrote
+// and nothing half-written. Throwaway HOME via test-setup.
 import { describe, it, expect, beforeAll } from "vitest";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,9 +9,9 @@ let X: typeof import("./shared-index.js");
 const home = () => process.env.CONTEXTENGINE_HOME as string;
 
 type S = import("./server-registry.js").ServerReport["servers"][number];
-const srv = (pid: number, started: string, staleBuild: boolean, corpus = "c1"): S => ({
+const srv = (pid: number, started: string, staleBuild: boolean, corpus = "c1", extra: Partial<S> = {}): S => ({
   pid, ppid: 1, parent: "test", started, heartbeat: started, version: "0", script: "x", build: "b",
-  cwd: "/", node: "v", corpus, alive: true, currentBuild: "b", staleBuild,
+  cwd: "/", node: "v", corpus, alive: true, currentBuild: "b", staleBuild, ...extra,
 });
 
 beforeAll(async () => {
@@ -58,9 +59,35 @@ describe("electIndexer", () => {
     expect(X.electIndexer("c1", servers, 300)).toEqual({ indexer: 100, role: "reader" });
     expect(X.electIndexer("other", servers, 400)).toEqual({ indexer: 400, role: "indexer" });
   });
-  it("a stale build leads only when no current one is alive", () => {
-    const servers = [srv(300, "2026-09-05T10:00:00.000Z", true), srv(301, "2026-09-05T10:00:01.000Z", true)];
-    expect(X.electIndexer("c1", servers, 301)).toEqual({ indexer: 300, role: "reader" });
+  // E2E_REVIEW_2026-09 C0, the owner's yes on 2026-09-30. Each of the next four fails on the code before.
+  it("the launchd agent wins among current builds, even when a chat server started first", () => {
+    const servers = [srv(100, "2026-09-30T10:00:00.000Z", false), srv(200, "2026-09-30T16:00:04.000Z", false, "c1", { daemon: true })];
+    expect(X.electIndexer("c1", servers, 200)).toEqual({ indexer: 200, role: "indexer" });
+    expect(X.electIndexer("c1", servers, 100)).toEqual({ indexer: 200, role: "reader" });
+  });
+  it("right after a build, when every server is stale, the agent keeps indexing, not the oldest window (the 15:51 shape)", () => {
+    const servers = [
+      srv(90733, "2026-09-28T18:56:09.000Z", true, "c1", { role: "reader" }), // a 2.12.0 chat window
+      srv(31311, "2026-09-30T09:02:25.000Z", true, "c1", { daemon: true, role: "indexer" }),
+      srv(97481, "2026-09-30T08:38:46.000Z", true, "c1", { role: "reader" }),
+    ];
+    expect(X.electIndexer("c1", servers, 90733)).toEqual({ indexer: 31311, role: "reader" });
+    expect(X.electIndexer("c1", servers, 31311)).toEqual({ indexer: 31311, role: "indexer" });
+  });
+  it("with every server stale and no agent, the one already indexing keeps it: an old reader never takes over", () => {
+    const servers = [srv(300, "2026-09-05T10:00:00.000Z", true, "c1", { role: "reader" }), srv(301, "2026-09-05T10:00:01.000Z", true, "c1", { role: "indexer" })];
+    expect(X.electIndexer("c1", servers, 300)).toEqual({ indexer: 301, role: "reader" });
+    expect(X.electIndexer("c1", servers, 301)).toEqual({ indexer: 301, role: "indexer" });
+  });
+  it("with every server stale, no agent and no indexer (the agent restarting itself), nobody indexes", () => {
+    const servers = [srv(300, "2026-09-05T10:00:00.000Z", true, "c1", { role: "reader" }), srv(301, "2026-09-05T10:00:01.000Z", true, "c1", { role: "reader" })];
+    expect(X.electIndexer("c1", servers, 300)).toEqual({ indexer: null, role: "reader" });
+    expect(X.electIndexer("c1", servers, 301)).toEqual({ indexer: null, role: "reader" });
+  });
+  it("a current chat server still beats a stale agent", () => {
+    const servers = [srv(1, "2026-09-30T09:00:00.000Z", true, "c1", { daemon: true, role: "indexer" }), srv(2, "2026-09-30T10:00:00.000Z", false, "c1", { role: "reader" })];
+    expect(X.electIndexer("c1", servers, 1)).toEqual({ indexer: 2, role: "reader" });
+    expect(X.electIndexer("c1", servers, 2)).toEqual({ indexer: 2, role: "indexer" });
   });
   it("a server missing from the registry indexes on its own rather than waiting on nobody", () => {
     expect(X.electIndexer("c1", [srv(1, "2026-09-05T10:00:00.000Z", false)], 999)).toEqual({ indexer: null, role: "indexer" });

@@ -16,6 +16,7 @@ import { listServers, type ServerReport } from "./server-registry.js";
 import { readVerifyState, pendingRefusals } from "./audit.js";
 import { claudeHookRegistrations } from "./install-claude-hook.js";
 import { secretsLockHealth, type SecretsLockHealth } from "./secrets-lock.js";
+import { anchorHealth, type AnchorHealth } from "./anchor.js";
 
 export interface FleetHealth {
   generatedAt: string;
@@ -88,6 +89,9 @@ export interface FleetHealth {
     /** Set when the live log is there but could not be read: every count above is then unknown, not zero. */
     readError: string | null;
   };
+  /** SealHour: the outside time stamp of the audit chain, in the words of the contract (section 10).
+   *  null only when its files could not be read. [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] */
+  anchor: AnchorHealth | null;
   /** The newest release for which verify-release passed on this machine, or null. */
   lastVerifiedRelease: string | null;
   /** Measured problems only. Empty means green. */
@@ -282,6 +286,15 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   if (refusedTotal > 0) warnings.push(`the audit log refused ${refusedTotal} entr${refusedTotal === 1 ? "y" : "ies"} today${lastRefusal ? ` (${lastRefusal})` : ""}: they are not in the log, and the gap is noted on the chain`);
   if (tornToday > 0) warnings.push(`${tornToday} audit record(s) were cut short today (a full disk?); the bytes are kept in ${lastTornKept}`);
   for (const w of report.warnings) if (/index on their own/.test(w)) warnings.push(w);
+  // SealHour: a period that should be stamped and is not is a measured problem; off is not one.
+  let anchor: AnchorHealth | null = null;
+  try {
+    anchor = anchorHealth(now);
+    if (anchor.problem) warnings.push(`SealHour: ${anchor.problem}`);
+    if (anchor.copy?.error) warnings.push(`SealHour: the copy off this machine failed (${anchor.copy.error})`);
+  } catch (err) {
+    warnings.push(`SealHour status could not be read (${err instanceof Error ? err.message : String(err)}): unknown, not fine`);
+  }
 
   return {
     generatedAt: now.toISOString(),
@@ -294,6 +307,7 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
     today: { hookEvents, doubledHookEvents, blocks, refusals, learningsSaved, backupFailures, lastBlocks: lastBlocks.slice(-3) },
     chain,
     auditLog: { refusedToday: refusedTotal, lastRefusal, tornToday, lastTornKept, readError: tail.error },
+    anchor,
     lastVerifiedRelease: lastVerifiedRelease(),
     warnings,
   };
@@ -320,6 +334,7 @@ export function formatFleetHealth(h: FleetHealth): string {
     : `  audit chain: not checked on this machine yet (the indexing server runs a full check daily; or run contextengine audit-verify)`);
   lines.push(`  claude code: ${h.today.hookEvents} hook event(s) today, ${h.today.doubledHookEvents} doubled; registrations ${h.claudeHooks ? Object.entries(h.claudeHooks).map(([ev, n]) => `${ev}=${n}`).join(" ") : "no settings.json"}`);
   lines.push(`  agent lock on secrets files: ${h.secretsLock ? (h.secretsLock.inPlace ? "in place" : `MISSING (${h.secretsLock.missing} of ${h.secretsLock.total} rules)`) : "no Claude Code settings on this machine"}`);
+  lines.push(`  ${h.anchor ? h.anchor.line : "SealHour: status unknown (its files could not be read)"}`);
   for (const b of h.today.lastBlocks) lines.push(`    ${b.ts.slice(11, 19)}Z ${b.kind}: ${b.detail}`);
   for (const w of h.warnings) lines.push(`  ⚠ ${w}`);
   return lines.join("\n");

@@ -19,8 +19,11 @@ beforeEach(() => {
   bin = join(dir, "bin");
   mkdirSync(bin);
   savedPath = process.env.PATH;
-  // Only our stand-ins and /bin (for sh): no real pm2, docker or crontab (macOS keeps crontab in /usr/bin).
-  process.env.PATH = `${bin}:/bin`;
+  // Only our stand-ins: no real pm2, docker or crontab. Not even /bin: on Ubuntu (GitHub's runners) /bin
+  // is /usr/bin, where docker and crontab are installed, and three tests failed there from 2026-09-29 while
+  // passing on macOS. Nothing needs it: execSync starts /bin/sh by absolute path, the stand-ins start with
+  // #!/bin/sh and use printf, commandExists() uses the `command -v` builtin, and the git test restores PATH.
+  process.env.PATH = bin;
 });
 afterEach(() => {
   process.env.PATH = savedPath;

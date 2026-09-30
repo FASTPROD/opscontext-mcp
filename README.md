@@ -2,7 +2,7 @@
 
 **AI that doesn't break what it can't see.**
 
-Claude Code, Cursor, and Copilot write code without seeing your servers — so they suggest the wrong port, restart the wrong service, deploy into the wrong env. OpsContext gives them eyes on what's actually running, plus a tamper-proof log of every change they make. Free core, no signup, runs entirely on your machine.
+Claude Code, Cursor, and Copilot write code without seeing your servers, so they suggest the wrong port, restart the wrong service, deploy into the wrong env. OpsContext gives them eyes on what's actually running, plus a tamper-evident log of every change they make. Free core, no signup, runs entirely on your machine.
 
 > Previously published as `@compr/contextengine-mcp`. The 2.0 rename reflects what the project actually does: Claude Code sees the **code**, OpsContext sees the **infra that runs it**.
 

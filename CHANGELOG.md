@@ -4,6 +4,60 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.18.0] 2026-09-30: the agent follows the build, every LOCK block is findable, an outside time stamp you can turn on
+
+Batch 5 of the end-to-end review (rows C0 and C7-5, point 20 and the code index), each item measured on the author's
+Mac first and proven there afterwards, and step 1 of SealHour, off by default.
+
+- **The background agent follows the build (macOS).** The launchd agent now restarts itself when a new build lands
+  in its folder: once no file has changed for 30 seconds, it has run for 2 minutes, the new build has proven it
+  starts, and never twice for the same build; launchd brings it back within seconds. No more `launchctl kickstart`
+  after an update. Chat servers never restart themselves: their windows reload them.
+- **The right server indexes.** The launchd agent indexes whenever it runs the build on disk. Right after an
+  update every server runs an old build: an old one never takes the index over from a reader any more (the agent
+  keeps it, or for a few seconds nobody does and the last index is served). A server's registry record is written
+  in one piece, and a record read half-written is never deleted: that used to make a server index on its own for
+  15 seconds. `contextengine servers` names a corpus nobody indexes.
+- **Every LOCK block in your code is findable.** A function's chunk now includes the comment right above it, and
+  every other whole LOCK block (at the top of a file, above a constant, in files from 100 KB to 1 MB) gets a chunk
+  of its own; search results say "Guarded by LOCK [TAG]: read its WHY before changing this code." A sentence that
+  merely mentions a header is not a block.
+- **Embedding library 4.3.0.** `@huggingface/transformers` 3.8.1 to 4.3.0, still optional: the two high `npm audit`
+  advisories (an image library the search never uses) are gone. Search results are identical (5,178 chunks and 30
+  queries compared, same top 10 for every query), embedding is about a third faster, and the optional stack takes
+  about 114 MB more on disk. The model (87 MB) downloads once more after the upgrade.
+
+### An outside time stamp for the audit chain (SealHour, interim mode)
+
+Off unless you turn it on. `contextengine anchor enable` shows what would leave the machine and asks
+two questions; nothing is stored, and nothing is sent, before an explicit yes.
+
+- **Once an hour, only when the audit log grew,** OpsContext makes a checkpoint of the chain on this
+  machine: a few 32-byte fingerprints (every record of the hour counts, side branches included), the
+  number of records, the time, and, if you said yes, one fingerprint for all your workspace
+  repositories. The checkpoint stays here. In interim mode its 32-byte fingerprint is stamped by two
+  free public time stamp services (FreeTSA and DigiCert, RFC 3161); that fingerprint, this machine's
+  address and the time are all that leave. The SealHour service (an outside time stamp from an official
+  European provider, written into Bitcoin) comes later and will ask again.
+- **`anchor status`** says it in one line, and so do fleet health and end-session: last stamp, how many
+  services answered, or "not stamped since 14:00: ... (2 checkpoints queued)". A checkpoint no service
+  stamped is retried; once a later one is stamped, the earlier one is dated through the chain by it.
+- **`anchor verify`** recomputes every checkpoint from this machine's own log (a log rotated or
+  restored since reads right, and the reading used is named) and checks every stamp with OpenSSL against
+  the service's pinned root. It reports the clock's offset: a constant one is fine, a jump is flagged.
+- **`anchor export-evidence <from> <to>`** writes the checkpoints and stamps of a period with a README
+  and `verify.mjs`, which anyone can run with Node and OpenSSL, offline, without OpsContext.
+- **`anchor copy <folder>`** keeps a copy off the machine (a synced or shared folder): the stamps are
+  worth little if they live only on a disk someone could rewrite.
+- **`policy.json`** gains `anchoring: { "required": true }`: in that repository a period without a stamp
+  is an error, not a warning.
+- The README says "tamper-evident" (it said "tamper-proof", which no log is).
+
+**Package:** 51 files to 59, 329 kB to 381 kB (the agent's restart module and the seven SealHour modules).
+
+Upgrading: nothing to do. If you run the launchd agent, restart it once after this upgrade
+(`launchctl kickstart -k gui/$(id -u)/com.opscontext.mcp`); from 2.18.0 on it follows every update by itself.
+
 ## [2.17.0] 2026-09-30: what nobody used is gone
 
 Batch 4 of the end-to-end review (rows C1-1, C1-2, C2-3, C5-2 and three findings of batch 3): the features

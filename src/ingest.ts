@@ -69,7 +69,10 @@ export function hasLockMarker(text: string): boolean {
 // FIX: lockBlockTags() returns the tags of whole blocks (a tagged header, a [NEVER] line and a WHY
 //      line in the same chunk); only the code chunker sets `guardedBy` from it (docs go through
 //      parseMarkdown, which never does), and a search result says lockGuardLine().
-const LOCK_HEADER = /(?:\[LOCKED\]|\u{1F512}\s*LOCKED)\s*\[([A-Z0-9][A-Z0-9_-]*)\]/gu;
+//      2026-09-30, batch 5 ([LOCK] [EVERY-LOCK-BLOCK-IS-FINDABLE], src/code-chunker.ts): a header counts only
+//      where it opens its comment line. A sentence that mentions one ("a [LOCKED] [TAG] header") added a
+//      tag, and chunks now carry the comments above them, where such sentences live.
+const LOCK_HEADER = /^[ \t]*(?:\/\/+|\/\*+|\*|#)[ \t]*(?:\[LOCKED\]|\u{1F512}[ \t]*LOCKED)[ \t]*\[([A-Z0-9][A-Z0-9_-]*)\]/gmu;
 const LOCK_NEVER = /\[NEVER\]|\u26D4\s*NEVER/u;
 const LOCK_WHY = /(?:^|\n)\s*(?:\/\/|#|\*|<!--)?\s*WHY:/;
 

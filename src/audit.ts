@@ -203,6 +203,9 @@ export type AuditEvent =
   // One indexer, many readers (2.6.0): which role a server took and each shared-index write
   | "server.role"
   | "index.write"
+  // The launchd agent leaving for a new build, which launchd starts again (added 2026-09-30).
+  // [LOCK] [THE-AGENT-FOLLOWS-THE-BUILD] (src/agent-restart.ts)
+  | "server.self_restart"
   | "learning.import"
   // One record per auto-import sweep; a learning.import record only names a source that imported,
   // updated or failed (added 2026-09-29). [LOCK] [SWEEP-RECORDS-ONLY-WHAT-CHANGED] (src/learnings.ts)
@@ -243,7 +246,14 @@ export type AuditEvent =
   // A final record cut short (full disk, crash), set aside and noted (added 2026-09-27). [LOCK] [TORN-TAIL-IS-KEPT-AND-CHAINED]
   | "audit.torn_tail"
   // Entries safeAppend() could not write, counted at the next good append (added 2026-09-27). [LOCK] [A-REFUSED-APPEND-IS-COUNTED-AND-CHAINED]
-  | "audit.append_failed";
+  | "audit.append_failed"
+  // The owner's SealHour choices, as consent evidence: enable (with the screen's answers), disable, code
+  // on or off, the copy folder on or off. The hourly job itself writes nothing here (added 2026-09-30).
+  // [LOCK] [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD] (src/anchor.ts)
+  | "anchor.enable"
+  | "anchor.disable"
+  | "anchor.code"
+  | "anchor.copy";
 
 export interface AuditRecord {
   ts: string;
@@ -1163,6 +1173,39 @@ function acquireRotateLock(): { release: () => void } | { heldMs: number } {
   }
   // Another process broke the same stale lock and won the create.
   return { heldMs: 0 };
+}
+
+/**
+ * Run `fn` holding the rotate lock, for a reader that needs the history to stand still while it reads
+ * it (the SealHour checkpoint, src/anchor-window.ts): no rotation, restore or scrub can move records
+ * between files meanwhile. Like every holder, it first finishes an interrupted move.
+ * [LOCK] [ROTATION-HOLDS-THE-LOCK-BEFORE-IT-PLANS] [LOCK] [AN-INTERRUPTED-MOVE-IS-FINISHED]
+ */
+export function withRotateLock<T>(fn: () => T): { ran: true; value: T } | { ran: false; heldMs: number } {
+  const lock = acquireRotateLock();
+  if ("heldMs" in lock) return { ran: false, heldMs: lock.heldMs };
+  try {
+    if (interruptedMovePending()) finishInterruptedMoves();
+    return { ran: true, value: fn() };
+  } finally {
+    lock.release();
+  }
+}
+
+/** The history's files in the order verifyChain() reads them: segments, then the live log. */
+export function historyFiles(): Array<{ path: string; label: string; live: boolean }> {
+  const files = listSegments().map((f) => ({ path: join(archiveDir(), f), label: f, live: false }));
+  files.push({ path: auditPath(), label: "audit.log", live: true });
+  return files.filter((f) => existsSync(f.path));
+}
+
+/** The hash of the live log's last record (the chain head), or null when it cannot be read. */
+export function liveHeadHash(): string | null {
+  try {
+    return readLastHash();
+  } catch {
+    return null;
+  }
 }
 
 /**
