@@ -322,12 +322,17 @@ export interface StampCheck {
 /**
  * Check a stored stamp against its pinned root, at the stamp's own time. With `queryFile`, the reply
  * must also answer that request (imprint and nonce); otherwise its imprint must be `digestHex`.
- * [LOCK] [A-STAMP-IS-CHECKED-BEFORE-IT-COUNTS]
+ * `untrusted` and `partialChain` are for a sealed hour's stamp (src/anchor-bundle.ts), whose anchor is
+ * the provider's own certificate as a trusted list names it, not a root: the caller pins that
+ * certificate by its fingerprint before calling. LibreSSL has no -partial_chain: it answers "could not
+ * check", as for any stamp it fails. [LOCK] [A-STAMP-IS-CHECKED-BEFORE-IT-COUNTS]
  */
-export function checkStamp(o: { tsr: string; caFile: string; digestHex?: string; queryFile?: string; time?: string | null }): StampCheck {
+export function checkStamp(o: { tsr: string; caFile: string; digestHex?: string; queryFile?: string; time?: string | null; untrusted?: string; partialChain?: boolean }): StampCheck {
   const ssl = findOpenssl();
   if (!ssl) return { ok: null, detail: "openssl was not found on this machine: the stamp could not be checked" };
   const args = ["ts", "-verify", ...(o.queryFile ? ["-queryfile", o.queryFile] : ["-digest", o.digestHex ?? ""]), "-in", o.tsr, "-CAfile", o.caFile];
+  if (o.untrusted) args.push("-untrusted", o.untrusted);
+  if (o.partialChain && !ssl.libressl) args.push("-partial_chain");
   const at = o.time ? Math.floor(Date.parse(o.time) / 1000) : NaN;
   if (!ssl.libressl && Number.isFinite(at)) args.push("-attime", String(at));
   const p = spawnSync(ssl.path, args, { encoding: "utf8", timeout: 15_000 });

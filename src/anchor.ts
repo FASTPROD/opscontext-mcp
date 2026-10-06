@@ -1,7 +1,9 @@
-// The SealHour client, step 1 (COMPR-TSA docs/SEALHOUR_PROTOCOL.md; plan docs/SEALHOUR_INTEGRATION_PLAN.md
-// section 6): once an hour, when the audit log grew, a checkpoint of the chain (and of the workspaces'
-// code when the owner said yes), kept in ~/.contextengine/anchors/, stamped by the interim backend
-// (src/anchor-tsa.ts) until the SealHour service exists.
+// The SealHour client (COMPR-TSA docs/SEALHOUR_PROTOCOL.md; plan docs/SEALHOUR_INTEGRATION_PLAN.md
+// section 6, steps 1 and 3): once an hour, when the audit log grew, a checkpoint of the chain (and of the
+// workspaces' code when the owner said yes), kept in ~/.contextengine/anchors/, then dated by the backend
+// the owner said yes to: the SealHour service (src/anchor-seal.ts, src/anchor-service.ts: a signed
+// receipt, the hour sealed with an official European stamp, Bitcoin), or the interim backend
+// (src/anchor-tsa.ts: a direct stamp from free public services, contract section 7.3).
 //
 // [LOCKED] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE] - 2026-09-30
 // [NEVER] stamp, or open any connection, unless anchors/config.json says enabled AND records the owner's
@@ -12,8 +14,10 @@
 //      active; the owner decides that, on a screen that says so (contract section 10, correction 7).
 // FIX: `contextengine anchor enable` shows the screen, asks the code question (default yes) and the
 //      start question (default no), and writes nothing before the second answer. anchorTick() returns
-//      "off" before touching anything else unless that consent is on disk, and stamps only with the
-//      providers it names.
+//      "off" before touching anything else unless that consent is on disk AND names the backend in
+//      use; it stamps only with the providers the consent names, and sends to the SealHour service
+//      only the credential kind it names (2026-10-05: a yes to the interim screen is not a yes to the
+//      service, which receives the checkpoint and the licence key; moving asks again).
 //
 // [LOCKED] [ONE-EMITTER-PER-MACHINE] - 2026-09-30
 // [NEVER] make a checkpoint outside the anchor lock, or without re-reading the chain's head under it.
@@ -52,8 +56,14 @@ import { canonBytes, checkpointProblems, codeRoot as codeRootOf, digestOf, isoSe
 import { activeProviders, stampDigest, type Provider, type StampResult } from "./anchor-tsa.js";
 import { codeLeaves } from "./anchor-code.js";
 import { findRepoPolicy } from "./policy.js";
+import { activeService, serviceName, type Service } from "./anchor-service.js";
+import { cutoffOf, fetchDueProofs, newSealMeta, sealCredential, sendQueued, type Hold, type SealCheckpoint, type SealCredential, type SealMeta } from "./anchor-seal.js";
+import { BUNDLE_NAME } from "./anchor-bundle.js";
 
-export const ANCHOR_SCREEN_VERSION = 1;
+/** 1: the interim screen of step 1. 2: the SealHour service's screen, and the interim one that names it (2026-10-05). */
+export const ANCHOR_SCREEN_VERSION = 2;
+/** Who dates the checkpoints: the SealHour service, or free public time stamp services asked directly. */
+export type Backend = "rfc3161" | "sealhour";
 /** The slot is drawn once per machine, between these minutes of each hour (never :00 to :04, where
  *  every scheduler on earth fires, nor the hour's last minutes). */
 const SLOT_MIN_S = 5 * 60;
@@ -84,13 +94,13 @@ export interface AnchorConfig {
   version: 1;
   enabled: boolean;
   code: boolean;
-  backend: "rfc3161";
+  backend: Backend;
   /** Seconds past each hour at which this machine's checkpoint is due. */
   slot_seconds: number;
   /** Random, names this machine's folder in the copy off the machine. */
   machine: string;
   /** The owner's yes, as given on the enable screen. [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE] */
-  consent: { at: string; screen: number; backend: "rfc3161"; providers: string[] } | null;
+  consent: { at: string; screen: number; backend: Backend; providers: string[]; /** SealHour only: what the screen said is sent. */ credential?: "licence" | "pilot" } | null;
   copy_dir: string | null;
   enabled_at: string | null;
   disabled_at: string | null;
@@ -116,6 +126,14 @@ export interface AnchorState {
   queued: Array<{ seq: number; created_at: string; error: string | null }>;
   code: { repos: number; skipped: number } | null;
   copy: { at: string | null; error: string | null } | null;
+  /** SealHour: the newest sealed checkpoint. `at` is its hour's stamp time, or the hour's cut-off without one. */
+  last_sealed?: { seq: number; created_at: string; hour: string | null; at: string; stamp_checked: boolean | null; bitcoin: string | null } | null;
+  /** SealHour: received (receipt stored), their hour not sealed yet. */
+  waiting?: Array<{ seq: number; hour: string | null; note: string | null }>;
+  /** SealHour: refused for themselves or their hour missed, and no later seal covers them yet. */
+  undated?: Array<{ seq: number; created_at: string; error: string | null }>;
+  /** SealHour: the queue waits until then (the service was away, said to wait, or refused the credential). */
+  hold?: Hold | null;
 }
 
 export interface CheckpointMeta {
@@ -128,6 +146,10 @@ export interface CheckpointMeta {
   code: { repos: number; skipped: Array<{ repo: string; why: string }> } | null;
   attempts: number;
   next_try_at: string | null;
+  /** The backend that was on when it was made (absent: the interim one, the only one before 2026-10-05). */
+  backend?: Backend;
+  /** SealHour: where it stands at the service. [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts) */
+  seal?: SealMeta | null;
   /** Set when a later checkpoint was stamped first: its chain names this one's digest, so this one is
    *  dated by that stamp (a later date) and is no longer retried: any stamp of its own now would be later
    *  still. */
@@ -160,7 +182,7 @@ export function writeConfig(c: AnchorConfig): void {
   writeJson(configPath(), c);
 }
 
-const emptyState = (): AnchorState => ({ chain: null, lost: null, last_tick: null, next_due: null, last_stamped: null, queued: [], code: null, copy: null });
+const emptyState = (): AnchorState => ({ chain: null, lost: null, last_tick: null, next_due: null, last_stamped: null, queued: [], code: null, copy: null, last_sealed: null, waiting: [], undated: [], hold: null });
 
 export function readState(): AnchorState {
   return { ...emptyState(), ...(readJson<AnchorState>(statePath()) ?? {}) };
@@ -171,18 +193,20 @@ export function writeState(s: AnchorState): void {
   writeJson(statePath(), s);
 }
 
-/** A new configuration for the enable screen's yes: a random slot and machine id. */
-export function newConfig(o: { code: boolean; providers: string[]; now: Date; rand?: (min: number, max: number) => number }): AnchorConfig {
+/** A new configuration for the enable screen's yes: a random slot and machine id. The backend is the
+ *  one the screen named; `credential` (SealHour only) is what that screen said is sent. */
+export function newConfig(o: { code: boolean; providers: string[]; now: Date; rand?: (min: number, max: number) => number; backend?: Backend; credential?: "licence" | "pilot" }): AnchorConfig {
   const rand = o.rand ?? ((min: number, max: number) => randomInt(min, max));
   const at = o.now.toISOString();
+  const backend = o.backend ?? "rfc3161";
   return {
     version: 1,
     enabled: true,
     code: o.code,
-    backend: "rfc3161",
+    backend,
     slot_seconds: rand(SLOT_MIN_S, SLOT_MAX_S),
     machine: randomBytes(4).toString("hex"),
-    consent: { at, screen: ANCHOR_SCREEN_VERSION, backend: "rfc3161", providers: o.providers },
+    consent: { at, screen: ANCHOR_SCREEN_VERSION, backend, providers: o.providers, ...(backend === "sealhour" ? { credential: o.credential ?? "licence" } : {}) },
     copy_dir: null,
     enabled_at: at,
     disabled_at: null,
@@ -226,18 +250,34 @@ export const isStamped = (c: { stamps: Record<string, StampEntry> }): boolean =>
 export const firstStampTime = (c: { stamps: Record<string, StampEntry> }): string | null =>
   Object.values(c.stamps).filter((s) => s.ok && s.time).map((s) => s.time!).sort()[0] ?? null;
 
+export const backendOf = (c: { meta: CheckpointMeta }): Backend => c.meta.backend ?? "rfc3161";
+/** Its hour's proof is stored here and holds. [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts) */
+export const isSealed = (c: { meta: CheckpointMeta }): boolean => backendOf(c) === "sealhour" && c.meta.seal?.state === "sealed";
+/** Dated by an outside witness of its own: a direct stamp, or a sealed hour. */
+export const isDated = (c: { meta: CheckpointMeta; stamps: Record<string, StampEntry> }): boolean => isStamped(c) || isSealed(c);
+/** When a sealed checkpoint's hour was sealed: its stamp's time, or the hour's cut-off without one. */
+export const sealTime = (c: { meta: CheckpointMeta }): string | null =>
+  c.meta.seal?.stamp?.time ?? (c.meta.seal?.hour ? cutoffOf(c.meta.seal.hour).toISOString() : null);
+const dateOf = (c: StoredCheckpoint): string | null => (isSealed(c) ? sealTime(c) : firstStampTime(c));
+/** Sent or about to be, with the backend in use: it will get, or be refused, a seal of its own. */
+const onItsWay = (c: StoredCheckpoint, current: Backend): boolean =>
+  current === "sealhour" && backendOf(c) === "sealhour" && (c.meta.seal?.state === "queued" || c.meta.seal?.state === "received");
+
 /**
- * Mark every checkpoint still queued that a later stamped checkpoint covers: the earliest later stamped
- * one whose chain reaches back to it unbroken. Written to its meta.json. [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED]
+ * Mark every checkpoint without a date of its own that a later dated checkpoint covers: the earliest
+ * later stamped or sealed one whose chain reaches back to it unbroken. Written to its meta.json. A
+ * checkpoint still on its way to SealHour is left alone: it is sent in its turn, so the service keeps
+ * every checkpoint of the log (workplan 2, correction 1), and its hour dates it.
+ * [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED]
  */
-function markCovered(all: StoredCheckpoint[]): void {
+function markCovered(all: StoredCheckpoint[], current: Backend): void {
   for (let i = 0; i < all.length; i++) {
     const c = all[i];
-    if (isStamped(c) || c.meta.covered_by) continue;
+    if (isDated(c) || c.meta.covered_by || onItsWay(c, current)) continue;
     for (let j = i + 1; j < all.length; j++) {
       if (all[j].checkpoint.prev_checkpoint_digest !== digestOf(all[j - 1].checkpoint)) break; // the chain breaks: nothing later covers it
-      if (isStamped(all[j])) {
-        c.meta.covered_by = { seq: all[j].seq, name: all[j].name, time: firstStampTime(all[j]) };
+      if (isDated(all[j])) {
+        c.meta.covered_by = { seq: all[j].seq, name: all[j].name, time: dateOf(all[j]) };
         c.meta.next_try_at = null;
         writeJson(join(c.dir, "meta.json"), c.meta);
         break;
@@ -246,7 +286,9 @@ function markCovered(all: StoredCheckpoint[]): void {
   }
 }
 
-const isQueued = (c: StoredCheckpoint): boolean => !isStamped(c) && !c.meta.covered_by;
+/** Not dated, and nothing later dates it: retried by its own backend while that backend is in use. */
+const isQueued = (c: StoredCheckpoint): boolean =>
+  backendOf(c) === "sealhour" ? c.meta.seal?.state === "queued" && !c.meta.covered_by : !isStamped(c) && !c.meta.covered_by;
 
 // ---------- the lock ----------
 
@@ -313,6 +355,9 @@ export interface TickReport {
   checkpoint?: string;
   stamped?: string[];
   retried?: number;
+  /** SealHour: the checkpoints the service gave a receipt for in this run, and those newly sealed. */
+  received?: number[];
+  sealed?: number[];
 }
 
 function readPackageVersion(): string {
@@ -345,6 +390,14 @@ const lastError = (stamps: Record<string, StampEntry>): string | null => {
 };
 
 function summarize(state: AnchorState, all: StoredCheckpoint[]): void {
+  const sealed = [...all].reverse().find(isSealed);
+  state.last_sealed = sealed
+    ? { seq: sealed.seq, created_at: sealed.checkpoint.created_at, hour: sealed.meta.seal!.hour, at: sealTime(sealed) ?? sealed.checkpoint.created_at, stamp_checked: sealed.meta.seal!.stamp ? sealed.meta.seal!.stamp.checked : null, bitcoin: sealed.meta.seal!.bitcoin }
+    : null;
+  state.waiting = all.filter((c) => backendOf(c) === "sealhour" && c.meta.seal?.state === "received").map((c) => ({ seq: c.seq, hour: c.meta.seal!.hour, note: c.meta.seal!.error ?? c.meta.seal!.waiting }));
+  state.undated = all
+    .filter((c) => backendOf(c) === "sealhour" && (c.meta.seal?.state === "refused" || c.meta.seal?.state === "missed") && !c.meta.covered_by)
+    .map((c) => ({ seq: c.seq, created_at: c.checkpoint.created_at, error: c.meta.seal!.error }));
   const stamped = [...all].reverse().find(isStamped);
   state.last_stamped = stamped
     ? {
@@ -355,11 +408,34 @@ function summarize(state: AnchorState, all: StoredCheckpoint[]): void {
         failed: Object.values(stamped.stamps).filter((s) => !s.ok).map((s) => s.name),
       }
     : null;
-  state.queued = all.filter(isQueued).map((c) => ({ seq: c.seq, created_at: c.checkpoint.created_at, error: lastError(c.stamps) }));
+  state.queued = all.filter(isQueued).map((c) => ({ seq: c.seq, created_at: c.checkpoint.created_at, error: backendOf(c) === "sealhour" ? (c.meta.seal?.error ?? null) : lastError(c.stamps) }));
 }
 
-/** Copy the checkpoints and stamps (never the code leaves or meta.json: they can name repositories) to the owner's
- *  folder off this machine, file by file, only what is new or changed. Correction 1 of workplan 2. */
+// [LOCKED] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] - 2026-10-02
+// [NEVER] write a file into the copy folder again when the copy there is already current, and
+//         [NEVER] read the copy's content to decide it: compare the two files' sizes and times only.
+// WHY: 2026-10-02, once the launchd agent ran Node 24, macOS refused that new program access to the
+//      files Google Drive manages (privacy database: kTCCServiceFileProviderDomain, the Node 24 path
+//      denied at 14:24:38 UTC, the Node 20 path allowed since 2026-10-01). New files could still be
+//      created there, so every new checkpoint reached the folder, but the two certificates were
+//      written again every hour and the first rewrite failed ("EPERM ... copyfile"): the status said
+//      the copy FAILED at 14:24 and 15:24 while nothing was missing, and before that every hour
+//      uploaded two unchanged files. Reading the copy to compare would make the provider fetch it,
+//      the very access that was refused.
+// FIX: one rule for every file, checkpoints and certificates alike: copy when the copy is missing,
+//      has another size, or is older than the source; otherwise leave it alone. A file that really
+//      changed and cannot be written is still reported as a failed copy.
+function copyIfChanged(src: string, dst: string): void {
+  const a = statSync(src);
+  let same = false;
+  try { const b = statSync(dst); same = b.size === a.size && b.mtimeMs >= a.mtimeMs; } catch { same = false; }
+  if (!same) copyFileSync(src, dst);
+}
+
+/** Copy the checkpoints, their stamps, their SealHour receipts and proofs (never the code leaves or meta.json:
+ *  they can name repositories; never the pilot code) to the owner's folder off this machine, file by
+ *  file, only what is new or changed. Correction 1 of workplan 2.
+ *  [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] */
 export function copyOffMachine(cfg: AnchorConfig, now: Date): { at: string | null; error: string | null } {
   if (!cfg.copy_dir) return { at: null, error: null };
   if (!existsSync(cfg.copy_dir)) return { at: null, error: `the folder ${cfg.copy_dir} is not there (not mounted?)` };
@@ -369,18 +445,25 @@ export function copyOffMachine(cfg: AnchorConfig, now: Date): { at: string | nul
       const to = join(dest, "checkpoints", c.name);
       mkdirSync(to, { recursive: true });
       for (const f of readdirSync(c.dir)) {
-        if (!/^(checkpoint\.json|stamps\.json|checkpoint\.[a-z0-9-]+\.ts[qr])$/.test(f)) continue;
-        const src = join(c.dir, f);
-        const dst = join(to, f);
-        const a = statSync(src);
-        let same = false;
-        try { const b = statSync(dst); same = b.size === a.size && b.mtimeMs >= a.mtimeMs; } catch { same = false; }
-        if (!same) copyFileSync(src, dst);
+        if (!/^(checkpoint\.json|stamps\.json|receipt\.json|checkpoint\.[a-z0-9-]+\.ts[qr])$/.test(f)) continue;
+        copyIfChanged(join(c.dir, f), join(to, f));
+      }
+      // The proof as SealHour served it, under the contract's names only.
+      const proof = join(c.dir, "proof");
+      if (existsSync(proof)) {
+        for (const e of readdirSync(proof, { withFileTypes: true })) {
+          const names = e.isDirectory() ? readdirSync(join(proof, e.name)).map((f) => `${e.name}/${f}`) : [e.name];
+          for (const n of names) {
+            if (!BUNDLE_NAME.test(n)) continue;
+            mkdirSync(join(to, "proof", e.isDirectory() ? e.name : ""), { recursive: true });
+            copyIfChanged(join(proof, n), join(to, "proof", n));
+          }
+        }
       }
     }
     if (existsSync(certsDir())) {
       mkdirSync(join(dest, "certs"), { recursive: true });
-      for (const f of readdirSync(certsDir())) if (f.endsWith(".pem")) copyFileSync(join(certsDir(), f), join(dest, "certs", f));
+      for (const f of readdirSync(certsDir())) if (f.endsWith(".pem")) copyIfChanged(join(certsDir(), f), join(dest, "certs", f));
     }
     return { at: now.toISOString(), error: null };
   } catch (e) {
@@ -389,17 +472,25 @@ export function copyOffMachine(cfg: AnchorConfig, now: Date): { at: string | nul
 }
 
 /**
- * The hourly job: retry queued stamps that are due, then, when this hour's slot has passed, this hour
- * has no checkpoint yet and the log grew, make one and stamp it; then copy off the machine.
- * Runs in its own process (`contextengine anchor tick`), started by the indexing server.
+ * The hourly job: when this hour's slot has passed, this hour has no checkpoint yet and the log grew,
+ * make a checkpoint; have it dated by the backend the owner said yes to (queued stamps retried and the
+ * new one stamped by the free services, or the queue sent to SealHour and the proofs of sealed hours
+ * fetched); then copy off the machine. Runs in its own process (`contextengine anchor tick`), started
+ * by the indexing server.
  */
-export async function anchorTick(o: { now?: () => Date; force?: boolean; timeoutMs?: number; clientVersion?: string } = {}): Promise<TickReport> {
+export async function anchorTick(o: { now?: () => Date; force?: boolean; timeoutMs?: number; clientVersion?: string; sleep?: (ms: number) => Promise<void> } = {}): Promise<TickReport> {
   const now = o.now ?? (() => new Date());
   const cfg = readConfig();
-  // [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE]: nothing is read, written or sent without the owner's yes.
-  if (!cfg || !cfg.enabled || !cfg.consent || cfg.consent.backend !== "rfc3161") return { action: "off", detail: "SealHour is off on this machine" };
-  const providers = consentedProviders(cfg);
-  if (providers.length === 0) return { action: "off", detail: "no time stamp service this machine said yes to is in use: run contextengine anchor enable" };
+  // [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE]: nothing is read, written or sent without the owner's yes
+  // to the backend in use.
+  if (!cfg || !cfg.enabled || !cfg.consent || cfg.consent.backend !== cfg.backend || (cfg.backend !== "rfc3161" && cfg.backend !== "sealhour")) {
+    return { action: "off", detail: "SealHour is off on this machine" };
+  }
+  const interim = cfg.backend === "rfc3161";
+  const providers = interim ? consentedProviders(cfg) : [];
+  if (interim && providers.length === 0) return { action: "off", detail: "no time stamp service this machine said yes to is in use: run contextengine anchor enable" };
+  const service: Service | null = interim ? null : activeService();
+  const who = service ? serviceName(service) : "";
 
   const release = acquireAnchorLock();
   if (!release) return { action: "busy", detail: "another anchor job is running" };
@@ -413,32 +504,36 @@ export async function anchorTick(o: { now?: () => Date; force?: boolean; timeout
       state.chain = { seq: last.seq, digest: digestOf(last.checkpoint), head_hash: last.checkpoint.records.head_hash, created_at: last.checkpoint.created_at, at: last.meta.end ?? null };
     }
 
-    // 1. Queued stamps, oldest first, each on its own backoff; one covered by a later stamp is done.
-    markCovered(all);
+    // 1. Interim: queued stamps, oldest first, each on its own backoff; one covered by a later stamp is done.
+    markCovered(all, cfg.backend);
     let retried = 0;
-    for (const c of all) {
-      if (retried >= MAX_RETRIES_PER_TICK) break;
-      if (!isQueued(c)) continue;
-      if (!o.force && c.meta.next_try_at && Date.parse(c.meta.next_try_at) > now().getTime()) continue;
-      c.stamps = await stampAll(c, providers, false, { now, timeoutMs: o.timeoutMs });
-      retried++;
-      c.meta.attempts += 1;
-      c.meta.next_try_at = isStamped(c) ? null : new Date(now().getTime() + RETRY_MIN[Math.min(c.meta.attempts - 1, RETRY_MIN.length - 1)] * 60_000).toISOString();
-      writeJson(join(c.dir, "meta.json"), c.meta);
+    if (interim) {
+      for (const c of all) {
+        if (retried >= MAX_RETRIES_PER_TICK) break;
+        if (backendOf(c) !== "rfc3161" || !isQueued(c)) continue;
+        if (!o.force && c.meta.next_try_at && Date.parse(c.meta.next_try_at) > now().getTime()) continue;
+        c.stamps = await stampAll(c, providers, false, { now, timeoutMs: o.timeoutMs });
+        retried++;
+        c.meta.attempts += 1;
+        c.meta.next_try_at = isStamped(c) ? null : new Date(now().getTime() + RETRY_MIN[Math.min(c.meta.attempts - 1, RETRY_MIN.length - 1)] * 60_000).toISOString();
+        writeJson(join(c.dir, "meta.json"), c.meta);
+      }
     }
 
     // 2. This hour's checkpoint.
     const t = now();
     const doneThisHour = !!state.chain && hourKey(new Date(state.chain.created_at)) === hourKey(t);
     const due = o.force || (t >= slotOf(t, cfg.slot_seconds) && !doneThisHour);
+    let made: { seq: number; count: number; repos: number } | null = null;
     if (!due) {
       report = { action: "not-due", detail: `next checkpoint after ${nextSlot(t, cfg, state.chain).toISOString().slice(11, 16)}Z` };
     } else {
       // [LOCK] [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD]: the cheap test first, before code or window.
       const head = liveHeadHash();
       const grew = head === null || (head !== ZERO && head !== state.chain?.head_hash);
+      const nothing = interim ? "no new record since the last checkpoint: nothing to stamp" : "no new record since the last checkpoint: nothing to seal";
       if (!grew) {
-        report = { action: "quiet", detail: "no new record since the last checkpoint: nothing to stamp" };
+        report = { action: "quiet", detail: nothing };
       } else {
         const code = cfg.code ? await codeLeaves({ cacheDir: manifestsDir() }) : null;
         const w = readWindow({ hash: state.chain?.head_hash ?? ZERO, at: state.chain?.at ?? undefined });
@@ -450,7 +545,7 @@ export async function anchorTick(o: { now?: () => Date; force?: boolean; timeout
           report = { action: "lost", detail: w.detail };
         } else if (w.kind === "empty") {
           state.lost = null;
-          report = { action: "quiet", detail: "no new record since the last checkpoint: nothing to stamp" };
+          report = { action: "quiet", detail: nothing };
         } else {
           state.lost = null;
           const createdAt = isoSecond(now());
@@ -472,7 +567,8 @@ export async function anchorTick(o: { now?: () => Date; force?: boolean; timeout
           if (code) writeJson(join(tmp, "code-leaves.json"), code.leaves);
           const meta: CheckpointMeta = {
             seq, digest, created_at: createdAt, first_ts: w.window.firstTs, last_ts: w.window.lastTs, end: w.window.end,
-            code: code ? { repos, skipped: code.skipped } : null, attempts: 1, next_try_at: null,
+            code: code ? { repos, skipped: code.skipped } : null, attempts: interim ? 1 : 0, next_try_at: null,
+            backend: cfg.backend, ...(interim ? {} : { seal: newSealMeta() }),
           };
           writeJson(join(tmp, "meta.json"), meta);
           writeJson(join(tmp, "stamps.json"), {});
@@ -481,33 +577,77 @@ export async function anchorTick(o: { now?: () => Date; force?: boolean; timeout
           state.chain = { seq, digest, head_hash: cp.records.head_hash, created_at: createdAt, at: w.window.end };
           state.code = code ? { repos, skipped: code.skipped.length } : null;
           writeState(state); // the chain moved: saved before any network call
-          const stamps = await stampAll({ dir, checkpoint: cp, stamps: {} }, providers, true, { now, timeoutMs: o.timeoutMs });
-          if (!Object.values(stamps).some((s) => s.ok)) {
-            meta.next_try_at = new Date(now().getTime() + RETRY_MIN[0] * 60_000).toISOString();
-            writeJson(join(dir, "meta.json"), meta);
+          made = { seq, count: cp.records.count, repos };
+          if (interim) {
+            const stamps = await stampAll({ dir, checkpoint: cp, stamps: {} }, providers, true, { now, timeoutMs: o.timeoutMs });
+            if (!Object.values(stamps).some((s) => s.ok)) {
+              meta.next_try_at = new Date(now().getTime() + RETRY_MIN[0] * 60_000).toISOString();
+              writeJson(join(dir, "meta.json"), meta);
+            }
+            const ok = Object.values(stamps).filter((s) => s.ok).map((s) => s.name);
+            report = {
+              action: "checkpoint",
+              checkpoint: name,
+              stamped: ok,
+              detail: ok.length > 0
+                ? `checkpoint ${seq} (${cp.records.count} record(s)${repos ? `, ${repos} repositor${repos === 1 ? "y" : "ies"}` : ""}) stamped by ${ok.join(" and ")}`
+                : `checkpoint ${seq} made, not stamped yet: ${lastError(stamps) ?? "no service answered"} (queued)`,
+            };
+          } else {
+            report = { action: "checkpoint", checkpoint: name, detail: "" };
           }
-          const ok = Object.values(stamps).filter((s) => s.ok).map((s) => s.name);
-          report = {
-            action: "checkpoint",
-            checkpoint: name,
-            stamped: ok,
-            detail: ok.length > 0
-              ? `checkpoint ${seq} (${cp.records.count} record(s)${repos ? `, ${repos} repositor${repos === 1 ? "y" : "ies"}` : ""}) stamped by ${ok.join(" and ")}`
-              : `checkpoint ${seq} made, not stamped yet: ${lastError(stamps) ?? "no service answered"} (queued)`,
-          };
         }
       }
     }
     if (retried > 0) report.retried = retried;
 
+    // 3. SealHour: the queue, oldest first, then the proofs of the hours sealed since.
+    // [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts)
+    if (service) {
+      all = listCheckpoints();
+      const mine = all.filter((c) => backendOf(c) === "sealhour") as Array<StoredCheckpoint & SealCheckpoint>;
+      const cred: SealCredential = sealCredential(cfg.consent.credential);
+      let trouble: string | null = null;
+      if ("problem" in cred) {
+        trouble = cred.problem;
+      } else {
+        const sent = await sendQueued(mine, service, cred.credential, { now, hold: state.hold ?? null, force: o.force, timeoutMs: o.timeoutMs, sleep: o.sleep });
+        state.hold = sent.hold;
+        if (sent.received.length > 0) report.received = sent.received;
+        trouble = sent.hold?.line ?? null;
+      }
+      const sealedNow = await fetchDueProofs(mine, service, { now, force: o.force, timeoutMs: o.timeoutMs });
+      if (sealedNow.length > 0) report.sealed = sealedNow;
+      const notes: string[] = [];
+      if (made) {
+        const m = mine.find((c) => c.seq === made!.seq);
+        const what = `checkpoint ${made.seq} (${made.count} record(s)${made.repos ? `, ${made.repos} repositor${made.repos === 1 ? "y" : "ies"}` : ""})`;
+        const st = m?.meta.seal;
+        if (st?.state === "received" || st?.state === "sealed") notes.push(`${what} received by ${who}, receipt ok; its hour ${st.hour} is sealed at ${cutoffOf(st.hour ?? "").toISOString().slice(11, 16)}Z`);
+        else if (st?.state === "refused") notes.push(`${what} made; ${st.error}`);
+        else notes.push(`${what} made, not sent yet: ${trouble ?? st?.error ?? `${who} did not answer`} (queued)`);
+      } else if (trouble && mine.some((c) => c.meta.seal?.state === "queued")) {
+        notes.push(`${mine.filter((c) => c.meta.seal?.state === "queued").length} checkpoint(s) queued: ${trouble}`);
+      }
+      const others = (report.received ?? []).filter((n) => n !== made?.seq);
+      if (others.length > 0) notes.push(`${others.length} queued checkpoint(s) received by ${who}`);
+      if (sealedNow.length > 0) notes.push(`checkpoint(s) #${sealedNow.join(", #")} sealed: proof kept and checked`);
+      if (notes.length > 0) report.detail = [report.detail, ...notes].filter(Boolean).join("; ");
+    }
+
     all = listCheckpoints();
-    markCovered(all);
+    markCovered(all, cfg.backend);
     summarize(state, all);
     if (cfg.copy_dir) state.copy = copyOffMachine(cfg, now());
     const t2 = now();
-    const retries = all.filter((c) => isQueued(c) && c.meta.next_try_at).map((c) => Date.parse(c.meta.next_try_at!));
+    const times = all.filter((c) => backendOf(c) === "rfc3161" && interim && isQueued(c) && c.meta.next_try_at).map((c) => Date.parse(c.meta.next_try_at!));
+    if (service) {
+      // The queue when its hold ends; each received checkpoint when its hour's proof can be asked.
+      if (state.hold && all.some((c) => backendOf(c) === "sealhour" && isQueued(c))) times.push(Date.parse(state.hold.until));
+      for (const c of all) if (backendOf(c) === "sealhour" && c.meta.seal?.state === "received" && c.meta.seal.proof_next_at) times.push(Date.parse(c.meta.seal.proof_next_at));
+    }
     const slot = nextSlot(t2, cfg, state.chain).getTime();
-    if (report.action !== "busy") state.next_due = new Date(Math.min(slot, ...retries)).toISOString();
+    if (report.action !== "busy") state.next_due = new Date(Math.min(slot, ...times.filter((x) => Number.isFinite(x)))).toISOString();
     state.last_tick = { at: t2.toISOString(), action: report.action, detail: report.detail };
     writeState(state);
     return report;
@@ -526,8 +666,11 @@ export async function anchorTick(o: { now?: () => Date; force?: boolean; timeout
 
 export interface AnchorHealth {
   enabled: boolean;
+  /** Who dates the checkpoints on this machine; null when SealHour is off. */
+  backend: Backend | null;
   code: boolean;
   repos: number | null;
+  /** Interim: the newest stamped checkpoint's time. SealHour: when the newest sealed checkpoint's hour was sealed. */
   lastStampAt: string | null;
   queued: number;
   lost: string | null;
@@ -536,64 +679,105 @@ export interface AnchorHealth {
   lastTickAt: string | null;
   nextDue: string | null;
   copy: { dir: string; at: string | null; error: string | null } | null;
-  /** Why the chain is not stamped as it should be; null when it is (or when SealHour is off). */
+  /** Why the chain is not stamped or sealed as it should be; null when it is (or when SealHour is off). */
   problem: string | null;
   /** One line, in the words of contract section 10. */
   line: string;
 }
 
 const hhmm = (iso: string) => `${iso.slice(11, 16)}Z`;
+/** A time of today as 14:02Z, an older one with its day. */
+const when = (iso: string, now: Date) => (now.getTime() - Date.parse(iso) < 20 * 3_600_000 ? hhmm(iso) : `${iso.slice(0, 10)} ${hhmm(iso)}`);
 function ago(iso: string, now: Date): string {
   const m = Math.max(0, Math.round((now.getTime() - Date.parse(iso)) / 60_000));
   if (m < 60) return `${m} min ago`;
   const h = Math.round(m / 60);
   return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
 }
+/** A received checkpoint whose hour is still not sealed this long after its cut-off is a problem. */
+const SEAL_LATE_MS = 75 * 60_000;
 
-/** The SealHour line for status, fleet health and end_session. Reads two small files and the log's
- *  last line; never the checkpoints folder. [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] */
+/** The SealHour line for status, fleet health, audit-verify and end_session. Reads two small files, the
+ *  log's last line and, for the SealHour backend, the credential; never the checkpoints folder.
+ *  [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts) */
 export function anchorHealth(now = new Date()): AnchorHealth {
   const cfg = readConfig();
-  const off: AnchorHealth = { enabled: false, code: false, repos: null, lastStampAt: null, queued: 0, lost: null, pending: null, lastTickAt: null, nextDue: null, copy: null, problem: null, line: "SealHour: off (contextengine anchor enable)" };
+  const off: AnchorHealth = { enabled: false, backend: null, code: false, repos: null, lastStampAt: null, queued: 0, lost: null, pending: null, lastTickAt: null, nextDue: null, copy: null, problem: null, line: "SealHour: off (contextengine anchor enable)" };
   if (!cfg || !cfg.enabled) return off;
   const s = readState();
   const head = liveHeadHash();
   const pending = head === null ? null : head !== ZERO && head !== s.chain?.head_hash;
   const repos = cfg.code ? (s.code?.repos ?? null) : null;
   const what = cfg.code ? (repos ? `chain + ${repos} repo${repos === 1 ? "" : "s"}` : "chain + code") : "chain only";
-  const since = s.last_stamped ? `not stamped since ${hhmm(s.last_stamped.created_at)}` : "not stamped yet";
-  let problem: string | null = null;
-  if (s.lost) problem = `${since}: the last stamped record is gone from the audit log (run contextengine audit-verify)`;
-  else if (s.queued.length > 0) {
-    // Everything older than a stamped checkpoint is covered by it (markCovered), so the queue always
-    // holds the newest checkpoint: "not stamped since" the last stamp is exact.
-    const n = s.queued.length;
-    problem = `${since}: ${s.queued[n - 1].error ?? "no time stamp service answered"} (${n} checkpoint${n === 1 ? "" : "s"} queued)`;
-  }
-  else if (pending && now.getTime() - Date.parse(s.last_tick?.at ?? cfg.enabled_at ?? now.toISOString()) > JOB_STALE_MS) {
-    problem = `${since}: the hourly job has not run ${s.last_tick ? `since ${hhmm(s.last_tick.at)}` : "yet"} (it runs in the OpsContext server; contextengine anchor tick runs it by hand)`;
-  } else if (s.last_tick?.action === "error") problem = `${since}: the hourly job failed: ${s.last_tick.detail}`;
   const copy = cfg.copy_dir ? { dir: cfg.copy_dir, at: s.copy?.at ?? null, error: s.copy?.error ?? null } : null;
+  const sealing = cfg.backend === "sealhour";
+  const jobLate = pending && now.getTime() - Date.parse(s.last_tick?.at ?? cfg.enabled_at ?? now.toISOString()) > JOB_STALE_MS;
+  const jobLine = `the hourly job has not run ${s.last_tick ? `since ${hhmm(s.last_tick.at)}` : "yet"} (it runs in the OpsContext server; contextengine anchor tick runs it by hand)`;
+  let problem: string | null = null;
   let line: string;
-  if (problem) line = `SealHour interim: on, ${problem}`;
-  else {
-    const stamp = s.last_stamped
-      ? `last stamp ${ago(s.last_stamped.created_at, now)} by ${s.last_stamped.ok} of ${s.last_stamped.total} free services${s.last_stamped.failed.length ? ` (${s.last_stamped.failed.join(", ")} did not answer)` : ""}`
-      : "no stamp yet";
-    const next = s.next_due ? `, next after ${hhmm(s.next_due)}` : "";
-    const quiet = s.last_stamped && pending === false ? ", nothing new since" : "";
-    line = `SealHour interim: on (${what}), ${stamp}${quiet}${next}`;
+  let lastAt: string | null;
+  if (!sealing) {
+    lastAt = s.last_stamped?.created_at ?? null;
+    const since = s.last_stamped ? `not stamped since ${hhmm(s.last_stamped.created_at)}` : "not stamped yet";
+    if (s.lost) problem = `${since}: the last stamped record is gone from the audit log (run contextengine audit-verify)`;
+    else if (s.queued.length > 0) {
+      // Everything older than a stamped checkpoint is covered by it (markCovered), so the queue always
+      // holds the newest checkpoint: "not stamped since" the last stamp is exact.
+      const n = s.queued.length;
+      problem = `${since}: ${s.queued[n - 1].error ?? "no time stamp service answered"} (${n} checkpoint${n === 1 ? "" : "s"} queued)`;
+    }
+    else if (jobLate) problem = `${since}: ${jobLine}`;
+    else if (s.last_tick?.action === "error") problem = `${since}: the hourly job failed: ${s.last_tick.detail}`;
+    if (problem) line = `SealHour interim: on, ${problem}`;
+    else {
+      const stamp = s.last_stamped
+        ? `last stamp ${ago(s.last_stamped.created_at, now)} by ${s.last_stamped.ok} of ${s.last_stamped.total} free services${s.last_stamped.failed.length ? ` (${s.last_stamped.failed.join(", ")} did not answer)` : ""}`
+        : "no stamp yet";
+      const next = s.next_due ? `, next after ${hhmm(s.next_due)}` : "";
+      const quiet = s.last_stamped && pending === false ? ", nothing new since" : "";
+      line = `SealHour interim: on (${what}), ${stamp}${quiet}${next}`;
+    }
+  } else {
+    // The SealHour service. "Sealed" is said of a checkpoint whose hour's proof is kept here and holds,
+    // and of nothing else. [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts)
+    let who = "SealHour";
+    try { who = serviceName(activeService()); } catch { who = "SealHour TEST stand-in (its settings cannot be read)"; }
+    const last = s.last_sealed ?? null;
+    lastAt = last?.at ?? null;
+    const since = last ? `not sealed since ${when(last.at, now)}` : "not sealed yet";
+    const queued = s.queued.length;
+    const waiting = s.waiting ?? [];
+    const undated = s.undated ?? [];
+    const cred = cfg.consent?.backend === "sealhour" ? sealCredential(cfg.consent.credential) : { problem: "the owner's yes to the SealHour service is not recorded (contextengine anchor enable)" };
+    const late = waiting.find((w) => w.hour && now.getTime() - cutoffOf(w.hour).getTime() > SEAL_LATE_MS);
+    const n = `(${queued} checkpoint${queued === 1 ? "" : "s"} queued)`;
+    if (s.lost) problem = `${since}: the last sealed record is gone from the audit log (run contextengine audit-verify)`;
+    else if ("problem" in cred) problem = `${since}: ${cred.problem}${queued ? ` ${n}` : ""}`;
+    else if (queued > 0) problem = `${since}: ${s.hold?.line ?? s.queued[queued - 1].error ?? `${who} did not answer`} ${n}`;
+    else if (undated.length > 0) problem = `${since}: checkpoint #${undated[undated.length - 1].seq} has no seal of its own (${undated[undated.length - 1].error ?? "refused"}); the next sealed checkpoint dates it`;
+    else if (late) problem = `${since}: the hour ${late.hour} is still not sealed at ${who}${late.note ? ` (${late.note})` : ""}`;
+    else if (jobLate) problem = `${since}: ${jobLine}`;
+    else if (s.last_tick?.action === "error") problem = `${since}: the hourly job failed: ${s.last_tick.detail}`;
+    if (problem) line = `${who}: on, ${problem}`;
+    else {
+      const note = !last ? "" : last.stamp_checked === true ? "" : last.stamp_checked === false ? " (its official stamp could not be checked on this machine)" : " (that hour has no official stamp yet)";
+      const seal = last ? `last seal ${ago(last.at, now)}${note}, receipt ok` : "no seal yet";
+      const next = waiting.length > 0 && waiting[0].hour
+        ? `, ${waiting.length} checkpoint${waiting.length === 1 ? "" : "s"} received (receipt ok), next seal at ${hhmm(cutoffOf(waiting[waiting.length - 1].hour ?? waiting[0].hour).toISOString())}`
+        : `${last && pending === false ? ", nothing new since" : ""}${s.next_due ? `, next checkpoint after ${hhmm(s.next_due)}` : ""}`;
+      line = `${who}: on (${what}), ${seal}${next}`;
+    }
   }
   line += copy
     ? copy.error ? `; copy off this machine FAILED (${copy.error})` : copy.at ? `; copied off this machine ${ago(copy.at, now)}` : "; not copied off this machine yet"
     : "; no copy off this machine (contextengine anchor copy <folder>)";
-  return { enabled: true, code: cfg.code, repos, lastStampAt: s.last_stamped?.created_at ?? null, queued: s.queued.length, lost: s.lost, pending, lastTickAt: s.last_tick?.at ?? null, nextDue: s.next_due, copy, problem, line };
+  return { enabled: true, backend: cfg.backend, code: cfg.code, repos, lastStampAt: lastAt, queued: s.queued.length, lost: s.lost, pending, lastTickAt: s.last_tick?.at ?? null, nextDue: s.next_due, copy, problem, line };
 }
 
 /** Should the indexing server start the hourly job now? Cheap: two small files. */
 export function anchorTickDue(now = new Date()): boolean {
   const cfg = readConfig();
-  if (!cfg || !cfg.enabled || !cfg.consent) return false;
+  if (!cfg || !cfg.enabled || !cfg.consent || cfg.consent.backend !== cfg.backend) return false;
   const s = readState();
   return !s.next_due || Date.parse(s.next_due) <= now.getTime();
 }

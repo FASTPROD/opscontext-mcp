@@ -97,7 +97,7 @@ This separation means:
 
 ## Privacy
 
-**OpsContext runs 100% on your machine.** No project data — code, learnings, sessions, git history, dependencies — is ever sent to an external server. The only network calls are license validation for PRO users (license key + machine ID hash). See the [full privacy details](https://www.npmjs.com/package/@compr/opscontext-mcp#privacy--data-security).
+**OpsContext runs 100% on your machine.** No project data (code, learnings, sessions, git history, dependencies) is ever sent to an external server. The only network calls are license validation for PRO users (license key + machine ID hash) and, only if you turn it on, SealHour's hourly checkpoint (fingerprints, numbers and a time). See the [full privacy details](https://www.npmjs.com/package/@compr/opscontext-mcp#privacy--data-security).
 
 ## Requirements
 

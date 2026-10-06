@@ -180,6 +180,30 @@ export function loadLicense(): LicenseInfo | null {
   }
 }
 
+/**
+ * The licence this machine holds validly, read without a word and without a record: the same checks
+ * as loadLicense() (expiry, refusal by the licence server, machine, signature), none of its console
+ * lines and none of its audit records. For the SealHour hourly job (src/anchor-seal.ts), which sends
+ * the licence key as its credential and must never append to the audit log: a job that wrote a record
+ * each hour would make the log grow every hour and seal forever ([LOCK]
+ * [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD] in src/anchor.ts; loadLicense() chains one on a refused signature).
+ */
+export function quietLicence(): { key: string; plan: string } | { problem: string } {
+  let data: LicenseInfo;
+  try {
+    if (!existsSync(LICENSE_FILE)) return { problem: "no OpsContext licence on this machine" };
+    data = JSON.parse(readFileSync(LICENSE_FILE, "utf-8")) as LicenseInfo;
+  } catch {
+    return { problem: "the licence file of this machine cannot be read" };
+  }
+  if (!data || typeof data.key !== "string") return { problem: "the licence file of this machine cannot be read" };
+  if (new Date(data.expiresAt) < new Date()) return { problem: "the OpsContext licence of this machine has expired" };
+  if (data.revoked) return { problem: "the OpsContext licence of this machine was refused by the licence server" };
+  if (data.machineId !== getMachineId()) return { problem: "the OpsContext licence on this machine is bound to another machine" };
+  if (!verifyLicenseSignature(data).ok) return { problem: "the OpsContext licence on this machine does not verify" };
+  return { key: data.key, plan: String(data.plan) };
+}
+
 function saveLicense(license: LicenseInfo): void {
   const dir = join(homedir(), ".contextengine");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

@@ -2,7 +2,7 @@
 // [LOCK] [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD] [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] (src/anchor.ts)
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createHash } from "crypto";
@@ -311,6 +311,45 @@ describe.skipIf(!haveOpenssl)("the hourly job", () => {
       await tick(at(H2, 12));
       expect(anchorHealth(at(H2, 13)).line).toMatch(/copy off this machine FAILED \(the folder .* is not there/);
     } finally {
+      rmSync(copy, { recursive: true, force: true });
+    }
+  });
+
+  // [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED]: on 2026-10-02 macOS let the Node 24 agent create
+  // files in Google Drive but refused it any rewrite of an existing one, and the copy rewrote the two
+  // unchanged certificates every hour. Read-only files in a writable folder are that situation.
+  it("a copy folder whose files cannot be written again: new checkpoints still go, unchanged files are left alone", async () => {
+    const copy = mkdtempSync(join(tmpdir(), "ce-anchor-copy-ro-"));
+    const frozen: string[] = [];
+    const freeze = (dir: string): void => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) freeze(p);
+        else { chmodSync(p, 0o444); frozen.push(p); }
+      }
+    };
+    try {
+      appendAudit("learning.save", { n: 1 });
+      const cfg = enable({ copy_dir: copy });
+      await tick(at(H1, 12));
+      const dest = join(copy, `opscontext-anchors-${cfg.machine}`);
+      expect(readdirSync(join(dest, "certs")).sort()).toEqual(["test-a-ca.pem", "test-b-ca.pem"]);
+      freeze(dest);
+      appendAudit("learning.save", { n: 2 });
+      expect((await tick(at(H2, 12))).action).toBe("checkpoint");
+      expect(readState().copy).toEqual({ at: at(H2, 12).toISOString(), error: null });
+      const second = listCheckpoints()[1];
+      expect(readdirSync(join(dest, "checkpoints", second.name))).toContain("stamps.json");
+      expect(anchorHealth(at(H2, 13)).line).toMatch(/copied off this machine 1 min ago$/);
+      // A file that did change is still copied, so a copy that cannot take it is still a failed copy.
+      const later = new Date(Date.now() + 3_600_000);
+      utimesSync(join(anchorsDir(), "certs", "test-a-ca.pem"), later, later);
+      appendAudit("learning.save", { n: 3 });
+      await tick(at(H3, 12));
+      expect(readState().copy?.error).toMatch(/EACCES/);
+      expect(anchorHealth(at(H3, 13)).line).toMatch(/copy off this machine FAILED/);
+    } finally {
+      for (const p of frozen) chmodSync(p, 0o644);
       rmSync(copy, { recursive: true, force: true });
     }
   });

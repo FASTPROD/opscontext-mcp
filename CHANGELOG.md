@@ -4,6 +4,93 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.19.0] 2026-10-06: sealed every hour by SealHour, and a README that says what leaves
+
+Nothing changes for an installation that never ran `anchor enable`: no checkpoint, no call. A machine in
+interim mode stays in it until its owner says yes again.
+
+### Sealed every hour by SealHour
+
+`contextengine anchor enable` now shows the SealHour service's screen. Nothing is stored, and nothing is
+sent, before an explicit yes to the second question:
+
+```
+SealHour seals your work every hour, so you can prove later that it existed by then:
+an outside time stamp from an official European provider, written into Bitcoin.
+A date, not ownership.
+
+Once an hour, while OpsContext runs and only if your audit chain grew, OpsContext makes a
+checkpoint on this machine and sends it to SealHour (api.sealhour.com).
+SealHour answers with a signed receipt and keeps the checkpoint, so a lost or rewritten disk
+does not lose the proof. At minute 2 of the next hour it seals the checkpoints of the hour
+together, has that seal stamped by the official provider and writes it into Bitcoin. The
+proof comes back to this machine; anyone can check it without OpsContext and without SealHour.
+
+What leaves this machine, once an hour, while OpsContext runs:
+  - a checkpoint of your OpsContext audit chain: a few 32-byte fingerprints, the number of
+    records and the time; never a record;
+  - if you say yes below, one fingerprint for all your workspace repositories, and their
+    number; never a file, never code, never a name;
+  - your licence key, and, as with any web request, this machine's address and the time.
+SealHour learns the hours you were active, to the hour. Nothing else leaves: no record, no file,
+no code, no name. Off any time: contextengine anchor disable.
+
+SealHour is included in OpsContext Team and Enterprise, and open to every licence while its pilot lasts.
+
+Seal the code of your workspaces too?  [Y/n]
+Start sealing?                         [y/N]
+```
+
+- **Who has it.** SealHour is included in OpsContext Team and Enterprise, and open to every licence while its
+  pilot lasts. The pilot ends on 1 December 2026 at 00:00 UTC: 30 November is its last day. After the pilot,
+  Pro reaches SealHour by moving to Team. Without a licence the screen says so,
+  and a pilot code made on your machine (random: it names no one) takes the place of the licence key while
+  the pilot lasts.
+- **A receipt for every checkpoint.** SealHour answers each checkpoint with a signed receipt and keeps the
+  checkpoint, so a lost or rewritten disk does not lose the proof. The receipt counts only under SealHour's
+  published key, for this checkpoint and its hour; anything else is reported and never kept.
+- **The proof, checked before it is kept.** Once the hour is sealed, OpsContext fetches the proof and checks
+  it: the checkpoint is this machine's, its place in the hour, the receipt, and the hour's stamp with OpenSSL
+  under a pinned certificate. Your checkpoint is included in the stamped hour, verifiable by anyone. The
+  Bitcoin attestation follows within hours and is reported as the proof states it.
+- **The words never run ahead.** A checkpoint is "received", then "sealed". `anchor status` says it in one
+  line: "SealHour: on (chain + 39 repos), last seal 12 min ago, receipt ok, next checkpoint after 15:23Z", or
+  "SealHour: on, not sealed since 14:02Z: SealHour did not answer (connection refused) (2 checkpoints
+  queued)". The same line ends `audit-verify`, and is in `servers`, fleet health and end-session.
+- **When SealHour or the network is away,** the checkpoints wait and go out oldest first once it answers
+  again; the status line says how many wait, in the service's own words when it refused.
+- **`anchor verify`** adds, for each sealed checkpoint, the receipt, its place in the hour, the hour's stamp
+  and Bitcoin, each with its mark.
+- **`anchor export-evidence <from> <to> [--refresh]`** writes each sealed checkpoint's proof exactly as SealHour
+  served it, so SealHour's free checker reads the folder as it is, next to the folder's own `verify.mjs`.
+  `--refresh` fetches each proof again first: its Bitcoin attestation comes hours after the seal.
+- **`anchor copy <folder>`** now takes the receipts and the proofs too.
+- **Interim mode stays.** `anchor enable --interim` keeps the direct stamps of 2.18.0 (two free public time
+  stamp services; not the official European stamp, not Bitcoin, no SealHour receipt).
+
+### Fixes
+
+- **The copy off this machine writes only what changed.** `anchor copy` rewrote two unchanged certificate
+  files every hour; a synced folder could refuse that, and the whole copy was then reported as failed.
+- **Re-installing the background agent (macOS).** `install-autostart --force` now waits until launchd has let
+  go of the old agent before starting the new one, and reports success only when launchd says the agent runs
+  and holds its port. Before, the start could fail right after the stop ("Bootstrap failed: 5") and leave
+  the machine without its agent while the command said all was well.
+
+### The README says what leaves
+
+The README said "nothing leaves your machine" and named the licence check as the only network call. With
+SealHour on that was no longer true, since 2.18.0. It now says "tamper-evident, with an outside time stamp
+when SealHour is on", has a section on SealHour, and lists under Privacy what SealHour receives, word for
+word what the enable screen asks you to agree to. The compliance page for SOC 2 CC7.2 no longer says that
+OpsContext ships no outside anchor.
+
+**Package:** 59 files to 63, 381 kB to about 410 kB (the four modules of the SealHour service).
+
+Upgrading: nothing to do while SealHour is off. Before you run `anchor enable`, restart your MCP client (the
+macOS background agent restarts itself): a server still running 2.18.0 reads a machine set to the SealHour
+service as off and makes no checkpoint until it restarts.
+
 ## [2.18.0] 2026-09-30: the agent follows the build, every LOCK block is findable, an outside time stamp you can turn on
 
 Batch 5 of the end-to-end review (rows C0 and C7-5, point 20 and the code index), each item measured on the author's

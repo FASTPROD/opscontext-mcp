@@ -2,7 +2,7 @@
 
 **AI that doesn't break what it can't see.**
 
-Claude Code, Cursor, and Copilot write code without seeing your servers, so they suggest the wrong port, restart the wrong service, deploy into the wrong env. OpsContext gives them eyes on what's actually running, plus a tamper-evident log of every change they make. Free core, no signup, runs entirely on your machine.
+Claude Code, Cursor, and Copilot write code without seeing your servers, so they suggest the wrong port, restart the wrong service, deploy into the wrong env. OpsContext gives them eyes on what's actually running, plus a tamper-evident log of every change they make, with an outside time stamp when SealHour is on. Free core, no signup, runs entirely on your machine.
 
 > Previously published as `@compr/contextengine-mcp`. The 2.0 rename reflects what the project actually does: Claude Code sees the **code**, OpsContext sees the **infra that runs it**.
 
@@ -10,7 +10,7 @@ Claude Code, Cursor, and Copilot write code without seeing your servers, so they
 [![License: BSL-1.1](https://img.shields.io/badge/License-BSL--1.1-blue.svg)](https://www.npmjs.com/package/@compr/opscontext-mcp)
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=css-llc.contextengine)
 
-OpsContext is an [MCP](https://modelcontextprotocol.io) server. It runs locally, snapshots your live infra (PM2 processes, nginx config, Docker containers, git status, cron jobs, redacted env), and exposes it via tools your AI coding agents (Claude Code, Cursor, Copilot, Windsurf, OpenClaw) can call in real time. Everything stays on your machine — no telemetry, no code uploads.
+OpsContext is an [MCP](https://modelcontextprotocol.io) server. It runs locally, snapshots your live infra (PM2 processes, nginx config, Docker containers, git status, cron jobs, redacted env), and exposes it via tools your AI coding agents (Claude Code, Cursor, Copilot, Windsurf, OpenClaw) can call in real time. No telemetry, no code uploads: no record, no file and no code ever leaves your machine. The two things that can leave are listed under [Privacy & Data Security](#privacy--data-security).
 
 > **🌐 Browser Capture (Phase 1, shipped 2026-06):** OpsContext now records prompts, assistant responses and tool calls from **Claude.ai**, **ChatGPT.com**, *and* your **Claude Code** terminal sessions in the same hash-chained audit log. Since 2.9.0 a prompt or a response is kept as its length and a keyed fingerprint, never its words; commands are kept with credentials redacted. Cross-surface drift detection becomes possible (e.g. catch when a model says one thing in the browser and another in the terminal). See [Step 3](#3-capture-browser--claude-code-events-optional) below.
 
@@ -21,7 +21,7 @@ Claude Code already reads your `CLAUDE.md`, `copilot-instructions.md`, and sourc
 OpsContext fills that gap, plus two compliance layers regulated industries demand from any agent stack:
 
 1. **Operational visibility (the moat)** — collectors for PM2 / nginx / Docker / git / cron / .env (redacted) / composer / systemd. Cross-project + check_ports + fleet HTML scoring. Claude Code can't see this; we feed it cleanly.
-2. **Tamper-evident audit log (compliance)** — hash-chained JSONL at `~/.contextengine/audit.log`. Every state change recorded with `prev_hash`/`hash`. Designed to produce evidence aligned with [SOC 2 CC7.2 (change monitoring)](docs/compliance/cc7.2.md) and [ISO 27001 A.12.4.1 (event logging)](docs/compliance/a.12.4.1.md). **These are evidence artifacts, not a certification.** OpsContext is not itself SOC 2– or ISO 27001–certified; the audit log helps *your* org's auditor satisfy *those* controls.
+2. **Tamper-evident audit log, with an outside time stamp when SealHour is on (compliance)**: hash-chained JSONL at `~/.contextengine/audit.log`. Every state change recorded with `prev_hash`/`hash`. The chain is checked from the inside; [SealHour](#sealhour-an-outside-time-stamp-for-the-audit-chain), off until you turn it on, adds a date from outside your machine. Designed to produce evidence aligned with [SOC 2 CC7.2 (change monitoring)](docs/compliance/cc7.2.md) and [ISO 27001 A.12.4.1 (event logging)](docs/compliance/a.12.4.1.md). **These are evidence artifacts, not a certification.** OpsContext is not itself certified for SOC 2 or ISO 27001; the audit log helps *your* org's auditor satisfy *those* controls.
 3. **Policy-as-code hooks (enforcement)** — declarative `.contextengine/policy.json` for secret patterns (with `paths` scoping), diff-aware doc coverage (replaces the workaround-y 4-hour staleness gate), deploy-verify hosts, and signed bypass tokens. Runs as a pre-commit hook layer alongside gitleaks.
 
 Plus the persistent-memory + search features carried forward from the contextengine era:
@@ -31,7 +31,7 @@ Plus the persistent-memory + search features carried forward from the contexteng
 - 📁 **Auto-discover** — finds `copilot-instructions.md`, `CLAUDE.md`, `.cursorrules`, `AGENTS.md` across all projects
 - 💻 **Code Parsing** — extracts functions, classes, interfaces from TS/JS/Python source files
 - ⚙️ **Operational Intelligence** — collects git, Docker, PM2, nginx, cron, package.json data
-- 🔒 **Local-only** — nothing leaves your machine
+- 🔒 **Local-only**: no record, no file and no code ever leaves your machine
 - ⚡ **Instant startup** — keyword search ready immediately, embeddings load in background
 - 💾 **Session Persistence** — AI agents can save/restore context across conversations
 - 💡 **Learning Store** — permanent operational rules that auto-surface in search results
@@ -229,17 +229,36 @@ OpsContext is **source-available with a free tier**. The free tier covers everyt
 
 ### Pricing
 
-| Plan | Price | Machines |
-|------|-------|----------|
-| **Pro** | CHF 2/mo | 2 |
-| **Team** | CHF 12/mo | 5 |
-| **Enterprise** | CHF 36/mo | 10 |
+| Plan | Price | Machines | SealHour |
+|------|-------|----------|----------|
+| **Pro** | CHF 2/mo | 2 | until its pilot ends on 1 December 2026; after that, by moving to Team |
+| **Team** | CHF 12/mo | 5 | included |
+| **Enterprise** | CHF 36/mo | 10 | included |
 
 → **[Get PRO](https://api.compr.ch/contextengine/pricing)** · Annual plans save 17%
 
 ```bash
 # Activate after purchase
 npx @compr/opscontext-mcp activate
+```
+
+### SealHour: an outside time stamp for the audit chain
+
+[SealHour](https://sealhour.com) seals your work every hour, so you can prove later that it existed by then: an outside time stamp from an official European provider, written into Bitcoin. A date, not ownership.
+
+On its own the audit chain is checked from the inside: it shows a record that was changed, not when the chain was written. With SealHour on, the log is tamper-evident, with an outside time stamp.
+
+- **Team and Enterprise.** Sealed every hour by SealHour: an outside time stamp from an official European provider, written into Bitcoin.
+- **Off until you turn it on.** `npx @compr/opscontext-mcp anchor enable` shows what would leave your machine and starts nothing without your yes.
+- **What leaves.** Once an hour, OpsContext sends SealHour a checkpoint of your audit chain: a few 32-byte fingerprints, the number of records and the time, and, if you choose, one fingerprint for all your repositories with their number; with your licence key. As with any web request, the receiver also sees this machine's address and the time, so it learns the hours you were active. Nothing else leaves: no record, no file, no code, no name. You can stop it any time.
+- **What comes back.** A signed receipt for each checkpoint; SealHour keeps the checkpoint too, so a lost or rewritten disk does not lose the proof. At minute 2 of the next hour SealHour seals the checkpoints of the hour together, has that seal stamped by the official provider and writes it into Bitcoin. Your checkpoint is included in the stamped hour, verifiable by anyone: `anchor export-evidence <from> <to>` writes the proofs of a period into a folder anyone can check without OpsContext and without SealHour.
+- **Who has it.** SealHour is included in OpsContext Team and Enterprise, and open to every licence while its pilot lasts. The pilot ends on 1 December 2026 at 00:00 UTC: 30 November is its last day. After the pilot, Pro reaches SealHour by moving to Team. Without a licence, a pilot code made on your machine (random: it names no one) takes the place of the licence key while the pilot lasts.
+- **Interim mode.** `anchor enable --interim` asks two free public time stamp services directly, in place of the SealHour service: an outside date; not the official European stamp, not Bitcoin, no SealHour receipt. Only one 32-byte fingerprint of each checkpoint leaves, and no licence key.
+
+```bash
+npx @compr/opscontext-mcp anchor status    # one line: the last seal, its receipt, what is queued
+npx @compr/opscontext-mcp anchor verify    # recompute every checkpoint from this machine's log; check every receipt, proof and stamp
+npx @compr/opscontext-mcp anchor disable   # stop: nothing leaves any more, what was made is kept
 ```
 
 ## CLI Usage (no MCP required)
@@ -279,6 +298,9 @@ npx @compr/opscontext-mcp audit
 
 # Verify the tamper-evident audit log, archived segments included
 npx @compr/opscontext-mcp audit-verify
+
+# SealHour: an outside time stamp for the audit chain (shows what would leave, starts nothing without a yes)
+npx @compr/opscontext-mcp anchor enable
 
 # Multi-agent token, cost and capacity report from Claude Code's own transcripts
 npx @compr/opscontext-mcp cost
@@ -475,7 +497,7 @@ If you're using ContextEngine, we'd love to hear about it.
 
 **ContextEngine runs 100% on your machine. Your code, your data, your rules.**
 
-Everything happens locally — search, scoring, learnings, sessions, embeddings. No project data is ever sent to an external server.
+Everything happens locally: search, scoring, learnings, sessions, embeddings. No record, no file and no code is ever sent to an external server. Two things can leave, both listed below: the licence check (PRO only), and, only if you turn it on, SealHour's hourly checkpoint (fingerprints, numbers and a time).
 
 ### What stays on your machine (always)
 
@@ -505,7 +527,26 @@ That is the complete list. The activation request sends exactly six fields and t
 
 **The server never receives:** project names, file contents, learnings, sessions, git history, dependencies, code, .env variables, or anything about your actual work.
 
-**These are the only two network calls the tool makes.** `activate` and `heartbeat`, both in `src/activation.ts`. Nothing else in the codebase opens a connection — verify it yourself with `grep -rn "fetch(" src/`.
+**Until you turn SealHour on, these are the only two network calls the tool makes.** `activate` and `heartbeat`, both in `src/activation.ts`.
+
+### What SealHour receives (only if you turn it on)
+
+Off by default. `npx @compr/opscontext-mcp anchor enable` shows this list on your screen and starts nothing without your yes; `anchor disable` stops it.
+
+| Data | When | Who receives it |
+|---|---|---|
+| A checkpoint of your audit chain: a few 32-byte fingerprints, the number of records and the time | Once an hour, while OpsContext runs and only if the chain grew | SealHour (`api.sealhour.com`) |
+| One fingerprint for all your workspace repositories, and their number | With the checkpoint, only if you said yes to the code question | SealHour |
+| Your licence key, or without a licence a pilot code made on your machine (random: it names no one) | With the checkpoint | SealHour, which asks the OpsContext licence server whether the key may seal |
+| This machine's address and the time | As with any web request | SealHour |
+
+Once an hour, OpsContext sends SealHour a checkpoint of your audit chain: a few 32-byte fingerprints, the number of records and the time, and, if you choose, one fingerprint for all your repositories with their number; with your licence key. As with any web request, the receiver also sees this machine's address and the time, so it learns the hours you were active. Nothing else leaves: no record, no file, no code, no name. You can stop it any time.
+
+During the pilot, everything SealHour receives is kept and nothing is deleted. How long it is kept afterwards will be written on [SealHour's privacy page](https://sealhour.com/privacy.html) before the first paid use.
+
+**In interim mode** (`anchor enable --interim`) the checkpoint stays on your machine: one 32-byte fingerprint of it goes to each of two free public time stamp services, named on the enable screen, with this machine's address and the time. No licence key.
+
+SealHour's calls are in `src/anchor-service.ts`, the interim mode's in `src/anchor-tsa.ts`. Nothing else in the codebase opens a connection to another machine: verify it yourself with `grep -rlE 'fetch\(|from "https?"' src/`, which lists those two files, `src/activation.ts`, and `src/http-server.ts` (the local event port, bound to 127.0.0.1).
 
 ### What's obfuscated, and what isn't
 
@@ -515,7 +556,7 @@ One file in the published package is deliberately unreadable: `dist/rubric.js`, 
 
 ### Why this matters
 
-Most AI coding tools (Copilot, Cursor, Codeium) send your code to external servers for processing. ContextEngine takes the opposite approach — **embeddings run locally on CPU**, search runs locally, and all persistent state stays in `~/.contextengine/` on your disk. The only network call is a lightweight license check for PRO users.
+Most AI coding tools (Copilot, Cursor, Codeium) send your code to external servers for processing. ContextEngine takes the opposite approach: **embeddings run locally on CPU**, search runs locally, and all persistent state stays in `~/.contextengine/` on your disk. Unless you turn SealHour on, the only network call is a lightweight license check for PRO users.
 
 ## License
 

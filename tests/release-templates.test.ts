@@ -52,6 +52,17 @@ describe.skipIf(!existsSync(TEMPLATES))("the public copy's workflow templates", 
     expect(behind).toEqual([]);
   });
 
+  // 2026-10-02, Node 24 plan phase 1b: the plan said this test kept the two CI files aligned, but
+  // it compared build steps only. The Node versions a release is tested on are part of the promise.
+  it("test on the same Node versions as this repo's CI", () => {
+    const nodes = (file: string) =>
+      /node-version:\s*\[([^\]]*)\]/.exec(readFileSync(file, "utf8"))?.[1].split(",").map((v) => v.trim()) ?? [];
+    const own = nodes(join(OWN, "ci.yml"));
+    // If this is empty the comparison below proves nothing: the matrix moved or changed shape.
+    expect(own.length).toBeGreaterThan(0);
+    expect(nodes(join(TEMPLATES, "public-ci.yml"))).toEqual(own);
+  });
+
   it("pin one version of each build step, here and in the templates", () => {
     const mixed: string[] = [];
     for (const [where, found] of [[OWN, pins(OWN)], [TEMPLATES, pins(TEMPLATES)]] as const) {

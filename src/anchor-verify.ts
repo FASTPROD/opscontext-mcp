@@ -1,6 +1,7 @@
 // `contextengine anchor verify` and `anchor export-evidence` (COMPR-TSA docs/SEALHOUR_PROTOCOL.md sections 2
-// and 7.3; workplan 2 Chantier 1, corrections 2 to 4): every checkpoint of this machine recomputed from its
-// own history, every stamp checked against the provider's pinned root, and the clock offset measured.
+// and 7; workplan 2 Chantier 1, corrections 2 to 4): every checkpoint of this machine recomputed from its
+// own history, every stamp checked against the provider's pinned root, every SealHour receipt and proof
+// checked under the pinned key and certificates (src/anchor-bundle.ts), and the clock offset measured.
 //
 // [LOCKED] [VERIFY-TRUSTS-ONLY-PINNED-ROOTS] - 2026-09-30
 // [NEVER] check a stamp against a certificate read from ~/.contextengine (anchors/certs/ is a convenience
@@ -12,12 +13,16 @@
 //      to a private temp folder for OpenSSL. Every check prints OK, NO or ??; NO fails the verification,
 //      ?? is said and never counted as a pass.
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { tmpdir } from "os";
+import { verifyMjs } from "./anchor-checker.js";
 import { checkWindows, type WindowCheck } from "./anchor-window.js";
 import { canonBytes, checkpointProblems, codeRoot, digestOf, ZERO, type CodeLeaf } from "./anchor-protocol.js";
 import { activeProviders, checkStamp, findOpenssl, parseTsr, PROVIDERS, type Provider } from "./anchor-tsa.js";
-import { listCheckpoints, type StoredCheckpoint } from "./anchor.js";
+import { backendOf, listCheckpoints, type StoredCheckpoint } from "./anchor.js";
+import { activeService, receiptKey, receiptRefusals, serviceName, RECEIPT_KEYS, STAMP_ANCHORS, publicKeyHex, type Service } from "./anchor-service.js";
+import { BUNDLE_NAME, checkBundle, readBundleDir } from "./anchor-bundle.js";
+import { cutoffOf, proofDir, readReceipt } from "./anchor-seal.js";
 
 /** A clock jump: two stamped checkpoints whose offsets differ by more than this. */
 export const CLOCK_JUMP_S = 300;
@@ -48,7 +53,9 @@ export interface CheckpointLine {
   window: { mark: Mark; detail: string };
   code: { mark: Mark; detail: string } | null;
   stamps: StampLine[];
-  /** Earliest first-try stamp time minus created_at, seconds. */
+  /** SealHour: the receipt, the place in the sealed hour, the hour's stamp, Bitcoin; empty for an interim checkpoint. */
+  seal: Array<{ mark: Mark; text: string }>;
+  /** Earliest first-try stamp time minus created_at, seconds (SealHour: its receipt's time minus created_at). */
   offsetS: number | null;
   flags: string[];
   /** Nothing in it says NO. */
@@ -120,6 +127,47 @@ function checkStampsOf(c: StoredCheckpoint, digest: string, rootsDir: string): S
   return out;
 }
 
+/**
+ * What SealHour says of one checkpoint, checked here: its receipt under the pinned key, its place in
+ * the sealed hour, the hour's stamp under a pinned certificate, Bitcoin as the proof states it.
+ * [LOCK] [A-SEAL-COUNTS-ONLY-UNDER-A-PINNED-CERTIFICATE] (src/anchor-bundle.ts)
+ */
+function sealLinesOf(c: StoredCheckpoint, digest: string, service: Service): { lines: Array<{ mark: Mark; text: string }>; included: boolean; stampedAt: string | null; receivedFirstTry: string | null } {
+  const who = serviceName(service);
+  const seal = c.meta.seal;
+  const out: Array<{ mark: Mark; text: string }> = [];
+  const customer = seal?.customer ?? undefined;
+  if (existsSync(proofDir(c))) {
+    const chk = checkBundle(proofDir(c), service, { digest, customer });
+    if (chk.checkpoint.mark !== "OK") out.push({ mark: chk.checkpoint.mark, text: `proof: ${chk.checkpoint.detail}` });
+    out.push({ mark: chk.receipt.mark, text: chk.receipt.detail });
+    out.push({ mark: chk.path.mark, text: chk.path.detail });
+    for (const s of chk.stamps) {
+      const at = s.time ? ` ${s.time.slice(0, 19).replace("T", " ")}Z` : "";
+      out.push({ mark: s.mark, text: s.mark === "OK" ? `hour stamped by ${s.name}:${at}${s.late ? " (asked late, after its hour)" : ""}` : `hour's stamp, ${s.name}:${at} ${s.detail}` });
+    }
+    if (chk.stamps.length === 0) out.push({ mark: "??", text: "the proof carries no time stamp of the hour yet" });
+    out.push({ mark: chk.bitcoin.state === "none" ? "--" : "??", text: `Bitcoin: ${chk.bitcoin.detail}` });
+    return { lines: out, included: chk.included, stampedAt: chk.stampedAt, receivedFirstTry: chk.included && seal?.first_try ? chk.receivedAt : null };
+  }
+  const receipt = readReceipt(c);
+  if (receipt) {
+    const problems = receiptRefusals(service, receipt, { digest, customer });
+    const r = receipt as { key_id?: unknown; received_at?: unknown; hour?: unknown };
+    if (problems.length > 0) out.push({ mark: receiptKey(service, r.key_id) ? "NO" : "??", text: `receipt: ${problems.join("; ")}` });
+    else out.push({ mark: "OK", text: `receipt signed by ${who} key ${String(r.key_id)}: received ${String(r.received_at).replace("T", " ")} for the hour ${String(r.hour)}` });
+    const first = problems.length === 0 && seal?.first_try ? String(r.received_at) : null;
+    if (seal?.state === "missed") out.push({ mark: "--", text: `not sealed: ${seal.error ?? `${who} missed its hour`}` });
+    else {
+      const at = typeof r.hour === "string" && /^\d{4}-\d\d-\d\dT\d\dZ$/.test(r.hour) ? cutoffOf(r.hour).toISOString().slice(0, 16).replace("T", " ") + "Z" : "the next minute 2";
+      out.push({ mark: "--", text: `not sealed yet: its hour is sealed at ${at}${seal?.error ? ` (${seal.error})` : seal?.waiting ? ` (${who}: ${seal.waiting})` : ""}; the proof is fetched by the hourly job` });
+    }
+    return { lines: out, included: false, stampedAt: null, receivedFirstTry: first };
+  }
+  out.push({ mark: "--", text: seal?.state === "refused" ? `not sealed: ${seal.error ?? `${who} refused it`}` : `not received by ${who} yet${seal?.error ? `: ${seal.error}` : ""}` });
+  return { lines: out, included: false, stampedAt: null, receivedFirstTry: null };
+}
+
 const sign = (s: number) => `${s >= 0 ? "+" : "-"}${Math.abs(s) < 120 ? `${Math.abs(s)} s` : Math.abs(s) < 7200 ? `${Math.round(Math.abs(s) / 60)} min` : `${(Math.abs(s) / 3600).toFixed(1)} h`}`;
 
 /** Verify every checkpoint kept on this machine. [LOCK] [VERIFY-TRUSTS-ONLY-PINNED-ROOTS] */
@@ -131,6 +179,10 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
     const windows = checkWindows(all.map((c) => ({ id: c.name, created_at: c.checkpoint.created_at, ...c.checkpoint.records })), { waitMs: o.waitMs });
     const lines: CheckpointLine[] = [];
     let prev: { digest: string; head: string; seq: number } | null = null;
+    let svc: Service | null = null;
+    const service = (): Service => (svc ??= activeService());
+    /** When each sealed checkpoint's hour was stamped, for the ones a later seal dates. */
+    const dates = new Map<number, string>();
     const prevDigests = new Map<string, string>();
     let lastOffset: number | null = null;
     for (const c of all) {
@@ -165,7 +217,9 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
 
       const stamps = checkStampsOf(c, digest, rootsDir);
       const flags: string[] = [];
+      const sealed = backendOf(c) === "sealhour" ? sealLinesOf(c, digest, service()) : null;
       const first = stamps.filter((s) => s.mark === "OK" && !s.late && s.time).map((s) => Math.round((Date.parse(s.time!) - Date.parse(cp.created_at)) / 1000));
+      if (sealed?.receivedFirstTry) first.push(Math.round((Date.parse(sealed.receivedFirstTry) - Date.parse(cp.created_at)) / 1000));
       const offsetS = first.length > 0 ? Math.min(...first) : null;
       if (offsetS !== null && lastOffset !== null && Math.abs(offsetS - lastOffset) > CLOCK_JUMP_S) {
         flags.push(`the clock jumped by ${sign(offsetS - lastOffset)} since the previous stamped checkpoint`);
@@ -175,13 +229,14 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
       const late = stamps.filter((s) => s.mark === "OK" && s.late && s.time);
       for (const s of late) flags.push(`${s.name} stamped it ${sign(Math.round((Date.parse(s.time!) - Date.parse(cp.created_at)) / 1000)).slice(1)} after it was made (the services were away)`);
 
-      const marks = [shape.mark, chain.mark, window.mark, code?.mark, ...stamps.map((s) => s.mark)];
-      const stampedOk = stamps.some((s) => s.mark === "OK");
+      const marks = [shape.mark, chain.mark, window.mark, code?.mark, ...stamps.map((s) => s.mark), ...(sealed?.lines.map((l) => l.mark) ?? [])];
+      const stampedOk = stamps.some((s) => s.mark === "OK") || !!sealed?.stampedAt;
+      if (sealed?.stampedAt) dates.set(c.seq, sealed.stampedAt);
       lines.push({
         seq: c.seq, name: c.name, created_at: cp.created_at, count: cp.records.count, repos: cp.code?.repos ?? null, digest,
-        shape, chain, window, code, stamps, offsetS, flags,
+        shape, chain, window, code, stamps, seal: sealed?.lines ?? [], offsetS, flags,
         holds: !marks.includes("NO"),
-        stamped: stampedOk || stamps.some((s) => s.mark === "??" && s.time !== null),
+        stamped: stampedOk || stamps.some((s) => s.mark === "??" && s.time !== null) || !!sealed?.included,
         stampChecked: stampedOk,
         coveredBy: null,
       });
@@ -194,9 +249,9 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
       for (let j = i + 1; j < lines.length; j++) {
         if (lines[j].chain.mark !== "OK") break;
         if (lines[j].stampChecked) {
-          const t = lines[j].stamps.filter((x) => x.mark === "OK" && x.time).map((x) => x.time!).sort()[0] ?? null;
+          const t = dates.get(lines[j].seq) ?? lines[j].stamps.filter((x) => x.mark === "OK" && x.time).map((x) => x.time!).sort()[0] ?? null;
           lines[i].coveredBy = { seq: lines[j].seq, time: t };
-          lines[i].flags.push(`no checked stamp of its own: dated through the chain by #${lines[j].seq}'s stamp${t ? ` of ${t.slice(0, 19).replace("T", " ")}Z` : ""}, a later date`);
+          lines[i].flags.push(`no checked stamp of its own: dated through the chain by #${lines[j].seq}'s ${dates.has(lines[j].seq) ? "seal" : "stamp"}${t ? ` of ${t.slice(0, 19).replace("T", " ")}Z` : ""}, a later date`);
           break;
         }
       }
@@ -212,9 +267,10 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
     const unstamped = lines.filter((l) => !l.stamped && !l.coveredBy).length;
     const through = lines.filter((l) => !l.stampChecked && l.coveredBy).length;
     const uncheckable = lines.filter((l) => l.stamped && !l.stampChecked && !l.coveredBy).length;
+    const sealedN = lines.filter((l) => dates.has(l.seq)).length;
     const summary = lines.length === 0
       ? "no checkpoint on this machine yet"
-      : `${lines.filter((l) => l.holds).length} of ${lines.length} checkpoint(s) hold; ${lines.filter((l) => l.stampChecked).length} stamped and checked` +
+      : `${lines.filter((l) => l.holds).length} of ${lines.length} checkpoint(s) hold; ${sealedN ? `${sealedN} sealed, their hour's stamp checked; ` : ""}${lines.filter((l) => l.stampChecked).length - sealedN} stamped and checked` +
         `${through ? `, ${through} dated through a later stamp` : ""}${uncheckable ? `, ${uncheckable} stamped but not checkable here` : ""}${unstamped ? `, ${unstamped} not stamped` : ""}`;
     return { lines, unlocked: windows.unlocked, restored: windows.restored, clock, holds, unstamped, summary };
   } finally {
@@ -224,7 +280,10 @@ export function verifyAnchors(o: { waitMs?: number } = {}): VerifyReport {
 
 export function formatVerify(r: VerifyReport, o: { offline?: boolean } = {}): string {
   const out: string[] = [];
-  out.push(`SealHour interim: verifying ${r.lines.length} checkpoint(s) kept on this machine${o.offline ? " (offline)" : ""}; everything below is checked here, against this machine's audit log and the services' pinned roots`);
+  const anySeal = r.lines.some((l) => l.seal.length > 0);
+  out.push(anySeal
+    ? `SealHour: verifying ${r.lines.length} checkpoint(s) kept on this machine${o.offline ? " (offline)" : ""}; everything below is checked here, against this machine's audit log, SealHour's pinned receipt key and the pinned certificates of the time stamp services`
+    : `SealHour interim: verifying ${r.lines.length} checkpoint(s) kept on this machine${o.offline ? " (offline)" : ""}; everything below is checked here, against this machine's audit log and the services' pinned roots`);
   const ssl = findOpenssl();
   out.push(`  stamps checked with: ${ssl ? `${ssl.version}${ssl.libressl ? " (LibreSSL: some stamps cannot be checked with it)" : ""}` : "OpenSSL not found: the stamps cannot be checked on this machine"}`);
   if (r.unlocked) out.push("  (read while a rotation of the audit log held its lock: if a window does not match, run verify again)");
@@ -239,7 +298,8 @@ export function formatVerify(r: VerifyReport, o: { offline?: boolean } = {}): st
       const off = s.mark === "OK" && !s.late && s.time ? ` (${sign(Math.round((Date.parse(s.time) - Date.parse(l.created_at)) / 1000))})` : "";
       out.push(`      [${s.mark}] stamp ${s.name}:${when}${off}${s.mark === "OK" ? "" : ` ${s.detail}`}`);
     }
-    if (!l.stamped && !l.coveredBy) out.push("      not stamped: no service has stamped this checkpoint yet");
+    for (const x of l.seal) out.push(`      [${x.mark}] ${x.text}`);
+    if (!l.stamped && !l.coveredBy && l.seal.length === 0) out.push("      not stamped: no service has stamped this checkpoint yet");
     for (const f of l.flags) out.push(`      note: ${f}`);
   }
   out.push(`  Clock: ${r.clock}`);
@@ -256,27 +316,48 @@ function parseBound(s: string, end: boolean): number {
   return t;
 }
 
+/** The checkpoints made between `from` and `to` (dates or ISO times, UTC). */
+export function checkpointsBetween(from: string, to: string): StoredCheckpoint[] {
+  const a = parseBound(from, false);
+  const b = parseBound(to, true);
+  return listCheckpoints().filter((c) => {
+    const t = Date.parse(c.checkpoint.created_at);
+    return t >= a && t <= b;
+  });
+}
+
 /**
  * Write the checkpoints made between `from` and `to` (dates or ISO times, UTC), their stamps, the pinned
  * roots, a README in English and in French, and verify.mjs, a checker that needs only Node and OpenSSL.
- * The code leaves stay on this machine. Never writes into a folder that exists.
+ * A sealed checkpoint's folder is its proof exactly as SealHour served it (the contract's names only):
+ * SealHour's free checker reads that folder as it is. The code leaves stay on this machine. Never
+ * writes into a folder that exists.
  */
-export function exportEvidence(o: { from: string; to: string; out: string }): { dir: string; count: number } {
-  const from = parseBound(o.from, false);
-  const to = parseBound(o.to, true);
-  const picked = listCheckpoints().filter((c) => {
-    const t = Date.parse(c.checkpoint.created_at);
-    return t >= from && t <= to;
-  });
+export function exportEvidence(o: { from: string; to: string; out: string }): { dir: string; count: number; sealed: number; pendingBitcoin: number } {
+  const picked = checkpointsBetween(o.from, o.to);
   if (picked.length === 0) throw new Error(`no checkpoint made between ${o.from} and ${o.to}`);
   if (existsSync(o.out)) throw new Error(`${o.out} exists: choose a new folder (nothing is ever written over)`);
   mkdirSync(join(o.out, "checkpoints"), { recursive: true });
   mkdirSync(join(o.out, "certs"));
   const used = new Set<string>();
+  let sealed = 0;
+  let pendingBitcoin = 0;
   for (const c of picked) {
     const to2 = join(o.out, "checkpoints", c.name);
     mkdirSync(to2);
+    if (backendOf(c) === "sealhour" && existsSync(proofDir(c))) {
+      // [LOCK] [A-BUNDLE-WRITES-ONLY-THE-CONTRACT-S-NAMES]: readBundleDir() hands back those names only.
+      for (const [name, data] of readBundleDir(proofDir(c))) {
+        if (!BUNDLE_NAME.test(name)) continue;
+        mkdirSync(dirname(join(to2, name)), { recursive: true });
+        writeFileSync(join(to2, name), data);
+      }
+      sealed++;
+      if (c.meta.seal?.bitcoin === "pending") pendingBitcoin++;
+      continue;
+    }
     copyFileSync(join(c.dir, "checkpoint.json"), join(to2, "checkpoint.json"));
+    if (existsSync(join(c.dir, "receipt.json"))) copyFileSync(join(c.dir, "receipt.json"), join(to2, "receipt.json"));
     const stamps: Record<string, { name: string; ca_file: string; time: string | null; first_try: boolean }> = {};
     for (const f of readdirSync(c.dir).filter((x) => /^checkpoint\.[a-z0-9-]+\.tsr$/.test(x))) {
       const id = f.split(".")[1];
@@ -291,10 +372,12 @@ export function exportEvidence(o: { from: string; to: string; out: string }): { 
     writeFileSync(join(to2, "stamps.json"), JSON.stringify(stamps, null, 2) + "\n");
   }
   for (const id of used) writeFileSync(join(o.out, "certs", `${id}-ca.pem`), pinnedRoot(id)!.caPem);
-  writeFileSync(join(o.out, "README.txt"), README_EN);
-  writeFileSync(join(o.out, "LISEZMOI.txt"), README_FR);
-  writeFileSync(join(o.out, "verify.mjs"), VERIFY_MJS);
-  return { dir: o.out, count: picked.length };
+  writeFileSync(join(o.out, "README.txt"), sealed > 0 ? README_SEALED_EN : README_EN);
+  writeFileSync(join(o.out, "LISEZMOI.txt"), sealed > 0 ? README_SEALED_FR : README_FR);
+  // The checker knows the pinned key and certificates, never a test stand-in's: a proof made against a
+  // stand-in shows [??] outside --trust-folder. [LOCK] [A-RECEIPT-COUNTS-ONLY-UNDER-A-PINNED-KEY]
+  writeFileSync(join(o.out, "verify.mjs"), verifyMjs({ keys: Object.fromEntries(RECEIPT_KEYS.map((k) => [k.id, publicKeyHex(k.pem)])), anchors: STAMP_ANCHORS }));
+  return { dir: o.out, count: picked.length, sealed, pendingBitcoin };
 }
 
 const README_EN = `OpsContext checkpoints and their time stamps (SealHour, interim mode)
@@ -360,91 +443,86 @@ Limites
   qui ne peut pas tourner s'affiche [??], jamais [OK].
 `;
 
-/** The standalone checker written into every export. Plain Node, no dependency; the same rules as
- *  src/anchor-protocol.ts ([LOCK] [SEALHOUR-PROTOCOL-V1-BYTES]) and the fixture's check.mjs. */
-export const VERIFY_MJS = `// verify.mjs: checks a folder of OpsContext checkpoints and their time stamps, offline, without OpsContext.
-//   node verify.mjs <folder> [<audit log, one JSON record per line>]
-// The rules are those of SealHour protocol version 1: canonical JSON (keys sorted, no spaces, UTF-8,
-// integers only), SHA-256, RFC 6962 tree with leaf = SHA-256(0x00 || JSON) and node = SHA-256(0x01 || l || r).
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+const README_SEALED_EN = `OpsContext checkpoints sealed by SealHour
 
-const ZERO = "0".repeat(64);
-const HEX = /^[0-9a-f]{64}$/;
-const [dir = ".", log] = process.argv.slice(2);
-function canon(v) {
-  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
-  if (v !== null && typeof v === "object")
-    return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
-  if (typeof v === "number" && !Number.isSafeInteger(v)) throw new Error("not an integer: " + v);
-  return JSON.stringify(v);
-}
-const sha = (...b) => createHash("sha256").update(Buffer.concat(b)).digest();
-const leaf = (o) => sha(Buffer.from([0]), Buffer.from(canon(o), "utf8"));
-const node = (l, r) => sha(Buffer.from([1]), l, r);
-const split = (n) => { let k = 1; while (k * 2 < n) k *= 2; return k; };
-const mth = (h) => (h.length === 1 ? h[0] : node(mth(h.slice(0, split(h.length))), mth(h.slice(split(h.length)))));
-const ssl = process.env.OPENSSL || "openssl";
-const hashes = log
-  ? readFileSync(log, "utf8").split("\\n").map((l) => { try { const r = JSON.parse(l); return HEX.test(r && r.hash) ? r.hash : null; } catch { return null; } }).filter(Boolean)
-  : null;
+What this folder is
+  Each folder under checkpoints/ holds one checkpoint of an OpsContext audit log: a few SHA-256
+  fingerprints of the log's records (records_root covers every record of its window, one leaf per
+  record), their number, the time on the owner's machine, and, when the owner said yes, one fingerprint
+  for all the workspace repositories. Each checkpoint names the one before it, so they form a chain.
+  A folder that holds leaf.json is a proof as SealHour served it: the checkpoint, SealHour's signed
+  receipt for it, its place in the hour SealHour sealed (leaf.json, path.json, root.bin), the time stamp
+  of that hour by an official European provider (root.<name>.tsr; stamps.json names the provider) and
+  its Bitcoin attestation (root.bin.ots). Its own README.txt says how to check it by hand.
+  A folder without leaf.json is a checkpoint with no seal of its own (stamped directly by a free public
+  service in interim mode, or not sealed yet): the next sealed checkpoint names it through the chain
+  and dates it, at that later date.
 
-const blocks = [];
-let out = null;
-const say = (ok, text) => { out.push("  [" + (ok === true ? "OK" : ok === false ? "NO" : "??") + "] " + text); return ok; };
-let prev = null;
-let fails = 0;
-let pending = []; // checkpoints with no checked stamp of their own, since the last one with one
-const names = readdirSync(join(dir, "checkpoints")).filter((n) => /^\\d{6}-[0-9a-f]{12}$/.test(n)).sort();
-for (const n of names) {
-  const d = join(dir, "checkpoints", n);
-  out = [n];
-  blocks.push(out);
-  const cp = JSON.parse(readFileSync(join(d, "checkpoint.json"), "utf8"));
-  const digest = sha(Buffer.from(canon(cp), "utf8")).toString("hex");
-  if (say(n.endsWith(digest.slice(0, 12)), "checkpoint digest " + digest) === false) fails++;
-  const chain = prev === null
-    ? (cp.prev_checkpoint_digest === ZERO ? true : null)
-    : cp.prev_checkpoint_digest === prev.digest && cp.records.from_hash === prev.head;
-  if (say(chain, prev === null ? (chain ? "first of the chain" : "the checkpoint before it is not in this folder") : "chains to the one before it") === false) fails++;
-  if (chain !== true) pending = []; // a broken or unknown link: nothing later dates what came before it
-  if (hashes) {
-    const r = cp.records;
-    let ok = false;
-    const starts = r.from_hash === ZERO ? [0] : hashes.map((h, i) => (h === r.from_hash ? i + 1 : -1)).filter((i) => i > 0);
-    for (const s of starts) {
-      const w = hashes.slice(s, s + r.count);
-      if (w.length === r.count && w[w.length - 1] === r.head_hash && mth(w.map((h) => leaf({ kind: "record", hash: h }))).toString("hex") === r.records_root) ok = true;
-    }
-    if (say(ok, "records_root recomputed from the log (" + r.count + " records)") === false) fails++;
-  }
-  const stamps = existsSync(join(d, "stamps.json")) ? JSON.parse(readFileSync(join(d, "stamps.json"), "utf8")) : {};
-  let first = null;
-  for (const f of readdirSync(d).filter((x) => /^checkpoint\\.[a-z0-9-]+\\.tsr$/.test(x)).sort()) {
-    const id = f.split(".")[1];
-    const s = stamps[id] || {};
-    const ca = join(dir, s.ca_file || "certs/" + id + "-ca.pem");
-    const args = ["ts", "-verify", "-digest", digest, "-in", join(d, f), "-CAfile", ca];
-    if (s.time) args.push("-attime", String(Math.floor(Date.parse(s.time) / 1000)));
-    const p = spawnSync(ssl, args, { encoding: "utf8" });
-    const ok = p.error ? null : p.status === 0 && /Verification: OK/.test(p.stdout);
-    if (ok && (!first || (s.time && s.time < first))) first = s.time || "a stamp without a time";
-    if (say(ok, "stamp " + (s.name || id) + (s.time ? " " + s.time : "") + (p.error ? ": openssl not found" : "")) === false) fails++;
-  }
-  if (first) {
-    for (const b of pending) b.push("  [OK] no checked stamp of its own: dated through the chain by " + n + " (" + first + "), a later date");
-    pending = [];
-  } else {
-    pending.push(out);
-  }
-  prev = { digest, head: cp.records.head_hash };
-}
-for (const b of pending) b.push("  not stamped by a service this folder can check");
-console.log(dir);
-for (const b of blocks) for (const l of b) console.log(l);
-const holds = names.length > 0 && fails === 0;
-console.log("Result: " + names.length + " checkpoint(s), " + (holds ? "the rule holds" : "the rule does NOT hold") + (pending.length ? ", " + pending.length + " not stamped" : "") + ".");
-process.exit(holds ? 0 : 1);
+What it proves
+  That each sealed checkpoint existed no later than its hour's stamp. A date, not ownership. The
+  official stamp is of the hour; the checkpoint is included in the stamped hour, verifiable by anyone.
+  With the owner's audit log, anyone can recompute records_root and see that the records it covers are
+  the ones that existed then: the log is tamper-evident, with an outside time stamp.
+
+How to check it, offline, without OpsContext and without SealHour
+  SealHour's free checker, one file (Python 3.9 or later, OpenSSL 3), one proof folder at a time:
+      python3 sealhour_verify.py checkpoints/<a folder that holds leaf.json>
+    The file is at https://sealhour.com/sealhour_verify.py and the keys it knows are listed at
+    https://sealhour.com/keys/ . Exit code 0: the proof holds; 1: it does not; 2: nothing is wrong,
+    but no date was checked. It also checks the Bitcoin attestation (it asks public block explorers
+    for one block, unless --offline).
+  This folder's own checker (Node 18 or later, OpenSSL 3), for the whole folder and the chain:
+      node verify.mjs .                 the checkpoints, their chain, every receipt, path and stamp
+      node verify.mjs . audit.jsonl     the same, and each records_root recomputed from the owner's log
+                                        (one JSON record per line, in the log's order, from
+                                        "contextengine audit-export --format jsonl")
+
+Limits
+  The Bitcoin attestation comes hours after the seal: a proof exported before says it is pending;
+  "contextengine anchor export-evidence --refresh" fetches the complete one. A checkpoint made while
+  part of the log was missing matches the log without the part put back later; the owner's
+  "contextengine anchor verify" checks both readings. A stamp proves the time of the fingerprint, not
+  who wrote the records. A check that cannot run is printed [??], never [OK].
+`;
+
+const README_SEALED_FR = `Relevés OpsContext scellés par SealHour
+
+Ce dossier
+  Chaque dossier sous checkpoints/ contient un relevé du journal d'audit OpsContext : quelques empreintes
+  SHA-256 des enregistrements (records_root couvre chaque enregistrement de sa fenêtre, une feuille par
+  enregistrement), leur nombre, l'heure de la machine et, si le propriétaire l'a accepté, une empreinte
+  pour tous les dépôts de ses espaces de travail. Chaque relevé nomme le précédent : ils forment une chaîne.
+  Un dossier qui contient leaf.json est une preuve telle que SealHour l'a servie : le relevé, le reçu
+  signé de SealHour, sa place dans l'heure que SealHour a scellée (leaf.json, path.json, root.bin), le
+  tampon de cette heure par un prestataire officiel européen (root.<nom>.tsr ; stamps.json nomme le
+  prestataire) et son inscription dans Bitcoin (root.bin.ots). Son propre LISEZMOI.txt dit comment la
+  vérifier à la main.
+  Un dossier sans leaf.json est un relevé sans sceau à lui (tamponné directement par un service public
+  gratuit en mode intérimaire, ou pas encore scellé) : le relevé scellé suivant le nomme par la chaîne
+  et le date, à cette date plus tardive.
+
+Ce que cela prouve
+  Que chaque relevé scellé existait au plus tard à l'heure du tampon de son heure. Une date, pas une
+  propriété. Le tampon officiel porte sur l'heure ; le relevé est inclus dans l'heure tamponnée, ce que
+  chacun peut vérifier. Avec le journal du propriétaire, chacun peut recalculer records_root et constater
+  que les enregistrements couverts sont bien ceux qui existaient alors.
+
+Vérifier, hors ligne, sans OpsContext et sans SealHour
+  Le vérificateur gratuit de SealHour, un seul fichier (Python 3.9 ou plus, OpenSSL 3), un dossier de
+  preuve à la fois :
+      python3 sealhour_verify.py checkpoints/<un dossier qui contient leaf.json>
+    Le fichier est à https://sealhour.com/sealhour_verify.py et les clés qu'il connaît sont listées à
+    https://sealhour.com/keys/ . Code de sortie 0 : la preuve tient ; 1 : elle ne tient pas ; 2 : rien
+    de faux, mais aucune date n'a été vérifiée. Il vérifie aussi l'inscription dans Bitcoin (il demande
+    un bloc à des explorateurs publics, sauf avec --offline).
+  Le vérificateur de ce dossier (Node 18 ou plus, OpenSSL 3), pour tout le dossier et la chaîne :
+      node verify.mjs .                 les relevés, leur chaîne, chaque reçu, chemin et tampon
+      node verify.mjs . audit.jsonl     idem, plus records_root recalculé depuis le journal du propriétaire
+
+Limites
+  L'inscription dans Bitcoin arrive des heures après le sceau : une preuve exportée avant le dit ;
+  "contextengine anchor export-evidence --refresh" va chercher la preuve complète. Un relevé fait pendant
+  qu'une partie du journal manquait correspond au journal sans la partie remise ensuite ;
+  "contextengine anchor verify" chez le propriétaire essaie les deux lectures. Une vérification qui ne
+  peut pas tourner s'affiche [??], jamais [OK].
 `;

@@ -2107,6 +2107,19 @@ async function cliAuditVerify(): Promise<void> {
     for (const a of acks.slice(0, 10)) log(`     ${a.ts.slice(0, 19).replace("T", " ")}Z  ${a.actor}  ${a.records} record(s)  "${a.reason.slice(0, 80)}"`);
     if (acks.length > 10) log(`     … (+${acks.length - 10} more)`);
   };
+  // SealHour: what dates this chain from outside, in the words every other surface uses (plan section 6,
+  // step 3). The check above reads this machine only; whoever can rewrite the log can rewrite its check.
+  // [LOCK] [NOT-SEALED-IS-NEVER-CALLED-SEALED] (src/anchor-seal.ts)
+  const sealNote = async (log: (s: string) => void): Promise<void> => {
+    try {
+      const { anchorHealth } = await import("./anchor.js");
+      const a = anchorHealth();
+      log(`\n${a.line}`);
+      if (a.enabled) log(`   The check above reads this machine only; that line is its outside date. 'contextengine anchor verify' checks every checkpoint against the log.`);
+    } catch (err) {
+      log(`\nSealHour: status could not be read (${(err as Error).message})`);
+    }
+  };
   if (report.ok) {
     console.log(`✅ Audit chain verified — ${report.total - dups.length} record(s).`);
     console.log(redacted.length === 0
@@ -2133,6 +2146,7 @@ async function cliAuditVerify(): Promise<void> {
       console.log(`   the evidence it exists to provide.`);
     }
     copiesNote();
+    await sealNote((x) => console.log(x));
     return;
   }
 
@@ -2174,6 +2188,7 @@ async function cliAuditVerify(): Promise<void> {
   if (dups.length > 0) {
     console.error(`\n   (Also ${dups.length} second copies of records, counted once, benign.)`);
   }
+  await sealNote((x) => console.error(x));
   console.error(`\nFor compliance-graded evidence, treat the affected records as unverified.`);
   process.exit(2);
 }

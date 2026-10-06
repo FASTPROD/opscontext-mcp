@@ -202,6 +202,74 @@ function waitForPort(timeoutSec: number = 30): boolean | null {
   return false;
 }
 
+// [LOCKED] [AUTOSTART-WAITS-FOR-LAUNCHD] 2026-10-02
+// [NEVER] bootstrap right after bootout, or call the install a success because something listens
+//         on the port.
+// WHY: 2026-10-02, moving the agent to Node 24 with `install-autostart --force`, the use its own
+//      help names: `launchctl bootout` returned while launchd was still removing the old agent, the
+//      bootstrap right after it failed ("Bootstrap failed: 5: Input/output error"), and the Mac was
+//      left with no agent. A chat server took over the index and the port, so nothing looked wrong,
+//      and the old success test, "something listens on 7842", passes with that chat server too: an
+//      agent that crashes at start was reported as running.
+// FIX: after bootout, wait until launchd no longer knows the label, and start nothing if it still
+//      does; success means launchd reports the job running and never exited, and its pid is the
+//      one listening on 7842. A chat server hands the port over within seconds once it sees the
+//      agent, so a slow handover is a warning; an agent that exited is a failure.
+// OPSCONTEXT_AUTOSTART_WAIT_SECONDS shortens the waits, for the tests only.
+// launchd sends SIGKILL 20 s after SIGTERM by default (ExitTimeOut), so 30 s covers a slow exit.
+const WAIT_SECONDS = Number(process.env.OPSCONTEXT_AUTOSTART_WAIT_SECONDS) || 30;
+
+interface JobState {
+  running: boolean;
+  pid: number | null;
+  /** "(never exited)" for a job that has not stopped since it was loaded. */
+  lastExit: string | null;
+}
+
+/** What launchd says about the agent: its state, or "gone" once launchd no longer knows the label,
+ *  or null when launchctl could not answer at all. [LOCK] [EXEC-FAILURE-IS-NOT-EMPTY] */
+function jobState(uid: number): JobState | "gone" | null {
+  try {
+    const out = execFileSync("launchctl", ["print", `gui/${uid}/${LABEL}`], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    // An answer without a state line is one this code cannot read: say so, never guess.
+    if (!/^\s*state = /m.test(out)) return null;
+    // The job's own lines come first; nested sections indent theirs further and are not read.
+    const pid = /^\s*pid = (\d+)/m.exec(out)?.[1];
+    return {
+      running: /^\s*state = running\b/m.test(out),
+      pid: pid ? Number(pid) : null,
+      lastExit: /^\s*last exit code = (.+)$/m.exec(out)?.[1].trim() ?? null,
+    };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { status?: number | null };
+    if (e.code === "ENOENT") return null; // no launchctl
+    return e.status === 113 ? "gone" : null; // 113: "Could not find service"
+  }
+}
+
+/** The pids listening on PORT: [] for none, null when lsof could not tell. */
+function portHolders(): number[] | null {
+  try {
+    const out = execFileSync("lsof", ["-nP", "-t", `-iTCP:${PORT}`, "-sTCP:LISTEN"], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    return out.split("\n").map((s) => Number(s.trim())).filter((n) => n > 0);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { status?: number | null; stderr?: string | Buffer };
+    if (e.code === "ENOENT") return null;
+    const said = e.stderr ? String(e.stderr).trim() : "";
+    return e.status === 1 && !said ? [] : null;
+  }
+}
+
+/** Polls every quarter second until check() says done, or the time is up (then the last value). */
+function pollFor<T>(seconds: number, check: () => { done: boolean; value: T }): T {
+  const end = Date.now() + seconds * 1000;
+  for (;;) {
+    const r = check();
+    if (r.done || Date.now() >= end) return r.value;
+    execFileSync("sleep", ["0.25"]);
+  }
+}
+
 /* eslint-disable no-console -- the three commands below print their report on stdout, CLI only.
    The helpers above stay under the rule, in case the MCP server ever imports one: its stdout is
    the protocol (CLAUDE.md rule 5). */
@@ -303,12 +371,23 @@ To view server logs:        tail -f ~/.contextengine/logs/mcp-stderr.log
     process.exit(1);
   }
 
-  // Idempotent bootstrap: bootout (ignore failure) → bootstrap
+  // Idempotent bootstrap: bootout (ignore failure), wait until launchd has let go, then bootstrap.
+  // [LOCK] [AUTOSTART-WAITS-FOR-LAUNCHD]
   const uid = userId();
   try {
     execFileSync("launchctl", ["bootout", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
   } catch {
     /* not loaded — fine */
+  }
+  const released = pollFor(WAIT_SECONDS, () => {
+    const s = jobState(uid);
+    return { done: s === "gone" || s === null, value: s };
+  });
+  if (released !== "gone" && released !== null) {
+    console.error(`❌ launchd was still removing the previous agent after ${WAIT_SECONDS} s, so the new one was not started.`);
+    console.error(`   The new plist is written. In a few seconds, start it by hand:`);
+    console.error(`     launchctl bootstrap gui/${uid} "${PLIST_FILE}"`);
+    process.exit(1);
   }
   try {
     execFileSync("launchctl", ["bootstrap", `gui/${uid}`, PLIST_FILE], { stdio: "inherit" });
@@ -317,7 +396,45 @@ To view server logs:        tail -f ~/.contextengine/logs/mcp-stderr.log
     process.exit(1);
   }
 
-  console.log(`   waiting for the server to bind port ${PORT}...`);
+  console.log(`   waiting for launchd to start it and for it to take port ${PORT}...`);
+  type Started =
+    | { kind: "no-launchctl" }
+    | { kind: "not-started" }
+    | { kind: "exited"; lastExit: string }
+    | { kind: "running"; pid: number; holders: number[] | null };
+  const started = pollFor<Started>(WAIT_SECONDS, () => {
+    const s = jobState(uid);
+    if (s === null) return { done: true, value: { kind: "no-launchctl" } };
+    if (s !== "gone" && s.lastExit && s.lastExit !== "(never exited)") return { done: true, value: { kind: "exited", lastExit: s.lastExit } };
+    if (s === "gone" || !s.running || !s.pid) return { done: false, value: { kind: "not-started" } };
+    const holders = portHolders();
+    return { done: holders === null || holders.includes(s.pid), value: { kind: "running", pid: s.pid, holders } };
+  });
+  if (started.kind === "exited") {
+    console.error(`❌ launchd started the agent and it exited (last exit code ${started.lastExit}).`);
+    console.error(`   Check the logs: tail -50 ~/.contextengine/logs/mcp-stderr.log`);
+    process.exit(1);
+  }
+  if (started.kind === "not-started") {
+    console.error(`❌ launchd did not report the agent running within ${WAIT_SECONDS} s.`);
+    console.error(`   Check: launchctl print gui/${uid}/${LABEL}, and tail -50 ~/.contextengine/logs/mcp-stderr.log`);
+    process.exit(1);
+  }
+  if (started.kind === "running") {
+    if (started.holders !== null && started.holders.includes(started.pid)) {
+      console.log(`✅ OpsContext is now running as a LaunchAgent (pid ${started.pid}, holds port ${PORT}; started at every login).`);
+      console.log(``);
+      console.log(`Verify:      curl -s http://127.0.0.1:${PORT}/health | jq .`);
+      console.log(`Logs:        tail -f ~/.contextengine/logs/mcp-stderr.log`);
+      console.log(`Stop:        opscontext uninstall-autostart`);
+    } else {
+      const who = started.holders === null ? "could not be checked (no working lsof here)" : started.holders.length ? `is still held by pid ${started.holders.join(", pid ")}` : "is not bound yet";
+      console.log(`⚠️ launchd runs the agent (pid ${started.pid}), but port ${PORT} ${who}.`);
+      console.log(`   A chat's server hands the port over once it sees the agent. Check in a minute: opscontext autostart-status`);
+    }
+    return;
+  }
+  // launchctl could not answer: fall back to the port alone.
   const bound = waitForPort(30);
   if (bound === null) {
     console.error(`⚠️ Loaded, but this machine has no working lsof, so whether the server bound port ${PORT} could not be checked.`);
