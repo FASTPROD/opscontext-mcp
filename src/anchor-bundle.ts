@@ -27,7 +27,7 @@
 //      shown with the fingerprint and marked ??, never OK. OpenSSL checks the stamp over root.bin at the
 //      stamp's own time. A check that cannot run is ??, a check that fails is NO, and only a bundle with
 //      no NO in its checkpoint, path and receipt lines is kept as this checkpoint's proof.
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { basename, dirname, join } from "path";
 import { digestOf, leafHash, rootFromPath } from "./anchor-protocol.js";
 import { checkStamp, parseTsr } from "./anchor-tsa.js";
@@ -68,6 +68,8 @@ export function bundleFiles(bundle: unknown): Map<string, Buffer> {
 /**
  * Write a bundle's files as the folder `dir`, replacing a proof already there in one move: the files go
  * to a new folder beside it first. Only names bundleFiles() let through reach this function.
+ * A file whose bytes are those of the proof already there keeps that file's time: the copy off the
+ * machine judges by size and time. [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] (src/anchor.ts)
  */
 export function writeBundle(files: Map<string, Buffer>, dir: string): void {
   const tmp = join(dirname(dir), `.tmp-${basename(dir)}-${process.pid}`);
@@ -78,6 +80,11 @@ export function writeBundle(files: Map<string, Buffer>, dir: string): void {
     const to = join(tmp, name);
     mkdirSync(dirname(to), { recursive: true });
     writeFileSync(to, data);
+    const was = join(dir, name);
+    try {
+      // Rounded down to the millisecond: the kept time is never later than the one it had.
+      if (readFileSync(was).equals(data)) { const s = statSync(was); utimesSync(to, new Date(Math.floor(s.atimeMs)), new Date(Math.floor(s.mtimeMs))); }
+    } catch { /* no such file in the proof kept so far: this one is new, and carries the time of now */ }
   }
   const old = `${tmp}.old`;
   rmSync(old, { recursive: true, force: true });

@@ -2,7 +2,7 @@
 // [LOCK] [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD] [LOCK] [NOT-STAMPED-IS-NEVER-CALLED-STAMPED] (src/anchor.ts)
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createHash } from "crypto";
@@ -341,15 +341,56 @@ describe.skipIf(!haveOpenssl)("the hourly job", () => {
       const second = listCheckpoints()[1];
       expect(readdirSync(join(dest, "checkpoints", second.name))).toContain("stamps.json");
       expect(anchorHealth(at(H2, 13)).line).toMatch(/copied off this machine 1 min ago$/);
-      // A file that did change is still copied, so a copy that cannot take it is still a failed copy.
+      // A file that did change replaces its copy: removed there, then written as a new file, never
+      // written into. On 2026-10-12 Google Drive refused the job any write into a file it had moved to
+      // the cloud, and let the same job remove such a file and create one.
+      const cert = join(anchorsDir(), "certs", "test-a-ca.pem");
+      const inCopy = join(dest, "certs", "test-a-ca.pem");
+      expect(statSync(inCopy).mode & 0o222).toBe(0);
       const later = new Date(Date.now() + 3_600_000);
-      utimesSync(join(anchorsDir(), "certs", "test-a-ca.pem"), later, later);
+      utimesSync(cert, later, later);
       appendAudit("learning.save", { n: 3 });
       await tick(at(H3, 12));
-      expect(readState().copy?.error).toMatch(/EACCES/);
-      expect(anchorHealth(at(H3, 13)).line).toMatch(/copy off this machine FAILED/);
+      expect(readState().copy).toEqual({ at: at(H3, 12).toISOString(), error: null });
+      expect(statSync(inCopy).mode & 0o200).toBe(0o200); // a new file, as writable as the original
+      expect(readFileSync(inCopy).equals(readFileSync(cert))).toBe(true);
     } finally {
       for (const p of frozen) chmodSync(p, 0o644);
+      rmSync(copy, { recursive: true, force: true });
+    }
+  });
+
+  // 2026-10-12: one file of checkpoint 58 could not be written in Google Drive. The copy stopped there
+  // at every run, so checkpoints 122 to 124 never reached the folder, and the line named one file only.
+  it("a file the copy folder refuses does not stop the checkpoints after it, and the line says how many are incomplete", async () => {
+    const copy = mkdtempSync(join(tmpdir(), "ce-anchor-copy-stuck-"));
+    const undo: Array<() => void> = [];
+    try {
+      appendAudit("learning.save", { n: 1 });
+      const cfg = enable({ copy_dir: copy });
+      await tick(at(H1, 12));
+      const first = listCheckpoints()[0];
+      const dest = join(copy, `opscontext-anchors-${cfg.machine}`, "checkpoints");
+      // Its stamps changed here, and its folder in the copy lets nothing be written, removed or added.
+      const later = new Date(Date.now() + 3_600_000);
+      utimesSync(join(first.dir, "stamps.json"), later, later);
+      chmodSync(join(dest, first.name, "stamps.json"), 0o444);
+      chmodSync(join(dest, first.name), 0o555);
+      undo.push(() => chmodSync(join(dest, first.name), 0o755));
+      appendAudit("learning.save", { n: 2 });
+      await tick(at(H2, 12));
+      appendAudit("learning.save", { n: 3 });
+      await tick(at(H3, 12));
+      const [, second, third] = listCheckpoints();
+      expect(existsSync(join(dest, second.name, "stamps.json"))).toBe(true);
+      expect(existsSync(join(dest, third.name, "stamps.json"))).toBe(true);
+      const said = readState().copy;
+      expect(said?.at).toBeNull();
+      expect(said?.error).toMatch(new RegExp(`^1 of 3 checkpoints is not complete in the copy, first refused file checkpoints/${first.name}/stamps\\.json: EACCES`));
+      expect(anchorHealth(at(H3, 13)).line).toMatch(/copy off this machine FAILED \(1 of 3 checkpoints is not complete in the copy/);
+      expect(readFileSync(join(dest, first.name, "stamps.json")).equals(readFileSync(join(first.dir, "stamps.json")))).toBe(true); // refused, and still there
+    } finally {
+      for (const f of undo) f();
       rmSync(copy, { recursive: true, force: true });
     }
   });

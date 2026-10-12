@@ -4,6 +4,34 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.19.1] 2026-10-12: the copy off this machine gets past a file a synced folder refuses
+
+Only for a machine where SealHour is on and `anchor copy <folder>` points to a synced folder. Nothing
+changes for anyone else.
+
+### Fixes
+
+- **One refused file no longer stops the copy.** Seen with Google Drive on macOS: after some days the
+  provider keeps old files in the cloud only, and a background job may remove such a file or create one,
+  but not write into it. The first such file ended the copy at every run: newer checkpoints never reached
+  the folder, and `anchor status` said "copy off this machine FAILED (Unknown system error -11 ...)". Now
+  each file is copied on its own. If the folder refuses one, the others still go, and the line says how
+  many checkpoints are not complete in the copy and names the first refused file.
+- **A file that changed is replaced, never written into.** The copy removes the old file and creates the
+  new one (in Google Drive the old one goes to the bin). A folder that lets nothing be removed is written
+  over, as before.
+- **A proof fetched again counts as changed only where it changed.** When the Bitcoin attestation of a
+  sealed hour arrives, its proof is fetched again. Every file of the proof got a new time, so the copy took
+  all twelve as changed. A file whose content did not change now keeps its time: two files go to the copy,
+  not twelve.
+
+Proven on a Mac with Google Drive, by the hourly job itself, on files the provider had moved to the cloud.
+Not tested with iCloud, Dropbox, OneDrive or a network share: there the copy does at least what 2.19.0 did.
+
+Upgrading: restart your MCP client (the macOS background agent restarts itself). If `anchor status` said
+the copy FAILED, the next hourly run copies what was left out. Nothing was lost meanwhile: every
+checkpoint stayed on the machine, and with the SealHour service on, at the service too.
+
 ## [2.19.0] 2026-10-06: sealed every hour by SealHour, and a README that says what leaves
 
 Nothing changes for an installation that never ran `anchor enable`: no checkpoint, no call. A machine in

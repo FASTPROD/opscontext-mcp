@@ -47,7 +47,7 @@
 //      stamp (its digest is inside it) and said so, with that later date; it is not retried, since a
 //      stamp of its own would now come later still.
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync, constants, copyFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { homedir } from "os";
 import { randomBytes, randomInt } from "crypto";
 import { liveHeadHash } from "./audit.js";
@@ -425,28 +425,72 @@ function summarize(state: AnchorState, all: StoredCheckpoint[]): void {
 // FIX: one rule for every file, checkpoints and certificates alike: copy when the copy is missing,
 //      has another size, or is older than the source; otherwise leave it alone. A file that really
 //      changed and cannot be written is still reported as a failed copy.
+// 2026-10-12, the same rule one step earlier: a proof fetched again (its Bitcoin part had come) was
+//      written whole, so its twelve files got a new time though ten had not changed, and the copy
+//      took all twelve as changed. writeBundle() (src/anchor-bundle.ts) now gives a file whose bytes
+//      did not change the time it had. [NEVER] give a new time to a file here that did not change.
+//
+// [LOCKED] [SEALHOUR-COPY-GOES-ON-PAST-A-REFUSED-FILE] - 2026-10-12
+// [NEVER] let one file the copy folder refuses end the copy of the checkpoints after it, and
+//         [NEVER] write into a file that is already in the copy: remove it there, then create it.
+// WHY: 2026-10-12, Yan's Mac, Google Drive. The files of checkpoint 58's proof were due again, and
+//      in the copy the provider had moved them to the cloud (flag "dataless"). The job could open
+//      such a file but not write into it (errno 11 on macOS, EDEADLK, which Node prints as "Unknown
+//      system error -11"), and Node's copy removes its target when it fails after the open (libuv,
+//      uv__fs_copyfile). So every run removed one file from the copy and stopped; the next run
+//      created that file again and stopped on the next old one. With one try around the whole loop
+//      every run ended at checkpoint 58: checkpoints 122 to 124 never reached the folder, which in
+//      interim mode is the only copy off the machine, and the status named one file, not the gap.
+// FIX: each file on its own: a refusal is counted and the loop goes on, and the status says how many
+//      checkpoints are not complete in the copy and names the first refused file. A file that changed
+//      is removed from the copy and created again, the two things that folder let the job do that
+//      day (seven removals, six creations, the last at 13:24 UTC); a folder that lets nothing be
+//      removed is written over, as before.
 function copyIfChanged(src: string, dst: string): void {
   const a = statSync(src);
   let same = false;
   try { const b = statSync(dst); same = b.size === a.size && b.mtimeMs >= a.mtimeMs; } catch { same = false; }
-  if (!same) copyFileSync(src, dst);
+  if (same) return;
+  try { unlinkSync(dst); } catch { /* not there yet, or nothing can be removed there: written over below, as before */ }
+  mkdirSync(dirname(dst), { recursive: true });
+  copyFileSync(src, dst);
+}
+
+/** Node's error without the two paths it adds: "EACCES: permission denied". */
+function refusalOf(e: unknown): string {
+  const head = (e as Error).message.split(", ")[0].slice(0, 80);
+  const [code, ...rest] = head.split(": ");
+  return rest.join(": ") === code ? code : head;
 }
 
 /** Copy the checkpoints, their stamps, their SealHour receipts and proofs (never the code leaves or meta.json:
  *  they can name repositories; never the pilot code) to the owner's folder off this machine, file by
  *  file, only what is new or changed. Correction 1 of workplan 2.
- *  [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] */
+ *  [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] [LOCK] [SEALHOUR-COPY-GOES-ON-PAST-A-REFUSED-FILE] */
 export function copyOffMachine(cfg: AnchorConfig, now: Date): { at: string | null; error: string | null } {
   if (!cfg.copy_dir) return { at: null, error: null };
   if (!existsSync(cfg.copy_dir)) return { at: null, error: `the folder ${cfg.copy_dir} is not there (not mounted?)` };
   const dest = join(cfg.copy_dir, `opscontext-anchors-${cfg.machine}`);
+  let first: string | null = null;
+  /** One file to its place in the copy; false when the folder refused it. */
+  const put = (src: string, rel: string): boolean => {
+    try {
+      copyIfChanged(src, join(dest, rel));
+      return true;
+    } catch (e) {
+      first ??= `${rel}: ${refusalOf(e)}`;
+      return false;
+    }
+  };
   try {
-    for (const c of listCheckpoints()) {
-      const to = join(dest, "checkpoints", c.name);
-      mkdirSync(to, { recursive: true });
+    const all = listCheckpoints();
+    let incomplete = 0;
+    for (const c of all) {
+      const to = `checkpoints/${c.name}`;
+      let whole = true;
       for (const f of readdirSync(c.dir)) {
         if (!/^(checkpoint\.json|stamps\.json|receipt\.json|checkpoint\.[a-z0-9-]+\.ts[qr])$/.test(f)) continue;
-        copyIfChanged(join(c.dir, f), join(to, f));
+        if (!put(join(c.dir, f), `${to}/${f}`)) whole = false;
       }
       // The proof as SealHour served it, under the contract's names only.
       const proof = join(c.dir, "proof");
@@ -454,18 +498,22 @@ export function copyOffMachine(cfg: AnchorConfig, now: Date): { at: string | nul
         for (const e of readdirSync(proof, { withFileTypes: true })) {
           const names = e.isDirectory() ? readdirSync(join(proof, e.name)).map((f) => `${e.name}/${f}`) : [e.name];
           for (const n of names) {
-            if (!BUNDLE_NAME.test(n)) continue;
-            mkdirSync(join(to, "proof", e.isDirectory() ? e.name : ""), { recursive: true });
-            copyIfChanged(join(proof, n), join(to, "proof", n));
+            if (BUNDLE_NAME.test(n) && !put(join(proof, n), `${to}/proof/${n}`)) whole = false;
           }
         }
       }
+      if (!whole) incomplete++;
     }
+    let certs = 0;
     if (existsSync(certsDir())) {
-      mkdirSync(join(dest, "certs"), { recursive: true });
-      for (const f of readdirSync(certsDir())) if (f.endsWith(".pem")) copyIfChanged(join(certsDir(), f), join(dest, "certs", f));
+      for (const f of readdirSync(certsDir())) if (f.endsWith(".pem") && !put(join(certsDir(), f), `certs/${f}`)) certs++;
     }
-    return { at: now.toISOString(), error: null };
+    if (first === null) return { at: now.toISOString(), error: null };
+    const what = [
+      incomplete > 0 ? `${incomplete} of ${all.length} checkpoint${all.length === 1 ? "" : "s"} ${incomplete === 1 ? "is" : "are"} not complete in the copy` : "",
+      certs > 0 ? `${certs} certificate${certs === 1 ? " is" : "s are"} not current in the copy` : "",
+    ].filter(Boolean).join(" and ");
+    return { at: null, error: `${what}, first refused file ${first}`.slice(0, 300) };
   } catch (e) {
     return { at: null, error: (e as Error).message.slice(0, 200) };
   }

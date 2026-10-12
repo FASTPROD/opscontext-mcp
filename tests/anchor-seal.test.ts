@@ -5,7 +5,7 @@
 // [LOCK] [NO-NETWORK-WITHOUT-ANCHOR-ENABLE] [LOCK] [NO-CHECKPOINT-WITHOUT-A-NEW-RECORD] (src/anchor.ts)
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { appendAudit } from "../src/audit.js";
@@ -473,6 +473,51 @@ describe.skipIf(!haveOpenssl)("the proof is kept only when it holds", () => {
     await tick(at("2026-10-06T22", 30));
     expect(sealOf(listCheckpoints()[0])).toMatchObject({ state: "sealed", bitcoin: "complete", proof_next_at: null });
     expect(readFileSync(join(listCheckpoints()[0].dir, "proof", "root.bin.ots"), "utf8")).toBe("fake attestation, complete");
+  });
+
+  // [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] [LOCK] [SEALHOUR-COPY-GOES-ON-PAST-A-REFUSED-FILE] (src/anchor.ts)
+  // 2026-10-12: the proof of checkpoint 58 came again with its Bitcoin part. Two of its twelve files had
+  // changed, all twelve got a new time, and Google Drive let none of them be written into.
+  it("a proof fetched again, and a copy folder whose files cannot be written into: only what changed is written, as a new file", async () => {
+    const copy = mkdtempSync(join(tmpdir(), "ce-seal-copy-again-"));
+    try {
+      grow(2);
+      const cfg = enable({ copy_dir: copy });
+      await tick(at(H1, 30));
+      await svc.seal("2026-10-06T15Z", { ots: "pending" });
+      await tick(at(H2, 5));
+      const c = listCheckpoints()[0];
+      const here = join(c.dir, "proof");
+      const there = join(copy, `opscontext-anchors-${cfg.machine}`, "checkpoints", c.name, "proof");
+      const names = everyFile(here).map((f) => f.slice(here.length + 1)).sort();
+      expect(names).toContain("root.bin.ots");
+      expect(everyFile(there).map((f) => f.slice(there.length + 1)).sort()).toEqual(names);
+      // The copy as the provider holds it days later: no file there can be written into. So that the test
+      // can tell a file written again from one left alone, each holds other bytes of the same size, and
+      // carries the same time as the file here.
+      const before = new Map(names.map((n) => [n, readFileSync(join(here, n))]));
+      const marked = (n: string) => Buffer.alloc(before.get(n)!.length, "#");
+      const old = new Date("2026-10-06T15:05:00Z");
+      for (const n of names) {
+        writeFileSync(join(there, n), marked(n));
+        chmodSync(join(there, n), 0o444);
+        utimesSync(join(there, n), old, old);
+        utimesSync(join(here, n), old, old);
+      }
+      svc.hours.get("2026-10-06T15Z")!.ots = "complete";
+      await tick(at("2026-10-06T18", 30));
+      expect(sealOf(listCheckpoints()[0]).bitcoin).toBe("complete");
+      const changed = names.filter((n) => !readFileSync(join(here, n)).equals(before.get(n)!));
+      expect(changed).toEqual(["root.bin.ots", "stamps.json"]);
+      expect(readState().copy).toEqual({ at: at("2026-10-06T18", 30).toISOString(), error: null });
+      for (const n of names) {
+        const inCopy = readFileSync(join(there, n));
+        if (changed.includes(n)) expect(inCopy.equals(readFileSync(join(here, n))), `${n} changed and is not in the copy`).toBe(true);
+        else expect(inCopy.equals(marked(n)), `${n} did not change and was written again`).toBe(true);
+      }
+    } finally {
+      rmSync(copy, { recursive: true, force: true });
+    }
   });
 });
 

@@ -9,7 +9,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "http";
 import type { AddressInfo } from "net";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { generateKeyPairSync } from "crypto";
@@ -117,6 +117,26 @@ describe("a bundle's names are the contract's fixed list", () => {
     expect(readFileSync(join(dir, "leaf.json"), "utf8")).toBe("2");
     expect(existsSync(join(dir, "root.bin.ots"))).toBe(false); // nothing of the old proof is left beside the new one
     expect(readFileSync(join(dir, "certs", "a.pem"), "utf8")).toBe("c");
+  });
+
+  // [LOCK] [SEALHOUR-COPY-WRITES-ONLY-WHAT-CHANGED] (src/anchor.ts): the copy off the machine judges a file
+  // by its size and its time. On 2026-10-12 a proof came again with its Bitcoin part: two files of twelve
+  // had changed, all twelve got a new time, and the copy tried to write all twelve again.
+  it("writeBundle keeps the time of every file whose content did not change", () => {
+    const base = mkdtempSync(join(tmpdir(), "ce-bundle-"));
+    dirs.push(base);
+    const dir = join(base, "proof");
+    writeBundle(new Map([["leaf.json", Buffer.from("same")], ["keys/k.pub", Buffer.from("key")], ["root.bin.ots", Buffer.from("pending")], ["stamps.json", Buffer.from("12345")]]), dir);
+    const old = new Date("2026-10-06T07:15:47Z");
+    for (const n of ["leaf.json", "keys/k.pub", "root.bin.ots", "stamps.json"]) utimesSync(join(dir, n), old, old);
+    writeBundle(new Map([["leaf.json", Buffer.from("same")], ["keys/k.pub", Buffer.from("key")], ["root.bin.ots", Buffer.from("complete")], ["stamps.json", Buffer.from("54321")], ["path.json", Buffer.from("new")]]), dir);
+    expect(statSync(join(dir, "leaf.json")).mtimeMs).toBe(old.getTime());
+    expect(statSync(join(dir, "keys", "k.pub")).mtimeMs).toBe(old.getTime());
+    // What changed carries the time of the change, a change that keeps the size included; so does a new file.
+    expect(statSync(join(dir, "root.bin.ots")).mtimeMs).toBeGreaterThan(old.getTime());
+    expect(statSync(join(dir, "stamps.json")).mtimeMs).toBeGreaterThan(old.getTime());
+    expect(statSync(join(dir, "path.json")).mtimeMs).toBeGreaterThan(old.getTime());
+    expect(readFileSync(join(dir, "stamps.json"), "utf8")).toBe("54321");
   });
 });
 
