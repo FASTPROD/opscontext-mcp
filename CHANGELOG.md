@@ -4,6 +4,34 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.19.2] 2026-10-13: the server calls a git that starts
+
+Only matters on a machine where the first git the server finds cannot run: an old git built for Intel
+on an Apple Silicon Mac, once macOS no longer translates Intel programs. Nothing changes for anyone else,
+beyond one very short check when the server starts.
+
+### Fixes
+
+- **The server checks its git before using it.** At its start the server asks the first git on its PATH
+  for its version. If that git cannot start, or starts and refuses (Apple's git before its licence is
+  accepted), the other gits on PATH and then `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin` are
+  tried, and the first one that answers is used by the server and by everything it starts: the hourly
+  SealHour job, the daily check of the audit chain. Before, the server stopped at the first git it found:
+  every git call failed with "Bad CPU type in executable", and with it the repository collectors, the
+  status of the workspaces and the SealHour code fingerprint. The log names the git that was passed
+  over, in the system's own words. When no git starts at all, fleet health says so (`servers`,
+  end-session, the status bar).
+- **The background agent's PATH (macOS) lists Homebrew's folder, and first.** `install-autostart` wrote
+  `<node's folder>:/usr/local/bin:/usr/bin:/bin`: on an Apple Silicon Mac the programs Homebrew installs
+  were not on it at all, and an old Intel git in `/usr/local/bin` came first. It now writes
+  `<node's folder>:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`.
+
+**Package:** 63 files to 64 (one module), about 418 kB.
+
+Upgrading: restart your MCP client (the macOS background agent restarts itself); the check then runs at
+every start. An agent installed before this version keeps the PATH it was given: the check covers it. To
+give it the new PATH as well, run `contextengine install-autostart --force` once.
+
 ## [2.19.1] 2026-10-12: the copy off this machine gets past a file a synced folder refuses
 
 Only for a machine where SealHour is on and `anchor copy <folder>` points to a synced folder. Nothing

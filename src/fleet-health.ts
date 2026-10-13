@@ -17,6 +17,7 @@ import { readVerifyState, pendingRefusals } from "./audit.js";
 import { claudeHookRegistrations } from "./install-claude-hook.js";
 import { secretsLockHealth, type SecretsLockHealth } from "./secrets-lock.js";
 import { anchorHealth, type AnchorHealth } from "./anchor.js";
+import { gitProblem } from "./git-path.js";
 
 export interface FleetHealth {
   generatedAt: string;
@@ -286,6 +287,9 @@ export function computeFleetHealth(opts: { now?: Date; version?: string; auditPa
   if (refusedTotal > 0) warnings.push(`the audit log refused ${refusedTotal} entr${refusedTotal === 1 ? "y" : "ies"} today${lastRefusal ? ` (${lastRefusal})` : ""}: they are not in the log, and the gap is noted on the chain`);
   if (tornToday > 0) warnings.push(`${tornToday} audit record(s) were cut short today (a full disk?); the bytes are kept in ${lastTornKept}`);
   for (const w of report.warnings) if (/index on their own/.test(w)) warnings.push(w);
+  // No git that starts was found when this server began. [LOCK] [THE-TOOL-CALLS-A-GIT-THAT-STARTS]
+  const noGit = gitProblem();
+  if (noGit) warnings.push(noGit);
   // SealHour: a period that should be stamped and is not is a measured problem; off is not one.
   let anchor: AnchorHealth | null = null;
   try {

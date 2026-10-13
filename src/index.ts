@@ -19,6 +19,7 @@ import {
 } from "./embeddings.js";
 import { collectProjectOps, collectSystemOps } from "./collectors.js";
 import { repoStatus, type RepoStatus } from "./repo-status.js";
+import { ensureGitStarts } from "./git-path.js";
 import { loadEmbeddingStore, compactEmbeddingStore } from "./embedding-store.js";
 import {
   sharedIndexEnabled,
@@ -1499,6 +1500,10 @@ async function main() {
   // [LOCK] [CE-HOME-IS-PRIVATE]: the folder is 0700 before the registry, the index or the log write
   // into it.
   secureCeHome();
+  // Before anything calls git, and before any child is started: the first git on the PATH this
+  // server was given may be one this machine cannot start. [LOCK] [THE-TOOL-CALLS-A-GIT-THAT-STARTS]
+  const gitChoice = ensureGitStarts();
+  if (gitChoice.note) console.error(`[ContextEngine] ⚠ ${gitChoice.note}`);
   // The launchd agent keeps its own log readable: above 50 MB, the last 5 MB are kept as
   // mcp-stderr.1.log and the open file is truncated in place. [LOCK] [DAEMON-LOG-TRIMS-ITSELF]
   if (process.env.OPSCONTEXT_DAEMON === "1") {

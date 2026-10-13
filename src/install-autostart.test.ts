@@ -14,6 +14,11 @@ describe("buildPlist", () => {
     expect(p).toMatch(/<key>OPSCONTEXT_DAEMON<\/key>\s*<string>1<\/string>/);
     expect(p).not.toMatch(/OPSCONTEXT_SKIP_CLAUDE_MEMORY/);
   });
+  // [LOCK] [THE-TOOL-CALLS-A-GIT-THAT-STARTS] (src/git-path.ts)
+  it("lists the folder of programs built for this Mac, and before the folder of older installs", () => {
+    const p = A.buildPlist("/n/bin/node", "/x/dist/index.js", "/n/bin", {});
+    expect(p).toMatch(/<key>PATH<\/key>\s*<string>\/n\/bin:\/opt\/homebrew\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin<\/string>/);
+  });
   it("passes the installing shell's corpus inputs through, so its corpus id equals the chats'", () => {
     const p = A.buildPlist("/n", "/e", "/b", { CONTEXTENGINE_CONFIG: "/Users/me/Projects/CE/contextengine.json", CONTEXTENGINE_WORKSPACES: "/a:/b", OPSCONTEXT_SKIP_CLAUDE_MEMORY: "1" });
     expect(p).toMatch(/<key>CONTEXTENGINE_CONFIG<\/key>\s*<string>\/Users\/me\/Projects\/CE\/contextengine\.json<\/string>/);

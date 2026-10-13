@@ -111,6 +111,10 @@ function xml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
+// [LOCK] [THE-TOOL-CALLS-A-GIT-THAT-STARTS] (src/git-path.ts): the agent's PATH lists
+// /opt/homebrew/bin, and before /usr/local/bin. Until 2.19.1 it was "<node>:/usr/local/bin:/usr/bin:/bin":
+// on an Apple Silicon Mac the tools Homebrew installs were not on it at all, and an old Intel git
+// in /usr/local/bin came first.
 export function buildPlist(nodePath: string, entryPath: string, nodeBinDir: string, env: NodeJS.ProcessEnv = process.env): string {
   // OPSCONTEXT_DAEMON tells the server it has no MCP client on stdin and must stay alive on its
   // own: as a reader it holds no file watchers, and every poller is unref'd, so without this the
@@ -137,7 +141,7 @@ export function buildPlist(nodePath: string, entryPath: string, nodeBinDir: stri
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${xml(nodeBinDir)}:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${xml(nodeBinDir)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${xml(homedir())}</string>
 ${extraEnv}
