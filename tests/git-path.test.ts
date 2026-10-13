@@ -23,8 +23,9 @@ function working(folder: string, version: string, ownFolder?: string): string {
 beforeAll(() => {
   T = mkdtempSync(join(tmpdir(), "ce git path "));
   // A program this machine cannot start: the header of a 32-bit Intel program and nothing else.
-  // macOS answers "Bad CPU type in executable" (error -86), the words of 2026-10-07; Linux
-  // answers that it is no program it can run. Either way it does not start.
+  // macOS answers "Bad CPU type in executable" (error -86), the words of 2026-10-07. Started by
+  // its full name it does not start on Linux either; what Linux does when it is called by name is
+  // not relied on (see the Mac-only test below).
   mkdirSync(dir("badcpu"));
   writeFileSync(join(dir("badcpu"), "git"), Buffer.from([0xce, 0xfa, 0xed, 0xfe, 7, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
   chmodSync(join(dir("badcpu"), "git"), 0o755);
@@ -58,7 +59,17 @@ describe("a git that starts", () => {
     expect(gitStarts(join(dir("nowhere"), "git"))).toBe(false);
   });
 
-  it("the failure this guards against is real: Node stops at the first git on PATH, with or without a shell", () => {
+  it("the failure this guards against is real: Node stops at a first git that refuses, with or without a shell", () => {
+    const e = env("licence", "good");
+    expect(() => gitOf(e, "node")).toThrow();
+    expect(() => gitOf(e, "shell")).toThrow();
+  });
+
+  // On a Mac only. The first version of this test claimed it for every system, and failed on
+  // GitHub's Linux machines under Node 20, 22 and 24 (2026-10-13, the release run of 2.19.2): there,
+  // called by name, the stand-in did not stop the call. Called by its full name it does not start
+  // on Linux either (the test above passed there), which is all the code relies on.
+  it.runIf(process.platform === "darwin")("on a Mac, Node also stops at a first git built for another processor", () => {
     const e = env("badcpu", "good");
     expect(() => gitOf(e, "node")).toThrow();
     expect(() => gitOf(e, "shell")).toThrow();
