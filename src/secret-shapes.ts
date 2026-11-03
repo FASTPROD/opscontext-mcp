@@ -33,12 +33,24 @@ export interface SecretShape {
   skip?: (value: string, after: string) => boolean;
 }
 
-const QUOTED_OR_BARE = String.raw`(?:'[^']*'|"[^"]*"|[^\s'"]+)`;
+// [LOCKED] [ESCAPED-QUOTE-IS-A-QUOTE] - 2026-11-02
+// [NEVER] drop the \' and \" alternatives from QUOTED_OR_BARE, the optional backslash before an
+//         opening quote in a shape's prefix, or the "a value ends before a backslash that precedes
+//         a quote" rule in the bare value classes.
+// WHY: a value written between backslash-quotes (\'value\' inside another shell line, \"value\" in
+//      a JSON-escaped string, both the shape of a saved allowed command in settings.json) passed
+//      every shape until 2026-11-02: the quoted alternative never opened (it wanted a bare quote)
+//      and the bare one stopped at the backslash, so the sshpass flag kept its value after a
+//      "[REDACTED:...]'" stub, and a "NAME=\'value\'" assignment was left whole.
+// FIX: an opening quote may carry a backslash (the prefix keeps it), and a value ends before the
+//      backslash of a closing quote, so the output keeps the quotes and loses the value. The test
+//      "hides a value between backslash-quotes" (tests/secret-shapes.test.ts) replays each shape.
+const QUOTED_OR_BARE = String.raw`(?:\\'[^']*\\'|\\"[^"]*\\"|'[^']*'|"[^"]*"|[^\s'"]+)`;
 
 export const SECRET_SHAPES: SecretShape[] = [
   { id: "private_key", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g },
   { id: "aws_access_key", re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
-  { id: "aws_secret_key", re: /(aws_secret_access_key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}/gi, keepPrefix: true },
+  { id: "aws_secret_key", re: /(aws_secret_access_key(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[A-Za-z0-9/+=]{40}/gi, keepPrefix: true },
   { id: "stripe_key", re: /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}/g },
   { id: "stripe_webhook_secret", re: /\bwhsec_[0-9A-Za-z]{16,}/g },
   { id: "github_token", re: /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{30,}|\bgithub_pat_[0-9A-Za-z_]{40,}/g },
@@ -60,10 +72,10 @@ export const SECRET_SHAPES: SecretShape[] = [
   // mysql -pSECRET (the value is glued to the flag; a bare -p prompts and is left alone).
   { id: "mysql_password", re: new RegExp(String.raw`(\bmysql(?:dump|admin)?\b[^\n]*?\s-p)(?=[^\s-])${QUOTED_OR_BARE}`, "g"), keepPrefix: true },
   { id: "password_flag", re: new RegExp(String.raw`(--password[=\s]\s*)${QUOTED_OR_BARE}`, "gi"), keepPrefix: true },
-  { id: "bearer_token", re: /(\bbearer\s+)(?=[0-9A-Za-z._~+/-]{20,})[0-9A-Za-z._~+/-]+=*/gi, keepPrefix: true },
-  { id: "basic_auth", re: /(\bauthorization:\s*basic\s+)[A-Za-z0-9+/]{8,}=*/gi, keepPrefix: true },
-  { id: "curl_user_password", re: /(\bcurl\b[^\n]*?\s(?:-u|--user)\s*['"]?[^\s:'"]+:)[^\s'"]+/g, keepPrefix: true },
-  { id: "api_key_header", re: /(\bx-api-key:\s*)[^\s'"]{8,}/gi, keepPrefix: true },
+  { id: "bearer_token", re: /(\bbearer\s+(?:\\?["'])?)(?=[0-9A-Za-z._~+/-]{20,})[0-9A-Za-z._~+/-]+=*/gi, keepPrefix: true },
+  { id: "basic_auth", re: /(\bauthorization:\s*basic\s+(?:\\?["'])?)[A-Za-z0-9+/]{8,}=*/gi, keepPrefix: true },
+  { id: "curl_user_password", re: /(\bcurl\b[^\n]*?\s(?:-u|--user)\s*(?:\\?['"])?[^\s:'"]+:)(?:[^\s'"\\]|\\(?!['"]))+/g, keepPrefix: true },
+  { id: "api_key_header", re: /(\bx-api-key:\s*(?:\\?['"])?)(?:[^\s'"\\]|\\(?!['"])){8,}/gi, keepPrefix: true },
   // name = value, the long tail. Skips variables, env lookups, paths, placeholders already
   // redacted, type names and function calls.
   // A name that ends in a separator plus PASS (SMTP_PASS, DB_PASS, db.pass) counts too: a real mail
@@ -75,7 +87,7 @@ export const SECRET_SHAPES: SecretShape[] = [
   {
     id: "credential_assignment",
     // A backtick opens a value too: "password: `...`" in Markdown, found in the real log.
-    re: /(\b(?:[\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret)|[\w.-]*[_.-]pass|pass(?=["'`]?\s*=|["'`]?\s*:\s*["'`]))["'`]?\s*[:=]\s*["'`]?)(?![$<{*/~.[]|process\.env|os\.environ|getenv)[^\s'"`,;)}\]]{6,}/gi,
+    re: /(\b(?:[\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret)|[\w.-]*[_.-]pass|pass(?=["'`]?\s*=|["'`]?\s*:\s*["'`]))(?:\\?["'`])?\s*[:=]\s*(?:\\?["'`])?)(?![$<{*/~.[]|process\.env|os\.environ|getenv)(?:[^\s'"`,;)}\]\\]|\\(?!["'`])){6,}/gi,
     keepPrefix: true,
     skip: (value, after) =>
       after.startsWith("(") ||

@@ -173,6 +173,8 @@ Verify:
 npx @compr/opscontext-mcp watch --once       # → tails recent events; should show claude_code_* kinds after one prompt
 ```
 
+Optional, `opscontext install-claude-hook --guard`: the **Bash guard**, a `PreToolUse` entry on Bash that refuses, before it runs, `rsync --delete`, `scp -r`, a script started by a relative path (give the script's full path, `cd /absolute/path && /absolute/path/script args`: Claude Code removes a leading `cd` to its current folder before a hook sees the command, so that `cd` alone is not enough, and the refusal names the folder the script would have run in) and `github.com` in a command's allowed sites. The reason reaches the agent; the owner runs such a command in their own terminal when it is really wanted. Details: `opscontext bash-guard --help`.
+
 **3d. Lock the agent out of your secrets files**
 
 ```bash
@@ -275,6 +277,8 @@ npx @compr/opscontext-mcp list-sources
 
 # Discover and analyze all projects
 npx @compr/opscontext-mcp list-projects
+npx @compr/opscontext-mcp unpushed           # per project, the commits not yet on GitHub (nothing is fetched)
+npx @compr/opscontext-mcp actions            # your open action points, from the `actions` key of every saved session (YYYY-MM-DD | open | project | what)
 
 # AI-readiness score — no argument scores the CURRENT project only
 npx @compr/opscontext-mcp score

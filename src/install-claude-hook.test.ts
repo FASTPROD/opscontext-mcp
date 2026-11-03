@@ -231,3 +231,64 @@ describe("cliInstallClaudeHook --simplicity", () => {
     expect(s.hooks?.PreToolUse?.[0].hooks[0].command).toBe("guard.sh");
   });
 });
+
+describe("cliInstallClaudeHook --guard", () => {
+  const GUARD = join(HOME, ".claude", "hooks", "opscontext-bash-guard.sh");
+  const readBack = () => JSON.parse(readFileSync(SETTINGS, "utf-8")) as Settings;
+  const guardEntries = (s: Settings) =>
+    (s.hooks?.PreToolUse ?? []).filter((e) => e.hooks.some((h) => I.hookScriptPath(h.command) === GUARD));
+
+  it("registers the guard once under PreToolUse Bash, writes a script that runs bash-guard, and a re-run with or without the flag keeps exactly one", async () => {
+    writeSettings({ hooks: {} });
+    const first = await install(["--guard"]);
+    expect(first.out).toMatch(/5 hook entries added, 0 already present\./);
+    expect(first.out).toMatch(/Installed Bash guard: .*opscontext-bash-guard\.sh \(PreToolUse Bash\)/);
+    expect(first.out).toMatch(/exactly one registration for UserPromptSubmit, PostToolUse, SessionStart, Stop, PreToolUse\(guard\)\./);
+    const script = readFileSync(GUARD, "utf-8");
+    expect(script).toMatch(/^#!\/bin\/sh\n/);
+    // It never fails open: a missing node or CLI, or a crash, is a deny too (the attacking pass of 2026-11-02).
+    expect(script).toMatch(/\nNODE='[^\n]*'\nCLI='[^\n]*cli\.js'\n/);
+    expect(script).toMatch(/if \[ ! -x "\$NODE" \] \|\| \[ ! -f "\$CLI" \]; then printf '%s\\n' "\$DENY"; exit 0; fi\n"\$NODE" "\$CLI" bash-guard \|\| printf '%s\\n' "\$DENY"\nexit 0\n$/);
+    let entries = guardEntries(readBack());
+    expect(entries).toHaveLength(1);
+    expect(entries[0].matcher).toBe("Bash");
+    expect(entries[0].hooks).toEqual([{ type: "command", command: GUARD, timeout: 10 }]);
+    expect(I.claudeHookRegistrations(SETTINGS, HOME)).toMatchObject({ "PreToolUse(guard)": 1, "PostToolUse(simplicity)": 0 });
+
+    vi.restoreAllMocks();
+    const again = await install(["--guard"]);
+    expect(again.out).toMatch(/0 hook entries added, 5 already present\./);
+    vi.restoreAllMocks();
+    const plain = await install();
+    expect(plain.out).toMatch(/0 hook entries added, 5 already present\./);
+    entries = guardEntries(readBack());
+    expect(entries).toHaveLength(1);
+  });
+
+  it("a plain install does not add the guard; a user's own PreToolUse Bash hook is kept beside ours", async () => {
+    writeSettings({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [cmd("theirs.sh")] }] } });
+    const r = await install();
+    expect(r.out).toMatch(/4 hook entries added, 0 already present\./);
+    expect(guardEntries(readBack())).toHaveLength(0);
+    vi.restoreAllMocks();
+    await install(["--guard"]);
+    const s = readBack();
+    expect(guardEntries(s)).toHaveLength(1);
+    expect(s.hooks?.PreToolUse?.[0].hooks[0].command).toBe("theirs.sh");
+  });
+
+  it("uninstall --guard removes only the guard; a full uninstall removes it with the rest and keeps theirs", async () => {
+    writeSettings({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [cmd("theirs.sh")] }] } });
+    await install(["--guard", "--simplicity"]);
+    vi.restoreAllMocks();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await I.cliUninstallClaudeHook(["--guard"]);
+    let s = readBack();
+    expect(guardEntries(s)).toHaveLength(0);
+    expect(I.claudeHookRegistrations(SETTINGS, HOME)).toMatchObject({ Stop: 1, "PostToolUse(simplicity)": 1, "PreToolUse(guard)": 0 });
+    await I.cliUninstallClaudeHook([]);
+    s = readBack();
+    expect(s.hooks?.Stop).toBeUndefined();
+    expect(s.hooks?.PreToolUse?.[0].hooks.map((h) => h.command)).toEqual(["theirs.sh"]);
+  });
+});

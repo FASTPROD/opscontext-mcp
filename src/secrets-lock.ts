@@ -10,13 +10,16 @@
 //      to "prove" the lock would be that leak again, with the product's name on it.
 // FIX: --check reads only the settings files Claude Code reads (user, project, local, managed),
 //      compares their permissions.deny with SECRETS_LOCK_RULES by exact text and reports one line
-//      per item. Tests: tests/secrets-lock.test.ts, in the throwaway HOME of src/test-setup.ts,
+//      per item. Since 2026-11-02 it also runs the capture shapes over permissions.allow and reports
+//      counts and shape names only (LOCK [ALLOW-LIST-SECRETS-ARE-COUNTED-NEVER-PRINTED] below).
+//      Tests: tests/secrets-lock.test.ts, in the throwaway HOME of src/test-setup.ts,
 //      including "the report never contains a value from the settings file".
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync, readlinkSync, rmSync } from "fs";
 import { join, resolve, dirname, basename, sep } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { redactSecrets } from "./secret-shapes.js";
 
 const CREDENTIALS_FILE_RULES: readonly string[] = [
   "Read(//**/.copilot-credentials.md)",
@@ -173,6 +176,45 @@ function stringList(v: unknown): string[] {
 /** The deny rules of one scope, trimmed; none for an unreadable file. */
 export function denyRules(s: SettingsScope): string[] {
   return s.valid ? stringList(asObject(s.settings.permissions).deny) : [];
+}
+
+/** The allow rules of one scope, trimmed; none for an unreadable file. Never printed: see below. */
+export function allowRules(s: SettingsScope): string[] {
+  return s.valid ? stringList(asObject(s.settings.permissions).allow) : [];
+}
+
+export interface AllowedCommandSecrets {
+  scope: Scope;
+  path: string;
+  /** Saved allow entries in this scope. */
+  entries: number;
+  /** Entries in which at least one secret shape matched. */
+  flagged: number;
+  /** Matches per shape id over the flagged entries. Counts only, never a value. */
+  shapes: Record<string, number>;
+}
+
+// [LOCKED] [ALLOW-LIST-SECRETS-ARE-COUNTED-NEVER-PRINTED] - 2026-11-02
+// [NEVER] put an allow entry's text, or any part of it (the program name, the host, the value, a
+//         redacted copy), in a report line or a log: scope, counts and shape ids only.
+// WHY: "always allow" on a Bash call saves the whole command line in settings.json, secret included,
+//      and the entry stays there for good, read by every chat. A check that quoted the entry to show
+//      what to remove would be that leak again, in a chat log, with the product's name on it.
+// FIX: redactSecrets() runs over each entry and only its counts are kept; the report names the
+//      scope and the file, and the owner opens that file and removes the entries by hand.
+export function allowedCommandSecrets(scopes: SettingsScope[]): AllowedCommandSecrets[] {
+  return scopes.map((s) => {
+    const entries = allowRules(s);
+    const shapes: Record<string, number> = {};
+    let flagged = 0;
+    for (const entry of entries) {
+      const { counts } = redactSecrets(entry);
+      if (Object.keys(counts).length === 0) continue;
+      flagged++;
+      for (const [id, n] of Object.entries(counts)) shapes[id] = (shapes[id] ?? 0) + n;
+    }
+    return { scope: s.scope, path: s.path, entries: entries.length, flagged, shapes };
+  });
 }
 
 export interface RulePresence {
@@ -392,6 +434,18 @@ export function checkSecretsLock(opts: CheckOptions = {}): SecretsLockReport {
       text: `env files: the broad .env.* rule (${draftIn.join(", ")} settings) counts, but it also blocks the .env.example templates git keeps, which the sandbox turns into git errors; --apply adds the exact names, then remove Read(//**/.env.*) and Edit(//**/.env.*) by hand`,
     });
   }
+  const allowed = allowedCommandSecrets(scopes);
+  const dirty = allowed.filter((a) => a.flagged > 0);
+  if (dirty.length === 0) {
+    lines.push({ level: "PASS", text: `allowed commands: no secret shape in the ${allowed.reduce((n, a) => n + a.entries, 0)} saved entries` });
+  }
+  for (const a of dirty) {
+    const shapes = Object.entries(a.shapes).sort(([x], [y]) => x.localeCompare(y)).map(([id, n]) => `${id} ${n}`).join(", ");
+    lines.push({
+      level: "FAIL",
+      text: `allowed commands: ${a.flagged} of ${a.entries} entries in ${a.scope} settings hold a secret shape (${shapes}): open ${t(a.path)} yourself and take them out of permissions.allow, then treat each secret as leaked and change it; the text is never printed here`,
+    });
+  }
   const inPlace = rules.every((r) => r.scopes.length > 0);
   const macWide = rules.every((r) => r.scopes.some((s) => s === "user" || s === "managed"));
   if (inPlace && !macWide) {
@@ -593,8 +647,10 @@ before any tool runs. This command checks them and, from your own terminal, inst
                      certificates; the self-lock rules (the agent cannot edit its own settings,
                      hooks, bin folder or MCP list); the sandbox (WARN while off); the extra
                      folders commands may write to; the installed Claude Code builds against the
-                     ${MIN_CLAUDE_CODE.editBlocked} and ${MIN_CLAUDE_CODE.writeBlocked} minimums.
-                     Writes nothing and opens no secrets file. Exit 1 on any FAIL.
+                     ${MIN_CLAUDE_CODE.editBlocked} and ${MIN_CLAUDE_CODE.writeBlocked} minimums; the saved allowed commands
+                     (permissions.allow), a FAIL when one holds a secret shape, reported as counts
+                     and shape names, never the text. Writes nothing and opens no secrets file.
+                     Exit 1 on any FAIL.
   --apply            Adds the missing rules to ~/.claude/settings.json (user scope: every repo on
                      this machine), keeps every existing entry, writes a dated backup beside the
                      file, re-reads what it wrote, then prints the test card. A second run reports

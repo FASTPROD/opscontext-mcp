@@ -113,7 +113,7 @@ describe("checkSecretsLock", () => {
       expect.stringMatching(/^\*\.p12 certificates.*: denied/),
       expect.stringMatching(/^self-lock .*: denied \(user settings\)$/),
     ]));
-    expect(L.formatSecretsLockReport(r)).toMatch(/Result: 0 FAIL, 1 WARN, 8 PASS\. The lock is in place; the WARN lines are the next steps\./);
+    expect(L.formatSecretsLockReport(r)).toMatch(/Result: 0 FAIL, 1 WARN, 9 PASS\. The lock is in place; the WARN lines are the next steps\./);
   });
 
   it("fails every group and names the missing rules when there is no settings file", () => {
@@ -127,7 +127,7 @@ describe("checkSecretsLock", () => {
     expect(fails[4]).toMatch(/^self-lock .*: 8 of 8 rules missing/);
     const text = L.formatSecretsLockReport(r);
     expect(text).toMatch(/settings read: user ~\/\.claude\/settings\.json \(absent\)/);
-    expect(text).toMatch(/Result: 5 FAIL, 1 WARN, 3 PASS\. The agent can still reach secrets files here\. Fix, in your own terminal \(never from a chat\): contextengine secrets-lock --apply/);
+    expect(text).toMatch(/Result: 5 FAIL, 1 WARN, 4 PASS\. The agent can still reach secrets files here\. Fix, in your own terminal \(never from a chat\): contextengine secrets-lock --apply/);
   });
 
   it("half a lock: the present groups pass, the missing groups name their rules", () => {
@@ -240,6 +240,41 @@ describe("checkSecretsLock", () => {
     expect(r.macWide).toBe(true);
     expect(byLevel(r, "INFO")).toEqual(expect.arrayContaining([expect.stringMatching(/^managed settings in force/)]));
     expect(byLevel(r, "PASS")[0]).toMatch(/\(managed settings\)$/);
+  });
+
+  // 2026-11-02: an allowed command saved by a chat ("always allow" on a Bash call) keeps the
+  // whole command line, secret included, in settings.json for good.
+  it("fails when a saved allowed command holds a secret shape, counts only, never the text", () => {
+    const h = home();
+    const SP = ["sshpass", "-p"].join(" ");
+    const pw = "Zq7" + "Kx9" + "Wm2" + "Vp4";
+    writeUser(h, {
+      permissions: {
+        deny: [...L.SECRETS_LOCK_RULES],
+        allow: [`Bash(${SP} ${pw} ssh admin@host.example.test)`, "Bash(npm run build)", `Bash(psql postgresql://fc_user:${pw}@db.example.test/fc_db)`],
+      },
+    });
+    const repo = mkdtempSync(join(h, "repo-"));
+    writeProject(repo, "settings.json", { permissions: { allow: [`Bash(curl -H \\"Authorization: Bearer ${pw}${pw}\\" https://api.example.test)`] } });
+    const r = L.checkSecretsLock(opts(h, { cwd: repo }));
+    expect(r.inPlace).toBe(true);
+    expect(r.fails).toBe(2);
+    expect(byLevel(r, "FAIL")).toEqual([
+      expect.stringMatching(/^allowed commands: 2 of 3 entries in user settings hold a secret shape \(sshpass_password 1, url_password 1\): open .*settings\.json yourself and take them out of permissions\.allow/),
+      expect.stringMatching(/^allowed commands: 1 of 1 entries in project settings hold a secret shape \(bearer_token 1\): open/),
+    ]);
+    const text = L.formatSecretsLockReport(r);
+    for (const leak of [pw, "ssh admin", "psql", "curl", "fc_user", "api.example.test", "npm run build"]) expect(text, leak).not.toContain(leak);
+    expect(text).toMatch(/Result: 2 FAIL, .*The deny rules are in place; fix the FAIL lines above\./);
+  });
+
+  it("passes with the count of saved entries when no allowed command holds a secret shape", () => {
+    const h = home();
+    writeUser(h, { permissions: { deny: [...L.SECRETS_LOCK_RULES], allow: ["Bash(npm run build)", "Bash(git commit -m \"fix the pass" + "word reset flow\")", "Read(//**/*.md)"] } });
+    const r = L.checkSecretsLock(opts(h));
+    expect(r.fails).toBe(0);
+    expect(byLevel(r, "PASS")).toContain("allowed commands: no secret shape in the 3 saved entries");
+    expect(byLevel(L.checkSecretsLock(opts(home())), "PASS")).toContain("allowed commands: no secret shape in the 0 saved entries");
   });
 
   it("never prints a value from the settings file", () => {

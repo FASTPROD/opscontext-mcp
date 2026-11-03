@@ -50,6 +50,34 @@ describe("[CAPTURE-IS-REDACTED-AT-THE-DOOR] redactSecrets", () => {
     for (const [input, want] of cases) expect(redactSecrets(input).text, input).toBe(want);
   });
 
+  // A value between backslash-quotes (\'value\', \"value\": a command quoted inside another shell
+  // line, or a JSON-escaped string) slipped past every shape: the bare alternative stopped at the
+  // backslash and the quoted one never opened. Found 2026-11-02 in a saved allowed command.
+  it("hides a value between backslash-quotes", () => {
+    const SP = ["sshpass", "-p"].join(" ");
+    const BQ = "\\'"; // backslash + single quote
+    const BD = '\\"'; // backslash + double quote
+    const pw2 = FAKE.pw + FAKE.pw;
+    const cases: Array<[string, string]> = [
+      [`${SP} ${BQ}${FAKE.pw}${BQ} ssh admin@host.example.test`, `${SP} [REDACTED:sshpass_password] ssh admin@host.example.test`],
+      [`${SP} ${BD}${FAKE.pw}${BD} scp a b`, `${SP} [REDACTED:sshpass_password] scp a b`],
+      [`tool --${KEY}=${BQ}${FAKE.pw}${BQ} run`, `tool --${KEY}=[REDACTED:password_flag] run`],
+      [`mysql -u root -p${BQ}${FAKE.pw}${BQ} crowlr`, `mysql -u root -p[REDACTED:mysql_password] crowlr`],
+      [`export DB_${KEY.toUpperCase()}=${BQ}${FAKE.pw}${BQ}`, `export DB_${KEY.toUpperCase()}=${BQ}[REDACTED:credential_assignment]${BQ}`],
+      [`{${BD}${KEY}${BD}: ${BD}${FAKE.pw}${BD}}`, `{${BD}${KEY}${BD}: ${BD}[REDACTED:credential_assignment]${BD}}`],
+      [`curl -u ${BQ}yan:${FAKE.pw}${BQ} https://example.test`, `curl -u ${BQ}yan:[REDACTED:curl_user_password]${BQ} https://example.test`],
+      [`-H ${BD}Authorization: Bearer ${pw2}${BD}`, `-H ${BD}Authorization: Bearer [REDACTED:bearer_token]${BD}`],
+      [`-H ${BQ}Authorization: Bearer ${BD}${pw2}${BD}${BQ}`, `-H ${BQ}Authorization: Bearer ${BD}[REDACTED:bearer_token]${BD}${BQ}`],
+      [`-H ${BQ}x-api-key: ${BD}${FAKE.pw}${BD}${BQ}`, `-H ${BQ}x-api-key: ${BD}[REDACTED:api_key_header]${BD}${BQ}`],
+    ];
+    for (const [input, want] of cases) {
+      const r = redactSecrets(input);
+      expect(r.text, input).toBe(want);
+      expect(r.text, input).not.toContain(FAKE.pw);
+      expect(redactSecrets(r.text).text, "second pass of " + input).toBe(want);
+    }
+  });
+
   it("leaves variables, env lookups, paths, type names, function calls and a bare -p alone", () => {
     const keep = [
       `${KEY}=$DB_PASS`,

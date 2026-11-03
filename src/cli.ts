@@ -880,6 +880,18 @@ async function cliListSources(): Promise<void> {
   console.log("");
 }
 
+async function cliUnpushed(args: string[]): Promise<void> {
+  const { unpushedFor, unpushedReport, UNPUSHED_USAGE } = await import("./unpushed.js");
+  if (args.includes("-h") || args.includes("--help")) { console.log(UNPUSHED_USAGE); return; }
+  const gate = await gateCheckFresh("list_projects"); // fleet visibility, gated like list-projects
+  if (gate) { console.error(gate); process.exit(1); }
+  const { ensureGitStarts } = await import("./git-path.js");
+  ensureGitStarts(); // [LOCK] [THE-TOOL-CALLS-A-GIT-THAT-STARTS]
+  const projects = loadProjectDirs().map(unpushedFor);
+  if (args.includes("--json")) console.log(JSON.stringify(projects, null, 2));
+  else console.log(`\n${unpushedReport(projects)}`);
+}
+
 async function cliListProjects(): Promise<void> {
   const gate = await gateCheckFresh("list_projects");
   if (gate) { console.error(gate); process.exit(1); }
@@ -1202,6 +1214,15 @@ async function cliLoadSession(name: string): Promise<void> {
 async function cliListSessions(): Promise<void> {
   const sessions = listSessions();
   console.log(`\n${formatSessionList(sessions)}`);
+}
+
+/** `contextengine actions`: the owner's open action points across every saved session (src/actions.ts). Read-only, exit 0. */
+async function cliActions(args: string[]): Promise<void> {
+  const { actionsReport, formatActions, parseActionsArgs, ACTIONS_USAGE } = await import("./actions.js");
+  if (args.includes("-h") || args.includes("--help")) { console.log(ACTIONS_USAGE); return; }
+  const parsed = parseActionsArgs(args);
+  if (!parsed.ok) { console.error(`${parsed.error}\n\n${ACTIONS_USAGE}`); process.exit(1); }
+  console.log(`\n${formatActions(actionsReport(parsed.opts), parsed.opts)}`);
 }
 
 
@@ -2571,6 +2592,10 @@ Usage:
   contextengine save-session <name> <key> <value>   Save session context
   contextengine load-session <name>    Restore session context
   contextengine list-sessions          List all saved sessions
+  contextengine actions [--all] [--since YYYY-MM-DD] [--project NAME]
+                                       The owner's open action points: the \`actions\` lines of every saved session
+                                       (YYYY-MM-DD | open | project | what), oldest first, with session and time
+                                       (UTC + Europe/Zurich); then the count of sessions without that key
   contextengine end-session            Pre-flight checklist (uncommitted changes, doc freshness)
   contextengine audit-export [--since DATE] [--until DATE] [--format jsonl|csv]
                                        Export hash-chained audit log (evidence aligned with
@@ -2611,7 +2636,14 @@ Usage:
   contextengine install-autostart [--force]
                                        Install macOS LaunchAgent so MCP server auto-starts at login
                                        (uninstall-autostart / autostart-status — companion commands)
-  contextengine install-claude-hook    Wire Claude Code terminal sessions into the OpsContext audit log, plus the Stop session gate
+  contextengine install-claude-hook [--simplicity] [--guard]
+                                       Wire Claude Code terminal sessions into the OpsContext audit log, plus the Stop session gate;
+                                       --guard adds the Bash guard (see bash-guard)
+  contextengine bash-guard [--check "<command>"]
+                                       Claude Code PreToolUse(Bash) hook body: refuses, before it runs, rsync --delete, scp -r,
+                                       a script started by a relative path, and github.com in a command's allowed sites
+  contextengine unpushed [--json]      Per project, the commits not yet on GitHub: each local branch against the GitHub remote's
+                                       last fetch (nothing is fetched)
   contextengine secrets-lock [--apply] Check (default, writes nothing) or install the Claude Code deny rules that keep the agent
                                        out of the credentials and env files, secrets/ folders and *.p12; --apply is for your own terminal
   contextengine session-gate           Claude Code Stop hook body: exit 2 while the repo's CE session is older than HEAD
@@ -2682,6 +2714,17 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
     console.error("Error:", err);
     process.exit(1);
   });
+} else if (command === "unpushed") {
+  cliUnpushed(process.argv.slice(3)).catch((err) => {
+    console.error("Error:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+} else if (command === "bash-guard") {
+  import("./bash-guard.js").then((m) => m.cliBashGuard(process.argv.slice(3))).catch((err) => {
+    // [LOCK] [BASH-GUARD-REFUSES-BEFORE-IT-RUNS]: a guard that cannot start must not let the command through.
+    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `the Bash guard could not start (${err instanceof Error ? err.message : String(err)}): refusing until it can` } }));
+    process.exit(0);
+  });
 } else if (command === "list-projects") {
   cliListProjects().catch((err) => {
     console.error("Error:", err);
@@ -2736,6 +2779,11 @@ npm:  https://www.npmjs.com/package/@compr/opscontext-mcp
 } else if (command === "list-sessions") {
   cliListSessions().catch((err) => {
     console.error("Error:", err);
+    process.exit(1);
+  });
+} else if (command === "actions") {
+  cliActions(process.argv.slice(3)).catch((err) => {
+    console.error("Error:", err instanceof Error ? err.message : err);
     process.exit(1);
   });
 } else if (command === "audit-export") {

@@ -6,7 +6,9 @@
 // [NEVER] write to ~/.claude/settings.json without parsing first. A typo
 //    or non-JSON state means Claude Code refuses to start.
 // [NEVER] emit on PreToolUse, would double-count vs PostToolUse for the
-//    `stuck` heuristic and skew `silent_failure` counts.
+//    `stuck` heuristic and skew `silent_failure` counts. (The Bash guard of
+//    --guard registers on PreToolUse but emits nothing: it answers deny, or
+//    nothing, and sends no event.)
 // WHY: Claude Code hook wiring is the ONLY way the user's terminal Claude
 //    Code sessions get into the OpsContext audit log. The installer has to
 //    be safe (idempotent, preserve existing) AND legible (clear error
@@ -38,7 +40,12 @@ const GATE_SCRIPT = join(HOOKS_DIR, "opscontext-session-gate.sh");
  *  [LOCK] [SIMPLICITY-GATE-SILENT-WHEN-BLIND] (defaults/simplicity-gate.py) */
 const SIMPLICITY_SCRIPT = join(HOOKS_DIR, "opscontext-simplicity-gate.py");
 const SIMPLICITY_MATCHER = "Edit|Write|MultiEdit";
-const OUR_SCRIPTS = [HOOK_SCRIPT, GATE_SCRIPT, SIMPLICITY_SCRIPT];
+/** The Bash guard: a PreToolUse hook on Bash that refuses rsync --delete, scp -r, a script started
+ *  by a relative path and github.com in a command's allowed sites, before the tool runs.
+ *  Optional: `--guard`. [LOCK] [BASH-GUARD-REFUSES-BEFORE-IT-RUNS] (src/bash-guard.ts) */
+const GUARD_SCRIPT = join(HOOKS_DIR, "opscontext-bash-guard.sh");
+const GUARD_MATCHER = "Bash";
+const OUR_SCRIPTS = [HOOK_SCRIPT, GATE_SCRIPT, SIMPLICITY_SCRIPT, GUARD_SCRIPT];
 
 const EVENT_KINDS = ["UserPromptSubmit", "PostToolUse", "SessionStart"] as const;
 
@@ -218,7 +225,8 @@ export function countOurHooks(
 }
 
 /** How many times Claude Code runs each OpsContext hook, read from settings.json: the three
- *  emit events, the Stop gate, and the optional simplicity gate as "PostToolUse(simplicity)".
+ *  emit events, the Stop gate, the optional simplicity gate as "PostToolUse(simplicity)" and the
+ *  optional Bash guard as "PreToolUse(guard)".
  *  null when there is no readable settings.json. Shared by the install verification
  *  ([INSTALL-VERIFIES-BY-COUNT]) and fleet health, so both count the same way. */
 export function claudeHookRegistrations(settingsPath: string = SETTINGS_FILE, home: string = homedir()): Record<string, number> | null {
@@ -235,6 +243,7 @@ export function claudeHookRegistrations(settingsPath: string = SETTINGS_FILE, ho
     ...countOurHooks(settings, EVENT_KINDS, emit, home),
     ...countOurHooks(settings, ["Stop"], join(hooksDir, "opscontext-session-gate.sh"), home),
     "PostToolUse(simplicity)": countOurHooks(settings, ["PostToolUse"], join(hooksDir, "opscontext-simplicity-gate.py"), home).PostToolUse,
+    "PreToolUse(guard)": countOurHooks(settings, ["PreToolUse"], join(hooksDir, "opscontext-bash-guard.sh"), home).PreToolUse,
   };
 }
 
@@ -284,7 +293,7 @@ function globalCliPath(): string | null {
 export async function cliInstallClaudeHook(args: string[]): Promise<void> {
   const help = args.includes("-h") || args.includes("--help");
   if (help) {
-    console.log(`Usage: opscontext install-claude-hook [--simplicity]
+    console.log(`Usage: opscontext install-claude-hook [--simplicity] [--guard]
 
 Wires OpsContext into Claude Code's hook system so every terminal Claude
 Code session sends prompts + tool calls to the OpsContext audit log.
@@ -300,14 +309,19 @@ Events emitted (all go through the local HTTP endpoint, never the network):
                        its git HEAD version; functions the edit made new offenders or worse
                        are reported back to Claude (exit 2). Pre-existing complexity, files
                        outside git and a missing ruff are silent. Needs ruff (brew install ruff).
+  • PreToolUse on Bash, with --guard → the Bash guard: refuses, before it runs, rsync --delete,
+                       scp -r, a script started by a relative path (unless the line first runs
+                       cd /absolute/folder) and github.com in the command's allowed sites. The
+                       reason reaches Claude; nothing is logged. (contextengine bash-guard --help)
 
 The installer:
   1. Copies the bundled hook script to ~/.claude/hooks/opscontext-emit.sh
      and writes ~/.claude/hooks/opscontext-session-gate.sh (node + this CLI, absolute paths);
-     with --simplicity also ~/.claude/hooks/opscontext-simplicity-gate.py
-  2. Splices four entries (five with --simplicity) into ~/.claude/settings.json under "hooks"
-  3. Preserves every existing hook entry (idempotent, safe to re-run; a re-run without
-     --simplicity keeps an installed simplicity gate and refreshes its script)
+     with --simplicity also ~/.claude/hooks/opscontext-simplicity-gate.py;
+     with --guard also ~/.claude/hooks/opscontext-bash-guard.sh (node + this CLI, absolute paths)
+  2. Splices four entries (one more per option) into ~/.claude/settings.json under "hooks"
+  3. Preserves every existing hook entry (idempotent, safe to re-run; a re-run without an
+     option keeps an installed simplicity gate or Bash guard and refreshes its script)
 
 A timestamped backup is written next to settings.json before any change.
 
@@ -318,6 +332,7 @@ Run: opscontext install-autostart
     return;
   }
   const simplicityAsked = args.includes("--simplicity");
+  const guardAsked = args.includes("--guard");
 
   // Parse settings.json before writing anything: a malformed file is refused with nothing changed
   // (it used to be refused after the emit script had already been copied).
@@ -345,7 +360,7 @@ Run: opscontext install-autostart
   // [LOCK] [HOOK-PATHS-ARE-SHELL-QUOTED]: first repair unquoted copies an older install wrote for a
   // path with a space, so the dedup below sees them as ours.
   let deduped = 0;
-  for (const kind of [...EVENT_KINDS, "Stop"]) {
+  for (const kind of [...EVENT_KINDS, "Stop", "PreToolUse"]) {
     const entries = settings.hooks[kind];
     if (!entries) continue;
     repairUnquotedCommands(entries, OUR_SCRIPTS);
@@ -423,6 +438,41 @@ Run: opscontext install-autostart
     else console.log(`⚠️  ruff not found (PATH, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/.cargo/bin): the gate stays silent until it is installed (brew install ruff, or pipx install ruff).`);
   }
 
+  // Step 5: the Bash guard, when asked for or already there (a plain re-run keeps it and refreshes
+  // its script). Absolute node + CLI paths, as for the Stop gate. [LOCK] [BASH-GUARD-REFUSES-BEFORE-IT-RUNS]
+  const guardWired = hookAlreadyWired(settings.hooks.PreToolUse, GUARD_SCRIPT);
+  const wantGuard = guardAsked || guardWired;
+  if (wantGuard) {
+    // Never fails open: a node or CLI that is missing, or a crash, is a deny too (a hook that exits
+    // non-zero and prints nothing lets the command run).
+    const guardDeny = JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "the Bash guard could not start (its node or cli.js is missing, or it crashed): refusing until it can; run contextengine install-claude-hook --guard again" } });
+    writeFileSync(
+      GUARD_SCRIPT,
+      [
+        "#!/bin/sh",
+        "# Generated by `opscontext install-claude-hook --guard`: the Bash guard on Claude Code PreToolUse(Bash).",
+        "# A JSON deny on stdout = the command does not run (the reason is inside). See: contextengine bash-guard --help",
+        "# It never fails open: a node or CLI that is missing or crashes is a deny too.",
+        `NODE=${scriptQuote(process.execPath)}`,
+        `CLI=${scriptQuote(cliPath)}`,
+        `DENY=${scriptQuote(guardDeny)}`,
+        `if [ ! -x "$NODE" ] || [ ! -f "$CLI" ]; then printf '%s\\n' "$DENY"; exit 0; fi`,
+        `"$NODE" "$CLI" bash-guard || printf '%s\\n' "$DENY"`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(GUARD_SCRIPT, 0o755);
+    settings.hooks.PreToolUse ??= [];
+    if (guardWired) {
+      skipped++;
+    } else {
+      settings.hooks.PreToolUse.push({ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: shellQuote(GUARD_SCRIPT), timeout: 10 }] });
+      added++;
+    }
+    console.log(`✅ Installed Bash guard: ${GUARD_SCRIPT} (PreToolUse ${GUARD_MATCHER})`);
+  }
+
   // A re-run that changes nothing writes nothing and leaves no backup behind (a copy of
   // settings.json per run piled up, env values and all).
   let backup = "";
@@ -446,6 +496,7 @@ Run: opscontext install-autostart
   // dedup pass alone never adds it).
   const expected: Record<string, number> = Object.fromEntries(Object.keys(counts).map((ev) => [ev, 1]));
   expected["PostToolUse(simplicity)"] = wantSimplicity ? 1 : 0;
+  expected["PreToolUse(guard)"] = wantGuard ? 1 : 0;
   const wrong = Object.entries(counts).filter(([ev, n]) => n !== expected[ev]);
   if (wrong.length > 0) {
     const detail = wrong.map(([ev, n]) => `${ev}=${n}`).join(", ");
@@ -466,10 +517,11 @@ Run: opscontext install-autostart
 
 export async function cliUninstallClaudeHook(args: string[]): Promise<void> {
   if (args.includes("-h") || args.includes("--help")) {
-    console.log(`Usage: opscontext uninstall-claude-hook [--simplicity]
+    console.log(`Usage: opscontext uninstall-claude-hook [--simplicity] [--guard]
 
 Removes OpsContext hook entries from ~/.claude/settings.json. With --simplicity
-only the simplicity gate entry is removed; the emit hooks and the Stop gate stay.
+only the simplicity gate entry is removed, with --guard only the Bash guard entry;
+the emit hooks and the Stop gate stay.
 The hook script files under ~/.claude/hooks/ are left in place — delete
 manually if you want them gone. The audit log is NOT touched.`);
     return;
@@ -485,7 +537,8 @@ manually if you want them gone. The audit log is NOT touched.`);
   // FIX: remove only the commands that run our scripts, compared by expanded path like the
   //      installer ([HOOKS-COMPARED-BY-EXPANDED-PATH]); drop an entry only when that leaves it
   //      empty; back up and write only when something was removed.
-  const ours = args.includes("--simplicity") ? [SIMPLICITY_SCRIPT] : OUR_SCRIPTS;
+  const chosen = [...(args.includes("--simplicity") ? [SIMPLICITY_SCRIPT] : []), ...(args.includes("--guard") ? [GUARD_SCRIPT] : [])];
+  const ours = chosen.length > 0 ? chosen : OUR_SCRIPTS;
 
   const settings = readSettings();
   if (!settings.hooks) {
@@ -494,7 +547,7 @@ manually if you want them gone. The audit log is NOT touched.`);
   }
 
   let removed = 0;
-  for (const kind of [...EVENT_KINDS, "Stop"] as const) {
+  for (const kind of [...EVENT_KINDS, "Stop", "PreToolUse"] as const) {
     const entries = settings.hooks[kind];
     if (!entries) continue;
     const kept: HookEntry[] = [];

@@ -4,6 +4,59 @@ All notable changes to OpsContext for AI Agents (previously ContextEngine — MC
 
 > Entries for 2.2.0 through 2.4.0 were not backfilled here; see `docs/sessions/SESSION_19` through `SESSION_21` for those releases.
 
+## [2.20.0] 2026-11-03: a guard that answers before the command runs, and what is not yet on GitHub
+
+Four rules that lived as text in instruction files become a hook that refuses the command before it
+runs; the commits of every project not yet on GitHub come out of one command; your open action points
+out of another; a hidden value is hidden in one more spelling; and the secrets check reads the saved
+allowed commands too.
+
+### Added
+
+- **The Bash guard** (`opscontext install-claude-hook --guard`): a Claude Code hook on every Bash call
+  that refuses, before it runs, `rsync --delete` and `scp -r` (a wrong target empties or overwrites a
+  sibling site on a shared server), a script started by a relative path (the tool's folder is not
+  reliable between calls, and another project's deploy script has run that way), and `github.com` in a
+  command's allowed sites (GitHub stays the owner's own terminal). The reason reaches the agent; the
+  owner runs such a command in their own terminal when it is really wanted. It looks through sudo, env,
+  ssh, xargs, `bash -c`, `eval`, command substitution and subshells, reads heredoc bodies as text, and
+  never fails open: unreadable input, a missing node or a crashing CLI are refusals too. The refusal of
+  a relative script names the folder it would have run in and asks for the full path, because Claude
+  Code removes a leading `cd` to its current folder before a hook sees the command.
+  `opscontext bash-guard --check "<command>"` gives the verdict by hand; `uninstall-claude-hook --guard`
+  removes only this hook.
+- **`opscontext unpushed`**: per project, the branches with commits not yet on GitHub, how many, and
+  the newest commit's age and subject; a project with no GitHub remote is named (its commits never
+  leave the machine), so is a folder that is not a repository. Nothing is fetched: it reads each
+  project's last fetch. `--json` for scripts. Pro, like `list-projects`.
+
+- **`contextengine actions`**: your open action points, read from the `actions` key of every saved
+  session (one line per action, `YYYY-MM-DD | open | <project> | <what you do>`, `done` once it is),
+  sorted by date, each with its session and the time that entry was written (UTC and Europe/Zurich),
+  then the count of sessions that have no such key and the newest of them. `--all` shows the done
+  lines, `--since YYYY-MM-DD` and `--project NAME` narrow. A session file that does not parse, or a
+  line that is not in that form, is named, never skipped. Read-only, no network, free tier. Agents
+  write the key whenever they hand you a command or a date; until now those items lived only in each
+  chat's last message, project by project.
+- **The "À toi" band, a Claude Code mod** (`mods/a-toi/`, not in the npm package): one line above the
+  prompt of a terminal or desktop session, `À toi : 2 rappels d'Oliv aujourd'hui · 1 commit pas sur
+  GitHub · 3 actions ouvertes`, read when the session starts and every five minutes: your reminders due
+  today from Oliv's `invoq` MCP server, the commits of the session's folder not on its tracked branch,
+  the open lines of `contextengine actions`. A source that fails reads "injoignable" in the band;
+  nothing is written anywhere, no secret is held. Loaded with `CLAUDE_CODE_PLUGIN_DIRS` (the mod's
+  README says how); `claude plugin validate` and `claude plugin test` check it.
+
+### Fixed
+
+- **A value between backslash-quotes is hidden.** A password or key written as \'value\' or
+  \"value\" (after a password flag, inside a JSON-escaped assignment in a `curl -d`, in a bearer or
+  `x-api-key` header) is now hidden like one between plain quotes, by every secret shape, and hiding
+  twice changes nothing.
+- **`secrets-lock --check` reads the saved allowed commands.** It fails when a command saved under
+  `permissions.allow` in a user, project or local settings file holds a secret shape, and prints only
+  the count and the shape names per file, never the text, with what to do: take the entry out, and
+  treat the secret as leaked.
+
 ## [2.19.2] 2026-10-13: the server calls a git that starts
 
 Only matters on a machine where the first git the server finds cannot run: an old git built for Intel

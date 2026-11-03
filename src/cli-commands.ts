@@ -23,6 +23,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "--version",
   "-h",
   "-v",
+  "actions",
   "activate",
   "anchor",
   "audit",
@@ -32,6 +33,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "audit-restore",
   "audit-scrub",
   "audit-verify",
+  "bash-guard",
   "servers",
   "session-gate",
   "secrets-lock",
@@ -65,6 +67,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   "sync-claude-md",
   "uninstall-autostart",
   "uninstall-claude-hook",
+  "unpushed",
   "version",
   "watch",
 ];

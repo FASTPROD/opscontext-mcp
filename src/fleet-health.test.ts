@@ -77,7 +77,7 @@ describe("computeFleetHealth", () => {
     const missing = join(home(), "missing.log");
     const rep = report([{ pid: 1, role: "indexer", staleBuild: false }]);
     const h = H.computeFleetHealth({ now, auditPath: missing, report: rep, settingsPath: settings });
-    expect(h.claudeHooks).toEqual({ UserPromptSubmit: 2, PostToolUse: 1, SessionStart: 1, Stop: 1, "PostToolUse(simplicity)": 1 });
+    expect(h.claudeHooks).toEqual({ UserPromptSubmit: 2, PostToolUse: 1, SessionStart: 1, Stop: 1, "PostToolUse(simplicity)": 1, "PreToolUse(guard)": 0 });
     expect(h.warnings).toEqual([expect.stringMatching(/runs an OpsContext hook more than once \(UserPromptSubmit=2\).*run install-claude-hook/)]);
     expect(H.formatFleetHealth(h)).toMatch(/registrations UserPromptSubmit=2 PostToolUse=1/);
 
